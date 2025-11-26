@@ -13,3 +13,5 @@ While it is great, it has some drawbacks:
 This will attempt to address those drawbacks.
 
 **WORK-IN-PROGRESS**
+
+**This is not available in Windows.**
