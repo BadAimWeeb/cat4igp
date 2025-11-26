@@ -19,7 +19,8 @@ pub struct WireGuardTunnel {
     local_private_key: String,
     peer_public_key: String,
     peer_endpoint: Option<SocketAddr>,
-    listen_port: Option<u16>
+    listen_port: Option<u16>,
+    force_userspace: bool
 }
 
 impl WireGuardTunnel {
@@ -35,7 +36,25 @@ impl WireGuardTunnel {
             local_private_key,
             peer_public_key,
             peer_endpoint,
-            listen_port
+            listen_port,
+            force_userspace: false
+        }
+    }
+
+    pub fn new_userspace(
+        interface: String,
+        local_private_key: String,
+        peer_public_key: String,
+        peer_endpoint: Option<SocketAddr>,
+        listen_port: Option<u16>
+    ) -> Self {
+        Self {
+            interface,
+            local_private_key,
+            peer_public_key,
+            peer_endpoint,
+            listen_port,
+            force_userspace: true
         }
     }
 
@@ -94,7 +113,7 @@ impl Tunnel for WireGuardTunnel {
                     },
                 )?,
             )
-            .apply(&ifname, BACKEND)?;
+            .apply(&ifname, if self.force_userspace { Backend::Userspace } else { BACKEND })?;
         Ok(())
     }
 
@@ -106,7 +125,7 @@ impl Tunnel for WireGuardTunnel {
                     "failed to parse interface name",
                 )
             })?,
-            BACKEND,
+            if self.force_userspace { Backend::Userspace } else { BACKEND },
         )?
         .delete()?)
     }
