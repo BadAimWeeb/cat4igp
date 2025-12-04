@@ -1,5 +1,7 @@
 pub mod models;
 pub mod schema;
+pub mod db;
+pub mod enums;
 
 use axum::{
     routing::{get, post},
