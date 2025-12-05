@@ -1,7 +1,7 @@
 use diesel::prelude::*;
 use dotenvy::dotenv;
 use std::env;
-use crate::models::{Node, Invite};
+use crate::{enums, models::{Invite, Node}};
 use uuid::Uuid;
 
 pub fn establish_connection() -> SqliteConnection {
@@ -63,6 +63,23 @@ pub fn update_node_name(conn: &mut SqliteConnection, node_id_val: i32, new_name:
     Ok(())
 }
 
+pub fn get_server_side_node_info(conn: &mut SqliteConnection, node_id_val: i32) -> Result<(String, chrono::NaiveDateTime), diesel::result::Error> {
+    use crate::schema::nodes::dsl::*;
+
+    nodes
+        .filter(id.eq(node_id_val))
+        .select((name, created_at))
+        .first::<(String, chrono::NaiveDateTime)>(conn)
+}
+
+pub fn get_node_list(conn: &mut SqliteConnection) -> Result<Vec<crate::models::Node>, diesel::result::Error> {
+    use crate::schema::nodes::dsl::*;
+
+    nodes
+        .select(crate::models::Node::as_select())
+        .load::<crate::models::Node>(conn)
+}
+
 pub fn update_wireguard_pubkey(conn: &mut SqliteConnection, node_id_val: i32, pubkey: &str) -> Result<(), diesel::result::Error> {
     use crate::schema::wireguard_static_key;
     use crate::schema::wireguard_static_key::dsl::*;
@@ -89,7 +106,103 @@ pub fn get_wireguard_pubkey(conn: &mut SqliteConnection, node_id_val: i32) -> Re
         .select(public_key)
         .first::<String>(conn)?;
 
-    Ok(key_record)
+    Ok(key_record) 
 }
 
+pub fn create_wireguard_tunnel(
+    conn: &mut SqliteConnection,
+    peer1_id: i32,
+    peer2_id: i32,
+    mtu_val: i32,
+    endpoint_should_be_ipv6: bool
+) -> Result<(), diesel::result::Error> {
+    use crate::schema::wireguard_tunnels;
 
+    let new_tunnel = crate::models::NewWireguardTunnel {
+        node_id_peer1: peer1_id,
+        node_id_peer2: peer2_id,
+        endpoint_peer1: None,
+        endpoint_peer2: None,
+        mtu: mtu_val,
+        endpoint_ipv6: endpoint_should_be_ipv6,
+    };
+
+    diesel::insert_into(wireguard_tunnels::table)
+        .values(&new_tunnel)
+        .execute(conn)?;
+
+    Ok(())
+}
+
+pub fn get_wireguard_answers(
+    conn: &mut SqliteConnection,
+    node_id_val: i32
+) -> Result<Vec<crate::models::WireguardTunnel>, diesel::result::Error> {
+    use crate::schema::wireguard_tunnels::dsl::*;
+
+    let results = wireguard_tunnels
+        .filter(
+            (node_id_peer1.eq(node_id_val))
+            .or(node_id_peer2.eq(node_id_val))
+        )
+        .select(crate::models::WireguardTunnel::as_select())
+        .load::<crate::models::WireguardTunnel>(conn)?;
+
+    Ok(results)
+}
+
+pub fn answer_wireguard_tunnel(
+    conn: &mut SqliteConnection,
+    tunnel_id_val: i32,
+    node_id_val: i32,
+    endpoint: Option<String>,
+    decline_type: Option<i16>
+) -> Result<(), diesel::result::Error> {
+    use crate::schema::wireguard_tunnels::dsl::*;
+
+    let target = wireguard_tunnels.filter(id.eq(tunnel_id_val));
+
+    if target
+        .filter(node_id_peer1.eq(node_id_val))
+        .first::<crate::models::WireguardTunnel>(conn)
+        .is_ok()
+    {
+        if let Some(decline) = decline_type {
+            diesel::update(target)
+                .set((
+                    peer1_answered.eq(decline),
+                    endpoint_peer1.eq(endpoint),
+                    updated_at.eq(chrono::Utc::now().naive_utc()),
+                ))
+                .execute(conn)?;
+        } else {
+            diesel::update(target)
+                .set((
+                    peer1_answered.eq(enums::WireguardAnswered::Answered as i16),
+                    endpoint_peer1.eq(endpoint),
+                    updated_at.eq(chrono::Utc::now().naive_utc()),
+                ))
+                .execute(conn)?;
+        }
+    } else {
+        if let Some(decline) = decline_type {
+            diesel::update(target)
+                .set((
+                    peer2_answered.eq(decline),
+                    endpoint_peer2.eq(endpoint),
+                    updated_at.eq(chrono::Utc::now().naive_utc()),
+                ))
+                .execute(conn)?;
+        } else {
+            diesel::update(target)
+                .set((
+                    peer2_answered.eq(enums::WireguardAnswered::Answered as i16),
+                    endpoint_peer2.eq(endpoint),
+                    updated_at.eq(chrono::Utc::now().naive_utc()),
+                ))
+                .execute(conn)?;
+        }
+    }
+
+    Ok(())
+}

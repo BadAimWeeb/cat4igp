@@ -3,14 +3,14 @@ CREATE TABLE `nodes`(
 	`id` INTEGER NOT NULL PRIMARY KEY,
 	`name` TEXT NOT NULL,
 	`auth_key` TEXT NOT NULL,
-	`created_at` TIMESTAMP NOT NULL,
+	`created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	`last_seen` TIMESTAMP
 );
 
 CREATE TABLE `wireguard_static_key`(
 	`node_id` INTEGER NOT NULL PRIMARY KEY,
 	`public_key` TEXT NOT NULL,
-	`created_at` TIMESTAMP NOT NULL
+	`created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE `wireguard_tunnels`(
@@ -19,20 +19,20 @@ CREATE TABLE `wireguard_tunnels`(
 	`node_id_peer2` INTEGER NOT NULL,
 	`endpoint_peer1` TEXT,
 	`endpoint_peer2` TEXT,
-	`peer1_answered` SMALLINT NOT NULL,
-	`peer2_answered` SMALLINT NOT NULL,
-	`mtu` INTEGER NOT NULL,
+	`peer1_answered` SMALLINT NOT NULL DEFAULT 0,
+	`peer2_answered` SMALLINT NOT NULL DEFAULT 0,
+	`mtu` INTEGER NOT NULL DEFAULT 1280,
 	`endpoint_ipv6` BOOL NOT NULL,
-	`created_at` TIMESTAMP NOT NULL,
-	`updated_at` TIMESTAMP NOT NULL
+	`created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	`updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE `invites`(
 	`id` INTEGER NOT NULL PRIMARY KEY,
 	`code` TEXT NOT NULL,
-	`created_at` TIMESTAMP NOT NULL,
+	`created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	`expires_at` TIMESTAMP,
-	`used_count` INTEGER NOT NULL,
+	`used_count` INTEGER NOT NULL DEFAULT 0,
 	`max_uses` INTEGER
 );
 
