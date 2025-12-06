@@ -45,6 +45,33 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    settings (id) {
+        id -> Integer,
+        key -> Text,
+        value -> Text,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    mesh_groups (id) {
+        id -> Integer,
+        name -> Text,
+        created_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    mesh_group_memberships (id) {
+        id -> Integer,
+        mesh_group_id -> Integer,
+        node_id -> Integer,
+        created_at -> Timestamp,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     invites,
     nodes,

@@ -1,6 +1,7 @@
 use diesel::prelude::*;
 
 #[derive(Queryable, Selectable)]
+#[derive(Clone)]
 #[diesel(table_name = crate::schema::nodes)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Node {
@@ -19,6 +20,7 @@ pub struct NewNode<'a> {
 }
 
 #[derive(Queryable, Selectable)]
+#[derive(Clone)]
 #[diesel(table_name = crate::schema::wireguard_static_key)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct WireguardStaticKey {
@@ -35,6 +37,7 @@ pub struct NewWireguardStaticKey<'a> {
 }
 
 #[derive(Queryable, Selectable)]
+#[derive(Clone)]
 #[diesel(table_name = crate::schema::wireguard_tunnels)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct WireguardTunnel {
@@ -63,6 +66,7 @@ pub struct NewWireguardTunnel {
 }
 
 #[derive(Queryable, Selectable)]
+#[derive(Clone)]
 #[diesel(table_name = crate::schema::invites)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Invite {

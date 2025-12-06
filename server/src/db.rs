@@ -1,12 +1,9 @@
 use diesel::prelude::*;
-use dotenvy::dotenv;
 use std::env;
-use crate::{enums, models::{Invite, Node}};
+use crate::{ext, models::{Invite, Node}};
 use uuid::Uuid;
 
 pub fn establish_connection() -> SqliteConnection {
-    dotenv().ok();
-
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     SqliteConnection::establish(&database_url)
         .unwrap_or_else(|_| panic!("Error connecting to {}", database_url))
@@ -178,7 +175,7 @@ pub fn answer_wireguard_tunnel(
         } else {
             diesel::update(target)
                 .set((
-                    peer1_answered.eq(enums::WireguardAnswered::Answered as i16),
+                    peer1_answered.eq(ext::WireguardAnswered::Answered as i16),
                     endpoint_peer1.eq(endpoint),
                     updated_at.eq(chrono::Utc::now().naive_utc()),
                 ))
@@ -196,7 +193,7 @@ pub fn answer_wireguard_tunnel(
         } else {
             diesel::update(target)
                 .set((
-                    peer2_answered.eq(enums::WireguardAnswered::Answered as i16),
+                    peer2_answered.eq(ext::WireguardAnswered::Answered as i16),
                     endpoint_peer2.eq(endpoint),
                     updated_at.eq(chrono::Utc::now().naive_utc()),
                 ))
