@@ -47,9 +47,14 @@ async fn auth_middleware(mut request: Request, next: Next) -> Response {
 pub async fn make_router_client() -> Result<Router, Box<dyn std::error::Error>> {
     Ok(
         Router::new()
-            .route("/update_name", post(client::update_name))
-            .route("/self_info", get(client::get_self_info))
+            .route("/self", post(client::update_name))
+            .route("/self", get(client::get_self_info))
             .route("/all_nodes", get(client::get_all_nodes))
+            .route("/wg_tun", get(client::get_wireguard_tunnels))
+            .route("/wg_tun", post(client::answer_wireguard_tunnel))
+            .route("/wg_pubkey", get(client::get_wireguard_pubkey))
+            .route("/wg_pubkey", post(client::update_wireguard_pubkey))
+
             // future: please add routes BEFORE this "layer" line.
             .layer(axum::middleware::from_fn(auth_middleware))
             .route("/register", post(client::register))

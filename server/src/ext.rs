@@ -1,20 +1,22 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
 pub enum WireguardAnswered {
     Unanswered = 0,
     Answered = 1,
     RejectedGeneric = 2,
     RejectedNoIpStack = 3,
+    Unknown = -1
 }
 
-impl TryFrom<i16> for WireguardAnswered {
-    type Error = ();
-
-    fn try_from(value: i16) -> Result<Self, Self::Error> {
+impl From<i16> for WireguardAnswered {
+    fn from(value: i16) -> Self {
         match value {
-            0 => Ok(WireguardAnswered::Unanswered),
-            1 => Ok(WireguardAnswered::Answered),
-            2 => Ok(WireguardAnswered::RejectedGeneric),
-            3 => Ok(WireguardAnswered::RejectedNoIpStack),
-            _ => Err(()),
+            0 => WireguardAnswered::Unanswered,
+            1 => WireguardAnswered::Answered,
+            2 => WireguardAnswered::RejectedGeneric,
+            3 => WireguardAnswered::RejectedNoIpStack,
+            _ => WireguardAnswered::Unknown,
         }
     }
 }
@@ -26,6 +28,7 @@ impl From<WireguardAnswered> for i16 {
             WireguardAnswered::Answered => 1,
             WireguardAnswered::RejectedGeneric => 2,
             WireguardAnswered::RejectedNoIpStack => 3,
+            WireguardAnswered::Unknown => -1,
         }
     }
 }
