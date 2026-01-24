@@ -12,12 +12,41 @@ diesel::table! {
 }
 
 diesel::table! {
+    mesh_group_memberships (id) {
+        id -> Integer,
+        mesh_group_id -> Integer,
+        node_id -> Integer,
+        created_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    mesh_groups (id) {
+        id -> Integer,
+        name -> Text,
+        auto_wireguard -> Bool,
+        auto_wireguard_mtu -> Integer,
+        created_at -> Timestamp,
+    }
+}
+
+diesel::table! {
     nodes (id) {
         id -> Integer,
         name -> Text,
         auth_key -> Text,
         created_at -> Timestamp,
         last_seen -> Nullable<Timestamp>,
+    }
+}
+
+diesel::table! {
+    settings (id) {
+        id -> Integer,
+        key -> Text,
+        value -> Text,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
     }
 }
 
@@ -45,36 +74,12 @@ diesel::table! {
     }
 }
 
-diesel::table! {
-    settings (id) {
-        id -> Integer,
-        key -> Text,
-        value -> Text,
-        created_at -> Timestamp,
-        updated_at -> Timestamp,
-    }
-}
-
-diesel::table! {
-    mesh_groups (id) {
-        id -> Integer,
-        name -> Text,
-        created_at -> Timestamp,
-    }
-}
-
-diesel::table! {
-    mesh_group_memberships (id) {
-        id -> Integer,
-        mesh_group_id -> Integer,
-        node_id -> Integer,
-        created_at -> Timestamp,
-    }
-}
-
 diesel::allow_tables_to_appear_in_same_query!(
     invites,
+    mesh_group_memberships,
+    mesh_groups,
     nodes,
+    settings,
     wireguard_static_key,
     wireguard_tunnels,
 );

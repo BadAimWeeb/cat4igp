@@ -1,7 +1,7 @@
 use axum::{Json, extract::Extension};
 use serde::{Serialize, Deserialize};
 
-use crate::ext::WireguardAnswered;
+use crate::{ext::WireguardAnswered};
 
 #[derive(Serialize, Deserialize)]
 pub struct StandardResponse {
@@ -16,14 +16,37 @@ pub struct RegisterPayload {
     invitation_key: String
 }
 
-pub async fn register(Json(payload): Json<RegisterPayload>) -> Result<Json<String>, (axum::http::StatusCode, String)> {
+#[derive(Serialize)]
+pub struct RegisterResponse {
+    success: bool,
+    auth_key: String
+}
+
+pub async fn register(Json(payload): Json<RegisterPayload>) -> Result<Json<RegisterResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
-    let auth_key = crate::db::register_node(&mut conn, &payload.node_name, &payload.invitation_key).map_err(|e| {
-        (axum::http::StatusCode::BAD_REQUEST, format!("Registration error: {}", e))
+    let (nid, auth_key) = crate::db::register_node(&mut conn, &payload.node_name, &payload.invitation_key).map_err(|e| {
+        (axum::http::StatusCode::BAD_REQUEST, Json(StandardResponse {
+            success: false,
+            message: Some(format!("Registration error: {}", e))
+        }))
     })?;
 
-    Ok(Json(auth_key))
+    // mesh group handling
+    let default_mesh_group = crate::db::get_setting(&mut conn, "default_mesh_group");
+    if let Ok(group_id_string) = default_mesh_group {
+        // convert from string to integer
+        let group_id_try = group_id_string.parse::<i32>();
+        if let Ok(group_id) = group_id_try {
+            // join mesh
+            let _ = crate::db::join_mesh(&mut conn, nid, group_id);
+        }
+    }
+
+    Ok(Json(RegisterResponse {
+        success: true,
+        auth_key,
+    }))
 }
 
 

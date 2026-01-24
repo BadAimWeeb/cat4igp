@@ -85,3 +85,60 @@ pub struct NewInvite<'a> {
     pub expires_at: Option<chrono::NaiveDateTime>,
     pub max_uses: Option<i32>,
 }
+
+#[derive(Queryable, Selectable)]
+#[derive(Clone)]
+#[diesel(table_name = crate::schema::mesh_groups)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct MeshGroup {
+    pub id: i32,
+    pub name: String,
+    pub auto_wireguard: bool,
+    pub auto_wireguard_mtu: i32,
+    pub created_at: chrono::NaiveDateTime
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = crate::schema::mesh_groups)]
+pub struct NewMeshGroup<'a> {
+    pub name: &'a str,
+    pub auto_wireguard: bool,
+    pub auto_wireguard_mtu: i32,
+}
+
+#[derive(Queryable, Selectable)]
+#[derive(Clone)]
+#[diesel(table_name = crate::schema::mesh_group_memberships)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct MeshGroupMembership {
+    pub id: i32,
+    pub mesh_group_id: i32,
+    pub node_id: i32,
+    pub created_at: chrono::NaiveDateTime
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = crate::schema::mesh_group_memberships)]
+pub struct NewMeshGroupMembership {
+    pub mesh_group_id: i32,
+    pub node_id: i32,
+}
+
+#[derive(Queryable, Selectable)]
+#[derive(Clone)]
+#[diesel(table_name = crate::schema::settings)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct Setting {
+    pub id: i32,
+    pub key: String,
+    pub value: String,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = crate::schema::settings)]
+pub struct NewSetting<'a> {
+    pub key: &'a str,
+    pub value: &'a str,
+}
