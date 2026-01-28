@@ -1,7 +1,7 @@
 use axum::{Json, extract::Extension};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
-use crate::{ext::WireguardAnswered};
+use crate::ext::WireguardAnswered;
 
 #[derive(Serialize, Deserialize)]
 pub struct StandardResponse {
@@ -9,37 +9,53 @@ pub struct StandardResponse {
     message: Option<String>,
 }
 
-
 #[derive(Deserialize)]
 pub struct RegisterPayload {
     node_name: String,
-    invitation_key: String
+    invitation_key: String,
 }
 
 #[derive(Serialize)]
 pub struct RegisterResponse {
     success: bool,
-    auth_key: String
+    auth_key: String,
 }
 
-pub async fn register(Json(payload): Json<RegisterPayload>) -> Result<Json<RegisterResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
+pub async fn register(
+    Json(payload): Json<RegisterPayload>,
+) -> Result<Json<RegisterResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
-    let (nid, auth_key) = crate::db::register_node(&mut conn, &payload.node_name, &payload.invitation_key).map_err(|e| {
-        (axum::http::StatusCode::BAD_REQUEST, Json(StandardResponse {
-            success: false,
-            message: Some(format!("Registration error: {}", e))
-        }))
-    })?;
+    let (nid, auth_key, override_join_mesh) =
+        crate::db::register_node(&mut conn, &payload.node_name, &payload.invitation_key).map_err(
+            |e| {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(StandardResponse {
+                        success: false,
+                        message: Some(format!("Registration error: {}", e)),
+                    }),
+                )
+            },
+        )?;
 
     // mesh group handling
-    let default_mesh_group = crate::db::get_setting(&mut conn, "default_mesh_group");
-    if let Ok(group_id_string) = default_mesh_group {
-        // convert from string to integer
-        let group_id_try = group_id_string.parse::<i32>();
-        if let Ok(group_id) = group_id_try {
-            // join mesh
+    if let Some(group_id) = override_join_mesh {
+        // 0 override means do not join any mesh, even default one
+        if group_id != 0 {
+            // join specified mesh
             let _ = crate::db::join_mesh(&mut conn, nid, group_id);
+        }
+    } else {
+        // join default mesh
+        let default_mesh_group = crate::db::get_setting(&mut conn, "default_mesh_group");
+        if let Ok(group_id_string) = default_mesh_group {
+            // convert from string to integer
+            let group_id_try = group_id_string.parse::<i32>();
+            if let Ok(group_id) = group_id_try {
+                // join mesh
+                let _ = crate::db::join_mesh(&mut conn, nid, group_id);
+            }
         }
     }
 
@@ -49,23 +65,25 @@ pub async fn register(Json(payload): Json<RegisterPayload>) -> Result<Json<Regis
     }))
 }
 
-
 #[derive(Deserialize)]
 pub struct UpdateNamePayload {
-    new_name: String
+    new_name: String,
 }
 
 pub async fn update_name(
     Extension(node): Extension<crate::models::Node>,
-    Json(payload): Json<UpdateNamePayload>
+    Json(payload): Json<UpdateNamePayload>,
 ) -> Result<Json<StandardResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
     crate::db::update_node_name(&mut conn, node.id, &payload.new_name).map_err(|e| {
-        (axum::http::StatusCode::BAD_REQUEST, Json(StandardResponse {
-            success: false,
-            message: Some(format!("Failed to update name: {}", e))
-        }))
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(StandardResponse {
+                success: false,
+                message: Some(format!("Failed to update name: {}", e)),
+            }),
+        )
     })?;
 
     Ok(Json(StandardResponse {
@@ -74,13 +92,12 @@ pub async fn update_name(
     }))
 }
 
-
 #[derive(Serialize)]
 pub struct NodeInfoResponse {
     success: bool,
     id: i32,
     name: String,
-    created_at: i64
+    created_at: i64,
 }
 
 pub async fn get_self_info(
@@ -94,7 +111,6 @@ pub async fn get_self_info(
     })
 }
 
-
 #[derive(Serialize)]
 pub struct NodeResponse {
     id: i32,
@@ -105,33 +121,37 @@ pub struct NodeResponse {
 #[derive(Serialize)]
 pub struct AllNodesResponse {
     success: bool,
-    nodes: Vec<NodeResponse>
+    nodes: Vec<NodeResponse>,
 }
 
-pub async fn get_all_nodes() -> Result<Json<AllNodesResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
+pub async fn get_all_nodes()
+-> Result<Json<AllNodesResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
     let nodes = crate::db::get_node_list(&mut conn).map_err(|e| {
-        (axum::http::StatusCode::BAD_REQUEST, Json(StandardResponse {
-            success: false,
-            message: Some(format!("Failed to get node list: {}", e))
-        }))
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(StandardResponse {
+                success: false,
+                message: Some(format!("Failed to get node list: {}", e)),
+            }),
+        )
     })?;
 
-    let node_responses: Vec<NodeResponse> = nodes.into_iter().map(|n| {
-        NodeResponse {
+    let node_responses: Vec<NodeResponse> = nodes
+        .into_iter()
+        .map(|n| NodeResponse {
             id: n.id,
             name: n.name,
             created_at: n.created_at.and_utc().timestamp_millis(),
-        }
-    }).collect();
+        })
+        .collect();
 
     Ok(Json(AllNodesResponse {
         success: true,
         nodes: node_responses,
     }))
 }
-
 
 #[derive(Serialize)]
 pub struct WireguardTunnelInfo {
@@ -150,7 +170,7 @@ pub struct WireguardTunnelInfo {
 #[derive(Serialize)]
 pub struct WireguardTunnelsResponse {
     success: bool,
-    tunnels: Vec<WireguardTunnelInfo>
+    tunnels: Vec<WireguardTunnelInfo>,
 }
 
 pub async fn get_wireguard_tunnels(
@@ -159,10 +179,13 @@ pub async fn get_wireguard_tunnels(
     let mut conn = crate::db::establish_connection();
 
     let tunnels = crate::db::get_wireguard_answers(&mut conn, node.id).map_err(|e| {
-        (axum::http::StatusCode::BAD_REQUEST, Json(StandardResponse {
-            success: false,
-            message: Some(format!("Failed to get wireguard tunnels: {}", e))
-        }))
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(StandardResponse {
+                success: false,
+                message: Some(format!("Failed to get wireguard tunnels: {}", e)),
+            }),
+        )
     })?;
 
     let mut tunnel_infos: Vec<WireguardTunnelInfo> = Vec::new();
@@ -188,7 +211,8 @@ pub async fn get_wireguard_tunnels(
             tunnel.peer1_answered
         };
 
-        let public_key = crate::db::get_wireguard_pubkey(&mut conn, peer_node_id).unwrap_or_default();
+        let public_key =
+            crate::db::get_wireguard_pubkey(&mut conn, peer_node_id).unwrap_or_default();
 
         tunnel_infos.push(WireguardTunnelInfo {
             tunnel_id: tunnel.id,
@@ -210,7 +234,6 @@ pub async fn get_wireguard_tunnels(
     }))
 }
 
-
 #[derive(Deserialize)]
 pub struct WireguardTunnelAnswerPayload {
     tunnel_id: i32,
@@ -220,7 +243,7 @@ pub struct WireguardTunnelAnswerPayload {
 
 pub async fn answer_wireguard_tunnel(
     Extension(node): Extension<crate::models::Node>,
-    Json(payload): Json<WireguardTunnelAnswerPayload>
+    Json(payload): Json<WireguardTunnelAnswerPayload>,
 ) -> Result<Json<StandardResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
@@ -229,12 +252,16 @@ pub async fn answer_wireguard_tunnel(
         payload.tunnel_id,
         node.id,
         payload.endpoint,
-        payload.decline_type
-    ).map_err(|e| {
-        (axum::http::StatusCode::BAD_REQUEST, Json(StandardResponse {
-            success: false,
-            message: Some(format!("Failed to answer wireguard tunnel: {}", e))
-        }))
+        payload.decline_type,
+    )
+    .map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(StandardResponse {
+                success: false,
+                message: Some(format!("Failed to answer wireguard tunnel: {}", e)),
+            }),
+        )
     })?;
 
     Ok(Json(StandardResponse {
@@ -243,29 +270,32 @@ pub async fn answer_wireguard_tunnel(
     }))
 }
 
-
 #[derive(Deserialize)]
 pub struct WireguardPubKeyAskPayload {
-    node_id_peer: i32
+    node_id_peer: i32,
 }
 
 #[derive(Serialize)]
 pub struct WireguardPubKeyResponse {
     success: bool,
-    public_key: String
+    public_key: String,
 }
 
 pub async fn get_wireguard_pubkey(
-    Json(payload): Json<WireguardPubKeyAskPayload>
+    Json(payload): Json<WireguardPubKeyAskPayload>,
 ) -> Result<Json<WireguardPubKeyResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
-    let public_key = crate::db::get_wireguard_pubkey(&mut conn, payload.node_id_peer).map_err(|e| {
-        (axum::http::StatusCode::BAD_REQUEST, Json(StandardResponse {
-            success: false,
-            message: Some(format!("Failed to get wireguard public key: {}", e))
-        }))
-    })?;
+    let public_key =
+        crate::db::get_wireguard_pubkey(&mut conn, payload.node_id_peer).map_err(|e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(StandardResponse {
+                    success: false,
+                    message: Some(format!("Failed to get wireguard public key: {}", e)),
+                }),
+            )
+        })?;
 
     Ok(Json(WireguardPubKeyResponse {
         success: true,
@@ -273,23 +303,25 @@ pub async fn get_wireguard_pubkey(
     }))
 }
 
-
 #[derive(Deserialize)]
 pub struct WireguardPubKeyUpdatePayload {
-    public_key: String
+    public_key: String,
 }
 
 pub async fn update_wireguard_pubkey(
     Extension(node): Extension<crate::models::Node>,
-    Json(payload): Json<WireguardPubKeyUpdatePayload>
+    Json(payload): Json<WireguardPubKeyUpdatePayload>,
 ) -> Result<Json<StandardResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
     crate::db::update_wireguard_pubkey(&mut conn, node.id, &payload.public_key).map_err(|e| {
-        (axum::http::StatusCode::BAD_REQUEST, Json(StandardResponse {
-            success: false,
-            message: Some(format!("Failed to update wireguard public key: {}", e))
-        }))
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(StandardResponse {
+                success: false,
+                message: Some(format!("Failed to update wireguard public key: {}", e)),
+            }),
+        )
     })?;
 
     Ok(Json(StandardResponse {

@@ -8,6 +8,7 @@ diesel::table! {
         expires_at -> Nullable<Timestamp>,
         used_count -> Integer,
         max_uses -> Nullable<Integer>,
+        override_join_mesh -> Nullable<Integer>,
     }
 }
 

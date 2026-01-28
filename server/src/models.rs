@@ -1,4 +1,5 @@
 use diesel::prelude::*;
+use serde::{Deserialize, Serialize};
 
 #[derive(Queryable, Selectable)]
 #[derive(Clone)]
@@ -67,6 +68,7 @@ pub struct NewWireguardTunnel {
 
 #[derive(Queryable, Selectable)]
 #[derive(Clone)]
+#[derive(Serialize, Deserialize)]
 #[diesel(table_name = crate::schema::invites)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Invite {
@@ -75,6 +77,7 @@ pub struct Invite {
     pub created_at: chrono::NaiveDateTime,
     pub expires_at: Option<chrono::NaiveDateTime>,
     pub used_count: i32,
+    pub override_join_mesh: Option<i32>,
     pub max_uses: Option<i32>,
 }
 
@@ -84,6 +87,7 @@ pub struct NewInvite<'a> {
     pub code: &'a str,
     pub expires_at: Option<chrono::NaiveDateTime>,
     pub max_uses: Option<i32>,
+    pub override_join_mesh: Option<i32>,
 }
 
 #[derive(Queryable, Selectable)]

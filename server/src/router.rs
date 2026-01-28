@@ -70,7 +70,12 @@ async fn auth_middleware_operator(mut request: Request, next: Next) -> Response 
 
     if let Some(token) = token_option {
         let operator_key = std::env::var("OPERATOR_AUTH_KEY").unwrap_or_default();
-        if token == operator_key {
+        if operator_key.is_empty() {
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body("Unauthorized: Please set OPERATOR_AUTH_KEY environment variable".into())
+                .unwrap()
+        } else if token == operator_key {
             next.run(request).await
         } else {
             Response::builder()

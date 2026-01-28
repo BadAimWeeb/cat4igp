@@ -25,6 +25,7 @@ pub fn create_invite_key(
     conn: &mut SqliteConnection,
     expires_at: Option<chrono::NaiveDateTime>,
     max_uses: Option<i32>,
+    override_join_mesh: Option<i32>,
 ) -> Result<String, diesel::result::Error> {
     use crate::schema::invites;
 
@@ -34,6 +35,7 @@ pub fn create_invite_key(
         code: &invite_code,
         expires_at,
         max_uses,
+        override_join_mesh,
     };
 
     diesel::insert_into(invites::table)
@@ -47,7 +49,7 @@ pub fn register_node(
     conn: &mut SqliteConnection,
     node_name: &str,
     invitation_key: &str,
-) -> Result<(i32, String), diesel::result::Error> {
+) -> Result<(i32, String, Option<i32>), diesel::result::Error> {
     use crate::schema::invites::dsl::*;
     use crate::schema::nodes;
 
@@ -76,7 +78,19 @@ pub fn register_node(
         .values(&new_node)
         .get_result::<crate::models::Node>(conn)?;
 
-    Ok((node.id, nauthk))
+    Ok((node.id, nauthk, inv.override_join_mesh))
+}
+
+pub fn get_invites(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<crate::models::Invite>, diesel::result::Error> {
+    use crate::schema::invites::dsl::*;
+
+    let results = invites
+        .select(crate::models::Invite::as_select())
+        .load::<crate::models::Invite>(conn)?;
+
+    Ok(results)
 }
 
 pub fn update_node_name(
