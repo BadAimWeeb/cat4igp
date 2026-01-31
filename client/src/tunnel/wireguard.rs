@@ -4,7 +4,7 @@ use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, PeerConfig
 
 use crate::{
     tunnel::{TunnelType, shared::Tunnel},
-    util::{IPV4_DEFAULT, IPV6_DEFAULT},
+    interface::{IPV4_DEFAULT, IPV6_DEFAULT},
 };
 
 #[cfg(target_os = "linux")]
