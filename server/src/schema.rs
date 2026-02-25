@@ -70,6 +70,8 @@ diesel::table! {
         peer2_answered -> SmallInt,
         mtu -> Integer,
         endpoint_ipv6 -> Bool,
+        fec -> Bool,
+        faketcp -> Bool,
         created_at -> Timestamp,
         updated_at -> Timestamp,
     }

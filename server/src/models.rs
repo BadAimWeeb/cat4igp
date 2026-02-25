@@ -51,6 +51,8 @@ pub struct WireguardTunnel {
     pub peer2_answered: i16,
     pub mtu: i32,
     pub endpoint_ipv6: bool,
+    pub fec: bool,
+    pub faketcp: bool,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
 }

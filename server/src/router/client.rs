@@ -1,29 +1,11 @@
 use axum::{Json, extract::Extension};
-use serde::{Deserialize, Serialize};
 
-use crate::ext::WireguardAnswered;
-
-#[derive(Serialize, Deserialize)]
-pub struct StandardResponse {
-    success: bool,
-    message: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct RegisterPayload {
-    node_name: String,
-    invitation_key: String,
-}
-
-#[derive(Serialize)]
-pub struct RegisterResponse {
-    success: bool,
-    auth_key: String,
-}
+use cat4igp_shared::rest::StandardResponse;
+use cat4igp_shared::rest::client as REST;
 
 pub async fn register(
-    Json(payload): Json<RegisterPayload>,
-) -> Result<Json<RegisterResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
+    Json(payload): Json<REST::RegisterPayload>,
+) -> Result<Json<REST::RegisterResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
     let (nid, auth_key, override_join_mesh) =
@@ -59,20 +41,15 @@ pub async fn register(
         }
     }
 
-    Ok(Json(RegisterResponse {
+    Ok(Json(REST::RegisterResponse {
         success: true,
         auth_key,
     }))
 }
 
-#[derive(Deserialize)]
-pub struct UpdateNamePayload {
-    new_name: String,
-}
-
 pub async fn update_name(
     Extension(node): Extension<crate::models::Node>,
-    Json(payload): Json<UpdateNamePayload>,
+    Json(payload): Json<REST::UpdateNamePayload>,
 ) -> Result<Json<StandardResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
@@ -92,18 +69,10 @@ pub async fn update_name(
     }))
 }
 
-#[derive(Serialize)]
-pub struct NodeInfoResponse {
-    success: bool,
-    id: i32,
-    name: String,
-    created_at: i64,
-}
-
 pub async fn get_self_info(
     Extension(node): Extension<crate::models::Node>,
-) -> Json<NodeInfoResponse> {
-    Json(NodeInfoResponse {
+) -> Json<REST::NodeInfoResponse> {
+    Json(REST::NodeInfoResponse {
         success: true,
         id: node.id,
         name: node.name,
@@ -111,21 +80,8 @@ pub async fn get_self_info(
     })
 }
 
-#[derive(Serialize)]
-pub struct NodeResponse {
-    id: i32,
-    name: String,
-    created_at: i64,
-}
-
-#[derive(Serialize)]
-pub struct AllNodesResponse {
-    success: bool,
-    nodes: Vec<NodeResponse>,
-}
-
 pub async fn get_all_nodes()
--> Result<Json<AllNodesResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
+-> Result<Json<REST::AllNodesResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
     let nodes = crate::db::get_node_list(&mut conn).map_err(|e| {
@@ -138,44 +94,24 @@ pub async fn get_all_nodes()
         )
     })?;
 
-    let node_responses: Vec<NodeResponse> = nodes
+    let node_responses: Vec<REST::SingleNode> = nodes
         .into_iter()
-        .map(|n| NodeResponse {
+        .map(|n| REST::SingleNode {
             id: n.id,
             name: n.name,
             created_at: n.created_at.and_utc().timestamp_millis(),
         })
         .collect();
 
-    Ok(Json(AllNodesResponse {
+    Ok(Json(REST::AllNodesResponse {
         success: true,
         nodes: node_responses,
     }))
 }
 
-#[derive(Serialize)]
-pub struct WireguardTunnelInfo {
-    tunnel_id: i32,
-    peer_node_id: i32,
-    public_key: String,
-    remote_endpoint: Option<String>,
-    local_answered: WireguardAnswered,
-    remote_response: WireguardAnswered,
-    mtu: i32,
-    endpoint_ipv6: bool,
-    created_at: i64,
-    updated_at: i64,
-}
-
-#[derive(Serialize)]
-pub struct WireguardTunnelsResponse {
-    success: bool,
-    tunnels: Vec<WireguardTunnelInfo>,
-}
-
 pub async fn get_wireguard_tunnels(
     Extension(node): Extension<crate::models::Node>,
-) -> Result<Json<WireguardTunnelsResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
+) -> Result<Json<REST::WireguardTunnelsResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
     let tunnels = crate::db::get_wireguard_answers(&mut conn, node.id).map_err(|e| {
@@ -188,7 +124,7 @@ pub async fn get_wireguard_tunnels(
         )
     })?;
 
-    let mut tunnel_infos: Vec<WireguardTunnelInfo> = Vec::new();
+    let mut tunnel_infos: Vec<REST::WireguardTunnelInfo> = Vec::new();
 
     for tunnel in tunnels {
         let self_p1 = tunnel.node_id_peer1 == node.id;
@@ -211,39 +147,51 @@ pub async fn get_wireguard_tunnels(
             tunnel.peer1_answered
         };
 
+        let local_endpoint = if self_p1 {
+            tunnel.endpoint_peer1.clone()
+        } else {
+            tunnel.endpoint_peer2.clone()
+        };
+
+        let remote_endpoint = if self_p1 {
+            tunnel.endpoint_peer2.clone()
+        } else {
+            tunnel.endpoint_peer1.clone()
+        };
+
         let public_key =
             crate::db::get_wireguard_pubkey(&mut conn, peer_node_id).unwrap_or_default();
 
-        tunnel_infos.push(WireguardTunnelInfo {
+        tunnel_infos.push(REST::WireguardTunnelInfo {
             tunnel_id: tunnel.id,
             peer_node_id,
             public_key,
-            remote_endpoint: tunnel.endpoint_peer2.clone(),
+            preferred_port: local_endpoint
+                .map_or(0, |e| {
+                    e.split(':').nth(1)
+                        .map_or(0, |p| p.parse::<u16>().unwrap_or_default())
+                }),
+            remote_endpoint,
             local_answered: local_answered.into(),
             remote_response: remote_response.into(),
             mtu: tunnel.mtu,
             endpoint_ipv6: tunnel.endpoint_ipv6,
+            fec: tunnel.fec,
+            faketcp: tunnel.faketcp,
             created_at: tunnel.created_at.and_utc().timestamp_millis(),
             updated_at: tunnel.updated_at.and_utc().timestamp_millis(),
         });
     }
 
-    Ok(Json(WireguardTunnelsResponse {
+    Ok(Json(REST::WireguardTunnelsResponse {
         success: true,
         tunnels: tunnel_infos,
     }))
 }
 
-#[derive(Deserialize)]
-pub struct WireguardTunnelAnswerPayload {
-    tunnel_id: i32,
-    decline_type: Option<i16>,
-    endpoint: Option<String>,
-}
-
 pub async fn answer_wireguard_tunnel(
     Extension(node): Extension<crate::models::Node>,
-    Json(payload): Json<WireguardTunnelAnswerPayload>,
+    Json(payload): Json<REST::WireguardTunnelAnswerPayload>,
 ) -> Result<Json<StandardResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
@@ -270,20 +218,9 @@ pub async fn answer_wireguard_tunnel(
     }))
 }
 
-#[derive(Deserialize)]
-pub struct WireguardPubKeyAskPayload {
-    node_id_peer: i32,
-}
-
-#[derive(Serialize)]
-pub struct WireguardPubKeyResponse {
-    success: bool,
-    public_key: String,
-}
-
 pub async fn get_wireguard_pubkey(
-    Json(payload): Json<WireguardPubKeyAskPayload>,
-) -> Result<Json<WireguardPubKeyResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
+    Json(payload): Json<REST::WireguardPubKeyAskPayload>,
+) -> Result<Json<REST::WireguardPubKeyResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
     let public_key =
@@ -297,20 +234,15 @@ pub async fn get_wireguard_pubkey(
             )
         })?;
 
-    Ok(Json(WireguardPubKeyResponse {
+    Ok(Json(REST::WireguardPubKeyResponse {
         success: true,
         public_key,
     }))
 }
 
-#[derive(Deserialize)]
-pub struct WireguardPubKeyUpdatePayload {
-    public_key: String,
-}
-
 pub async fn update_wireguard_pubkey(
     Extension(node): Extension<crate::models::Node>,
-    Json(payload): Json<WireguardPubKeyUpdatePayload>,
+    Json(payload): Json<REST::WireguardPubKeyUpdatePayload>,
 ) -> Result<Json<StandardResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 

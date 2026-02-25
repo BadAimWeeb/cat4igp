@@ -1,26 +1,8 @@
-use axum::{Json, extract::Extension};
-use serde::{Serialize, Deserialize};
+use axum::Json;
+use cat4igp_shared::rest::StandardResponse;
+use cat4igp_shared::rest::operator as REST;
 
-#[derive(Serialize, Deserialize)]
-pub struct StandardResponse {
-    success: bool,
-    message: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct CreateInvitePayload {
-    expires_at: Option<i64>,
-    max_uses: Option<i32>,
-    join_mesh: Option<i32>
-}
-
-#[derive(Serialize)]
-pub struct CreateInviteResponse {
-    success: bool,
-    invite_code: String
-}
-
-pub async fn create_invite(Json(payload): Json<CreateInvitePayload>) -> Result<Json<CreateInviteResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
+pub async fn create_invite(Json(payload): Json<REST::CreateInvitePayload>) -> Result<Json<REST::CreateInviteResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
     let expires_at = if let Some(ts) = payload.expires_at {
@@ -48,19 +30,13 @@ pub async fn create_invite(Json(payload): Json<CreateInvitePayload>) -> Result<J
         }))
     })?;
 
-    Ok(Json(CreateInviteResponse {
+    Ok(Json(REST::CreateInviteResponse {
         success: true,
         invite_code,
     }))
 }
 
-#[derive(Serialize)]
-pub struct GetInvitesResponse {
-    success: bool,
-    invites: Vec<crate::models::Invite>,
-}
-
-pub async fn get_invites() -> Result<Json<GetInvitesResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
+pub async fn get_invites() -> Result<Json<REST::GetInvitesResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
     let invites = crate::db::get_invites(&mut conn).map_err(|e| {
@@ -70,28 +46,23 @@ pub async fn get_invites() -> Result<Json<GetInvitesResponse>, (axum::http::Stat
         }))
     })?;
 
-    Ok(Json(GetInvitesResponse {
+    Ok(Json(REST::GetInvitesResponse {
         success: true,
-        invites,
+        invites: invites.into_iter().map(|inv| REST::Invite {
+            id: inv.id,
+            code: inv.code,
+            created_at: inv.created_at,
+            expires_at: inv.expires_at,
+            used_count: inv.used_count,
+            override_join_mesh: inv.override_join_mesh,
+            max_uses: inv.max_uses,
+        }).collect(),
     }))
 }
 
-#[derive(Deserialize)]
-pub struct CreateMeshPayload {
-    name: String,
-    auto_wireguard: Option<bool>,
-    auto_wireguard_mtu: Option<i32>,
-}
-
-#[derive(Serialize)]
-pub struct CreateMeshResponse {
-    success: bool,
-    mesh_group_id: i32,
-}
-
 pub async fn create_mesh(
-    Json(payload): Json<CreateMeshPayload>,
-) -> Result<Json<CreateMeshResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
+    Json(payload): Json<REST::CreateMeshPayload>,
+) -> Result<Json<REST::CreateMeshResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
     let mut conn = crate::db::establish_connection();
 
     let auto_wireguard = payload.auto_wireguard.unwrap_or(false);
@@ -107,7 +78,7 @@ pub async fn create_mesh(
         )
     })?;
 
-    Ok(Json(CreateMeshResponse {
+    Ok(Json(REST::CreateMeshResponse {
         success: true,
         mesh_group_id: mesh_group,
     }))

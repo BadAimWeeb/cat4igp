@@ -148,6 +148,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base32"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "022dfe9eb35f19ebbcb51e0b40a5ab759f46ad60cadf7297e0bd085afb50e076"
+
+[[package]]
 name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -212,6 +218,58 @@ name = "bytes"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
+
+[[package]]
+name = "cat4igp-client"
+version = "0.1.0"
+dependencies = [
+ "base32",
+ "blake2",
+ "cat4igp-shared",
+ "clap",
+ "dns-lookup",
+ "futures-util",
+ "ipnet",
+ "libc",
+ "rand 0.8.5",
+ "reqwest",
+ "rtnetlink",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "udp_sas",
+ "webpki-roots",
+ "wireguard-control",
+]
+
+[[package]]
+name = "cat4igp-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "cat4igp-shared",
+ "chrono",
+ "diesel",
+ "dotenvy",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "cat4igp-shared"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+]
 
 [[package]]
 name = "cc"
@@ -288,31 +346,6 @@ name = "clap_lex"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
-
-[[package]]
-name = "client"
-version = "0.1.0"
-dependencies = [
- "blake2",
- "clap",
- "dns-lookup",
- "futures-util",
- "ipnet",
- "libc",
- "rand 0.8.5",
- "reqwest",
- "rtnetlink",
- "rustls",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "toml",
- "udp_sas",
- "webpki-roots",
- "wireguard-control",
-]
 
 [[package]]
 name = "colorchoice"
@@ -1914,22 +1947,6 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
-]
-
-[[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "diesel",
- "dotenvy",
- "futures-util",
- "serde",
- "serde_json",
- "tokio",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

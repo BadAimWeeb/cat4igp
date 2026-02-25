@@ -3,8 +3,8 @@ use std::{net::SocketAddr, str::FromStr};
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, PeerConfigBuilder};
 
 use crate::{
-    tunnel::{TunnelType, shared::Tunnel},
     interface::{IPV4_DEFAULT, IPV6_DEFAULT},
+    tunnel::{TunnelType, shared::Tunnel},
 };
 
 #[cfg(target_os = "linux")]
@@ -29,7 +29,7 @@ impl WireGuardTunnel {
         local_private_key: String,
         peer_public_key: String,
         peer_endpoint: Option<SocketAddr>,
-        listen_port: Option<u16>
+        listen_port: Option<u16>,
     ) -> Self {
         Self {
             interface,
@@ -46,7 +46,7 @@ impl WireGuardTunnel {
         local_private_key: String,
         peer_public_key: String,
         peer_endpoint: Option<SocketAddr>,
-        listen_port: Option<u16>
+        listen_port: Option<u16>,
     ) -> Self {
         Self {
             interface,
@@ -65,9 +65,53 @@ impl WireGuardTunnel {
     pub fn set_listen_port(&mut self, port: u16) {
         self.listen_port = Some(port);
     }
+
+    pub fn get_peer_endpoint(&self) -> Option<SocketAddr> {
+        self.peer_endpoint
+    }
+
+    pub fn get_listen_port(&self) -> Option<u16> {
+        self.listen_port
+    }
+
+    pub fn get_local_private_key(&self) -> &str {
+        &self.local_private_key
+    }
 }
 
 impl Tunnel for WireGuardTunnel {
+    fn is_connected(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        if let Ok(device) = Device::get(
+            &InterfaceName::from_str(self.interface.as_str()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "failed to parse interface name",
+                )
+            })?,
+            if self.force_userspace {
+                Backend::Userspace
+            } else {
+                BACKEND
+            },
+        ) {
+            // check connected status by comparing last handshake time of the peer with current time. it should be 3 minutes (180 seconds) or less if the tunnel is active
+            if let Some(peer) = device
+                .peers
+                .iter()
+                .find(|p| p.config.public_key.to_base64() == self.peer_public_key)
+            {
+                if let Some(last_handshake) = peer.stats.last_handshake_time {
+                    return Ok(last_handshake.elapsed().unwrap_or_default().as_secs() <= 180);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn get_mtu(&self) -> Result<u32, Box<dyn std::error::Error>> {
+        crate::interface::get_mtu(self.interface.clone()).await
+    }
+
     async fn setup(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let ifname = InterfaceName::from_str(self.interface.as_str()).map_err(|_| {
             io::Error::new(
@@ -113,21 +157,44 @@ impl Tunnel for WireGuardTunnel {
                     },
                 )?,
             )
-            .apply(&ifname, if self.force_userspace { Backend::Userspace } else { BACKEND })?;
+            .apply(
+                &ifname,
+                if self.force_userspace {
+                    Backend::Userspace
+                } else {
+                    BACKEND
+                },
+            )?;
+
         Ok(())
     }
 
     async fn destroy(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        Ok(Device::get(
+        Device::get(
             &InterfaceName::from_str(self.interface.as_str()).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "failed to parse interface name",
                 )
             })?,
-            if self.force_userspace { Backend::Userspace } else { BACKEND },
+            if self.force_userspace {
+                Backend::Userspace
+            } else {
+                BACKEND
+            },
         )?
-        .delete()?)
+        .delete()?;
+
+        Ok(())
+    }
+
+    fn is_ift_created(&self) -> bool {
+        let name = &InterfaceName::from_str(self.interface.as_str());
+        if let Ok(ifname) = name {
+            Device::get(ifname, if self.force_userspace { Backend::Userspace } else { BACKEND }).is_ok()
+        } else {
+            false
+        }
     }
 
     fn get_type(&self) -> TunnelType {

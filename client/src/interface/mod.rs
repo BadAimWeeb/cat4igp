@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use ipnet::IpNet;
-use rtnetlink::{new_connection, packet_route::link::{LinkFlags, LinkHeader, LinkMessage, LinkAttribute}};
+use rtnetlink::{new_connection, packet_route::{address::{AddressAttribute, AddressHeader, AddressMessage}, link::{LinkAttribute, LinkFlags, LinkHeader, LinkMessage}}};
 
 use blake2::{Blake2s256, Digest};
 use std::net::IpAddr;
@@ -43,7 +43,7 @@ pub fn generate_ipv6_lla_from_seed(seed: Vec<u8>) -> IpAddr {
 }
 
 
-pub async fn set_addr(interface: String, addr: IpNet) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn add_addr(interface: String, addr: IpNet) -> Result<(), Box<dyn std::error::Error>> {
     let (connection, handle, _) = new_connection()?;
 
     let conn_poll = tokio::spawn(connection);
@@ -60,6 +60,71 @@ pub async fn set_addr(interface: String, addr: IpNet) -> Result<(), Box<dyn std:
     handle
         .address()
         .add(link_index, addr.addr(), addr.prefix_len())
+        .execute()
+        .await?;
+
+    conn_poll.abort();
+    Ok(())
+}
+
+pub async fn get_addr(interface: String) -> Result<Vec<IpNet>, Box<dyn std::error::Error>> {
+    let (connection, handle, _) = new_connection()?;
+
+    let conn_poll = tokio::spawn(connection);
+
+    let mut link_list_stream = handle.link().get().match_name(interface).execute();
+
+    let mut id = None;
+    if let Some(Ok(link_msg)) = link_list_stream.next().await {
+        id = Some(link_msg.header.index);
+    }
+
+    let link_index = id.ok_or("failed to find interface")?;
+
+    let mut addr_list_stream = handle.address().get().set_link_index_filter(link_index).execute();
+
+    let mut addrs = Vec::new();
+    while let Some(Ok(addr_msg)) = addr_list_stream.next().await {
+        let ip = addr_msg.attributes.iter().find_map(|attr| {
+            match attr {
+                AddressAttribute::Address(a) => Some(a),
+                _ => None,
+            }
+        }).ok_or("failed to find address attribute")?.to_owned();
+
+        addrs.push(IpNet::new(ip, addr_msg.header.prefix_len).map_err(|_| "failed to parse IP network")?);
+    }
+
+    conn_poll.abort();
+    Ok(addrs)
+}
+
+pub async fn del_addr(interface: String, addr: IpNet) -> Result<(), Box<dyn std::error::Error>> {
+    let (connection, handle, _) = new_connection()?;
+
+    let conn_poll = tokio::spawn(connection);
+
+    let mut link_list_stream = handle.link().get().match_name(interface).execute();
+
+    let mut id = None;
+    if let Some(Ok(link_msg)) = link_list_stream.next().await {
+        id = Some(link_msg.header.index);
+    }
+
+    let link_index = id.ok_or("failed to find interface")?;
+
+    let header = AddressHeader {
+        index: link_index,
+        prefix_len: addr.prefix_len(),
+        ..Default::default()
+    };
+    let mut message = AddressMessage::default();
+    message.header = header;
+    message.attributes = vec![AddressAttribute::Address(addr.addr().to_owned())];
+
+    handle
+        .address()
+        .del(message)
         .execute()
         .await?;
 
@@ -94,4 +159,53 @@ pub async fn link_up_with_mtu(interface: String, mtu: u32) -> Result<(), Box<dyn
 
     conn_poll.abort();
     Ok(())
+}
+
+pub async fn link_down(interface: String) -> Result<(), Box<dyn std::error::Error>> {
+    let (connection, handle, _) = new_connection()?;
+
+    let conn_poll = tokio::spawn(connection);
+
+    let mut link_list_stream = handle.link().get().match_name(interface).execute();
+
+    let mut id = None;
+    if let Some(Ok(link_msg)) = link_list_stream.next().await {
+        id = Some(link_msg.header.index);
+    }
+
+    let link_index = id.ok_or("failed to find interface")?;
+
+    let header = LinkHeader {
+        index: link_index,
+        flags: LinkFlags::empty(),
+        ..Default::default()
+    };
+    let mut message = LinkMessage::default();
+    message.header = header;
+
+    handle.link().set(message).execute().await?;
+
+    conn_poll.abort();
+    Ok(())
+}
+
+pub async fn get_mtu(interface: String) -> Result<u32, Box<dyn std::error::Error>> {
+    let (connection, handle, _) = new_connection()?;
+
+    let conn_poll = tokio::spawn(connection);
+
+    let mut link_list_stream = handle.link().get().match_name(interface).execute();
+
+    let mut mtu = None;
+    if let Some(Ok(link_msg)) = link_list_stream.next().await {
+        for attr in link_msg.attributes {
+            if let LinkAttribute::Mtu(m) = attr {
+                mtu = Some(m);
+                break;
+            }
+        }
+    }
+
+    conn_poll.abort();
+    mtu.ok_or_else(|| "failed to find MTU".into())
 }

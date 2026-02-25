@@ -10,6 +10,7 @@ use crate::config::ServerConfig;
 
 pub mod protocol;
 pub mod client;
+mod daemon_memory;
 
 use protocol::{DaemonRequest, DaemonResponse, SharedSecret};
 
@@ -18,6 +19,7 @@ pub struct Daemon {
     config: ClientConfig,
     server_config: Arc<Mutex<Option<ServerConfig>>>,
     secret: SharedSecret,
+    memory: Arc<daemon_memory::DaemonMemory>,
 }
 
 /// IPC message envelope
@@ -50,6 +52,7 @@ impl Daemon {
             config,
             server_config: Arc::new(Mutex::new(server_config)),
             secret,
+            memory: Arc::new(daemon_memory::DaemonMemory::new()),
         })
     }
 
@@ -176,7 +179,7 @@ impl Daemon {
         // In a real implementation, we would modify the config file
         // For now, just return success
         if public_hostname_ipv4.is_some() || public_hostname_ipv6.is_some() {
-            DaemonResponse::Ok(Some("Configuration modified".to_string()))
+            DaemonResponse::Ok(Some("TODO: implement".to_string()))
         } else {
             DaemonResponse::Error("No configuration parameters provided".to_string())
         }
@@ -239,6 +242,8 @@ impl Daemon {
             secret: SharedSecret {
                 secret: self.secret.secret.clone(),
             },
+            // do not clone memory! clone the Arc instead
+            memory: Arc::clone(&self.memory),
         })
     }
 }

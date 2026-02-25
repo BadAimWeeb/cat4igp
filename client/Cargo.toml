@@ -1,5 +1,5 @@
 [package]
-name = "client"
+name = "cat4igp-client"
 version = "0.1.0"
 edition = "2024"
 
@@ -22,6 +22,8 @@ webpki-roots = "0.25"
 rand = "0.8"
 udp_sas = "0.1"
 libc = "0.2"
+cat4igp-shared = { workspace = true }
+base32 = "0.5.1"
 
 [dev-dependencies]
 tempfile = "3.8"
