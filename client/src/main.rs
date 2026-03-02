@@ -3,6 +3,7 @@ mod daemon;
 mod interface;
 mod network;
 mod tunnel;
+mod netassist;
 
 use daemon::protocol::DaemonRequest;
 use daemon::client::DaemonClient;
