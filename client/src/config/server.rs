@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::fs;
 use std::io;
+use wireguard_control::Key;
 
 /// Server configuration stored in the work directory
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,9 +17,17 @@ pub struct ServerConfig {
     /// Invite code for server registration
     pub invite_code: String,
     
-    /// Node private key (generated during registration)
+    /// Node authentication key returned by server registration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_key: Option<String>,
+
+    /// Local WireGuard private key used to create tunnels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wg_private_key: Option<String>,
+
+    /// Local WireGuard public key announced to the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wg_public_key: Option<String>,
 }
 
 fn default_tls_verify() -> bool {
@@ -33,7 +42,29 @@ impl ServerConfig {
             invite_code,
             verify_tls: true,
             node_key: None,
+            wg_private_key: None,
+            wg_public_key: None,
         }
+    }
+
+    /// Ensure local WireGuard keypair exists and is internally consistent.
+    pub fn ensure_wireguard_keypair(&mut self) -> Result<(), io::Error> {
+        let private = if let Some(private) = &self.wg_private_key {
+            Key::from_base64(private).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid WireGuard private key in config: {}", e),
+                )
+            })?
+        } else {
+            let generated = Key::generate_private();
+            self.wg_private_key = Some(generated.to_base64());
+            generated
+        };
+
+        // Always derive and persist public key from private key.
+        self.wg_public_key = Some(private.get_public().to_base64());
+        Ok(())
     }
 
     /// Load server configuration from file

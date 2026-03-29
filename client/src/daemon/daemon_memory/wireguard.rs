@@ -1,24 +1,30 @@
-use std::error::Error;
+use std::net::SocketAddr;
+use std::{error::Error, sync::Arc};
 use base32::Alphabet::Crockford;
 use cat4igp_shared::rest::client as REST;
+use cat4igp_libfec as FEC;
 
 use crate::tunnel::shared::Tunnel as _;
+use crate::daemon::daemon_memory::DaemonMemory;
 
 pub struct WireguardTunnelC {
     tunnel_id: i32,
     peer_node_id: i32,
     ipv6: bool,
     os_tun: crate::tunnel::wireguard::WireGuardTunnel,
-    mtu: i32
+    mtu: i32,
+    fec: Option<Arc<FEC::PeerEngine>>
 }
 
 impl WireguardTunnelC {
+    /// DO NOT USE THIS DIRECTLY UNLESS YOU KNOW WHAT YOU ARE DOING. This is only for testing purposes. Use new_from_rest instead.
     pub fn new(
         tunnel_id: i32,
         peer_node_id: i32,
         ipv6: bool,
         mtu: i32,
         os_tun: crate::tunnel::wireguard::WireGuardTunnel,
+        fec: Option<Arc<FEC::PeerEngine>>
     ) -> Self {
         Self {
             tunnel_id,
@@ -26,25 +32,61 @@ impl WireguardTunnelC {
             ipv6,
             mtu,
             os_tun,
+            fec
         }
     }
 
-    pub fn new_from_rest(
-        rest_info: REST::WireguardTunnelInfo,
+    pub async fn new_from_rest(
+        rest_info: Arc<REST::WireguardTunnelInfo>,
         local_private_key: String,
-    ) -> Result<Self, Box<dyn Error>> {
-        Ok(Self {
+        daemon_memory: Arc<DaemonMemory>
+    ) -> Result<(Self, u16), Box<dyn Error>> {
+        let port = daemon_memory.port_mgmt.allocate(Some(rest_info.preferred_port))?;
+        let fec_res = Self::gen_new_fec(rest_info.clone(), port).await?;
+
+        let (fec, os_tun) = if let Some((fec, fec_listen_port, wg_port)) = fec_res {
+            let fec1 = fec.clone();
+            (Some(fec), Self::gen_new_wg_tunnel(rest_info.clone(), local_private_key, Some(fec1), wg_port, fec_listen_port))
+        } else {
+            (None, Self::gen_new_wg_tunnel(rest_info.clone(), local_private_key, None, port, 0))
+        };
+
+        Ok((Self {
             tunnel_id: rest_info.tunnel_id,
             peer_node_id: rest_info.peer_node_id,
             ipv6: rest_info.endpoint_ipv6,
             mtu: rest_info.mtu,
-            os_tun: Self::gen_new_wg_tunnel(rest_info, local_private_key),
-        })
+            fec,
+            os_tun,
+        }, port))
+    }
+
+    async fn gen_new_fec(rest_info: Arc<REST::WireguardTunnelInfo>, port: u16) -> Result<Option<(Arc<FEC::PeerEngine>, u16, u16)>, Box<dyn Error>> {
+        if rest_info.fec {
+            let local_bind_port = crate::network::ports::get_random_udp_port()?;
+            let local_app_port = crate::network::ports::get_random_udp_port()?;
+
+            let cfg = FEC::Config::new(
+                SocketAddr::new(if rest_info.endpoint_ipv6 {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                } else {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                }, port),
+                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), local_bind_port),
+                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), local_app_port),
+            );
+            Ok(Some((Arc::new(FEC::PeerEngine::start(cfg).await?), local_bind_port, local_app_port)))
+        } else {
+            Ok(None)
+        }
     }
 
     fn gen_new_wg_tunnel(
-        rest_info: REST::WireguardTunnelInfo,
+        rest_info: Arc<REST::WireguardTunnelInfo>,
         local_private_key: String,
+        fec: Option<Arc<FEC::PeerEngine>>,
+        port: u16,
+        fec_peerport: u16
     ) -> crate::tunnel::wireguard::WireGuardTunnel {
         let mut bit_slice = [0u8; 8]; // 56 bits are required out of 64 bits.
 
@@ -84,7 +126,9 @@ impl WireguardTunnelC {
 
         // Bit 21 to bit 36 are reserved for future use. Leave 0 for now.
 
-        let pend = if let Some(endpoint) = rest_info.remote_endpoint {
+        let pend = if fec.is_some() {
+            Some(SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), fec_peerport))
+        } else if let Some(endpoint) = &rest_info.remote_endpoint {
             endpoint.parse::<std::net::SocketAddr>().ok()
         } else {
             None
@@ -96,26 +140,27 @@ impl WireguardTunnelC {
                 base32::encode(Crockford, bit_slice.as_slice())[..12].to_owned()
             ),
             local_private_key,
-            rest_info.public_key,
+            rest_info.public_key.clone(),
             pend,
-            if rest_info.preferred_port == 0 {
+            if port == 0 {
                 None
             } else {
-                Some(rest_info.preferred_port)
+                Some(port)
             },
         )
     }
 
     pub async fn update_from_rest(
         &mut self,
-        rest_info: REST::WireguardTunnelInfo,
+        rest_info: Arc<REST::WireguardTunnelInfo>,
+        daemon_memory: Arc<DaemonMemory>
     ) -> Result<(), Box<dyn Error>> {
         // Guard for tunnel ID and peer node ID consistency.
         if self.tunnel_id != rest_info.tunnel_id || self.peer_node_id != rest_info.peer_node_id {
             return Err("Tunnel ID or peer node ID mismatch".into());
         }
 
-        let old_mtu = self.os_tun.get_mtu().await;
+        self.mtu = rest_info.mtu;
         if self.ipv6 != rest_info.endpoint_ipv6 {
             // Completely destroy and recreate the tunnel because of name
             let local_private_key = self.os_tun.get_local_private_key().to_string();
@@ -123,8 +168,20 @@ impl WireguardTunnelC {
             let ifcreated = self.os_tun.is_ift_created();
             let _ = self.os_tun.destroy();
             self.ipv6 = rest_info.endpoint_ipv6;
-            self.mtu = rest_info.mtu;
-            self.os_tun = Self::gen_new_wg_tunnel(rest_info, local_private_key);
+            
+
+            let port = daemon_memory.port_mgmt.allocate(Some(rest_info.preferred_port))?;
+            let fec_res = Self::gen_new_fec(rest_info.clone(), port).await?;
+
+            let (fec, os_tun) = if let Some((fec, fec_listen_port, wg_port)) = fec_res {
+                let fec1 = fec.clone();
+                (Some(fec), Self::gen_new_wg_tunnel(rest_info.clone(), local_private_key, Some(fec1), wg_port, fec_listen_port))
+            } else {
+                (None, Self::gen_new_wg_tunnel(rest_info.clone(), local_private_key, None, port, 0))
+            };
+
+            self.fec = fec;
+            self.os_tun = os_tun;
         
             if ifcreated {
                 self.os_tun.setup().await?;
@@ -134,10 +191,19 @@ impl WireguardTunnelC {
             return Ok(());
         }
 
-
+        
         // TODO: check for FEC, FakeTCP, and other WireGuard parameters.
 
         Ok(())
+    }
+
+    pub async fn activate(&mut self) -> Result<(), Box<dyn Error>> {
+        self.os_tun.setup().await?;
+        self.ensure_up().await
+    }
+
+    pub async fn teardown(&mut self) -> Result<(), Box<dyn Error>> {
+        self.os_tun.destroy().await
     }
 
     async fn ensure_up(&mut self) -> Result<(), Box<dyn Error>> {
@@ -191,5 +257,9 @@ impl WireguardTunnelC {
 
     pub fn get_os_tun_mut(&mut self) -> &mut crate::tunnel::wireguard::WireGuardTunnel {
         &mut self.os_tun
+    }
+
+    pub fn get_listen_port(&self) -> Option<u16> {
+        self.os_tun.get_listen_port()
     }
 }

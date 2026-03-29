@@ -1,3 +1,4 @@
+use rand::prelude::*;
 use std::net::{IpAddr, ToSocketAddrs, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 use std::os::unix::io::AsRawFd;
@@ -222,7 +223,7 @@ impl PublicIpDetector {
         }
 
         // Randomize server order
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut servers = self.ipv4_servers.clone();
         servers.shuffle(&mut rng);
 
@@ -246,7 +247,7 @@ impl PublicIpDetector {
         }
 
         // Randomize server order
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut servers = self.ipv6_servers.clone();
         servers.shuffle(&mut rng);
 
@@ -271,7 +272,7 @@ impl PublicIpDetector {
         }
 
         // Pick a random NAT testing server
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let server = self.ipv4_nat_servers.choose(&mut rng)
             .ok_or("No NAT testing servers available")?;
 
@@ -289,7 +290,7 @@ impl PublicIpDetector {
         }
 
         // Pick a random NAT testing server
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let server = self.ipv6_nat_servers.choose(&mut rng)
             .ok_or("No NAT testing servers available")?;
 
@@ -352,7 +353,7 @@ impl PublicIpDetector {
         // Test IV: Binding request to alternate server to check mapping behavior
         // We need another server for this - use regular STUN servers as fallback
         let mapping_behavior = if !self.ipv4_servers.is_empty() && is_ipv4 {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let alt_server = self.ipv4_servers.choose(&mut rng).unwrap();
             let alt_ip = alt_server.ipv4_addrs.first().unwrap();
             let alt_addr = format!("{}:{}", alt_ip, alt_server.port);
@@ -374,7 +375,7 @@ impl PublicIpDetector {
                 }
             }
         } else if !self.ipv6_servers.is_empty() && !is_ipv4 {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let alt_server = self.ipv6_servers.choose(&mut rng).unwrap();
             let alt_ip = alt_server.ipv6_addrs.first().unwrap();
             let alt_addr = format!("[{}]:{}", alt_ip, alt_server.port);

@@ -3,7 +3,7 @@ mod daemon;
 mod interface;
 mod network;
 mod tunnel;
-mod netassist;
+mod server_rest;
 
 use daemon::protocol::DaemonRequest;
 use daemon::client::DaemonClient;
@@ -31,19 +31,19 @@ enum Commands {
         config: Option<PathBuf>,
     },
 
-    /// Configure server settings
-    Server {
-        /// Set server address and invite code (format: "address,invite_code")
+    /// Register with server
+    Register {
+        /// Server address (example: https://controller.example.com)
         #[arg(long)]
-        set: Option<String>,
+        server: String,
 
-        /// Get current server configuration
+        /// Invite code from the controller
         #[arg(long)]
-        get: bool,
+        invite: String,
 
-        /// Register with server
-        #[arg(long)]
-        register: bool,
+        /// Disable TLS certificate verification
+        #[arg(long, default_value_t = false)]
+        insecure: bool,
     },
 
     /// Daemon control commands
@@ -103,7 +103,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             start_daemon(client_config).await?;
         }
 
-        Some(Commands::Server { set, get, register }) => {
+        Some(Commands::Register {
+            server,
+            invite,
+            insecure,
+        }) => {
             let client_config = if config_path.exists() {
                 config::ClientConfig::from_file(&config_path)?
             } else {
@@ -115,75 +119,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &client_config.data_dir,
             )?;
 
-            if let Some(server_spec) = set {
-                // Parse format: "address,invite_code"
-                let parts: Vec<&str> = server_spec.split(',').collect();
-                if parts.len() != 2 {
-                    eprintln!("Error: --set requires format 'address,invite_code'");
+            let request = DaemonRequest::Register {
+                address: server,
+                invite_code: invite,
+                verify_tls: !insecure,
+            };
+
+            match client.send_request(request).await? {
+                daemon::protocol::DaemonResponse::Ok(msg) => {
+                    println!("✓ {}", msg.unwrap_or("Registered successfully".to_string()));
+                }
+                daemon::protocol::DaemonResponse::Error(e) => {
+                    eprintln!("✗ Error: {}", e);
                     std::process::exit(1);
                 }
-
-                let request = DaemonRequest::SetServer {
-                    address: parts[0].to_string(),
-                    invite_code: parts[1].to_string(),
-                    verify_tls: true,
-                };
-
-                match client.send_request(request).await? {
-                    daemon::protocol::DaemonResponse::Ok(msg) => {
-                        println!("✓ {}", msg.unwrap_or("Server configured".to_string()));
-                    }
-                    daemon::protocol::DaemonResponse::Error(e) => {
-                        eprintln!("✗ Error: {}", e);
-                        std::process::exit(1);
-                    }
-                    _ => {
-                        eprintln!("✗ Unexpected response");
-                        std::process::exit(1);
-                    }
+                _ => {
+                    eprintln!("✗ Unexpected response");
+                    std::process::exit(1);
                 }
-            } else if get {
-                let request = DaemonRequest::GetServer;
-                match client.send_request(request).await? {
-                    daemon::protocol::DaemonResponse::ServerConfig {
-                        address,
-                        invite_code,
-                        verify_tls,
-                        registered,
-                    } => {
-                        println!("Server Configuration:");
-                        println!("  Address: {}", address);
-                        println!("  Invite Code: {}", invite_code);
-                        println!("  Verify TLS: {}", verify_tls);
-                        println!("  Registered: {}", if registered { "Yes" } else { "No" });
-                    }
-                    daemon::protocol::DaemonResponse::Error(e) => {
-                        eprintln!("✗ Error: {}", e);
-                        std::process::exit(1);
-                    }
-                    _ => {
-                        eprintln!("✗ Unexpected response");
-                        std::process::exit(1);
-                    }
-                }
-            } else if register {
-                let request = DaemonRequest::Register;
-                match client.send_request(request).await? {
-                    daemon::protocol::DaemonResponse::Ok(msg) => {
-                        println!("✓ {}", msg.unwrap_or("Registered successfully".to_string()));
-                    }
-                    daemon::protocol::DaemonResponse::Error(e) => {
-                        eprintln!("✗ Error: {}", e);
-                        std::process::exit(1);
-                    }
-                    _ => {
-                        eprintln!("✗ Unexpected response");
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                eprintln!("Error: Specify --set, --get, or --register");
-                std::process::exit(1);
             }
         }
 

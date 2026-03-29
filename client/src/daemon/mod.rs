@@ -2,11 +2,14 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::io;
+use std::future::Future;
+use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::ClientConfig;
 use crate::config::ServerConfig;
+use crate::server_rest::client::ServerRestClient;
 
 pub mod protocol;
 pub mod client;
@@ -16,7 +19,7 @@ use protocol::{DaemonRequest, DaemonResponse, SharedSecret};
 
 /// Daemon state and management
 pub struct Daemon {
-    config: ClientConfig,
+    config: Arc<ClientConfig>,
     server_config: Arc<Mutex<Option<ServerConfig>>>,
     secret: SharedSecret,
     memory: Arc<daemon_memory::DaemonMemory>,
@@ -45,14 +48,20 @@ impl Daemon {
             }
         };
 
-        // Load server configuration if it exists
-        let server_config = ServerConfig::load(&config.data_dir).ok();
+        // Load server configuration if it exists and ensure local WireGuard keypair is persisted.
+        let mut server_config = ServerConfig::load(&config.data_dir).ok();
+        if let Some(cfg) = server_config.as_mut() {
+            cfg.ensure_wireguard_keypair()?;
+            cfg.save(&config.data_dir)?;
+        }
+
+        let cfg_clone = config.clone();
 
         Ok(Daemon {
-            config,
+            config: Arc::new(config),
             server_config: Arc::new(Mutex::new(server_config)),
             secret,
-            memory: Arc::new(daemon_memory::DaemonMemory::new()),
+            memory: Arc::new(daemon_memory::DaemonMemory::new(cfg_clone)),
         })
     }
 
@@ -70,8 +79,11 @@ impl Daemon {
                 invite_code,
                 verify_tls,
             } => self.handle_set_server(address, invite_code, verify_tls).await,
-            DaemonRequest::GetServer => self.handle_get_server().await,
-            DaemonRequest::Register => self.handle_register().await,
+            DaemonRequest::Register {
+                address,
+                invite_code,
+                verify_tls,
+            } => self.handle_register(address, invite_code, verify_tls).await,
             DaemonRequest::Restart => self.handle_restart().await,
             DaemonRequest::Shutdown => self.handle_shutdown().await,
             DaemonRequest::GetConfig => self.handle_get_config().await,
@@ -86,18 +98,22 @@ impl Daemon {
     }
 
     async fn handle_status(&self) -> DaemonResponse {
-        let server_config = self.server_config.lock().await;
-        let server_configured = server_config.is_some();
-        let node_key_present = server_config
-            .as_ref()
-            .and_then(|s| s.node_key.clone())
-            .is_some();
+        let (server_configured, node_key_present) = {
+            let server_config = self.server_config.lock().await;
+            let server_configured = server_config.is_some();
+            let node_key_present = server_config
+                .as_ref()
+                .and_then(|s| s.node_key.clone())
+                .is_some();
+            (server_configured, node_key_present)
+        };
+        let poll_error = self.memory.get_last_poll_error().await;
 
         DaemonResponse::Status {
             running: true,
             server_configured,
             node_key_present,
-            message: None,
+            message: poll_error,
         }
     }
 
@@ -108,12 +124,18 @@ impl Daemon {
         verify_tls: bool,
     ) -> DaemonResponse {
         let mut server_config = self.server_config.lock().await;
-        let config = ServerConfig {
+        let mut config = ServerConfig {
             address,
             invite_code,
             verify_tls,
             node_key: None,
+            wg_private_key: None,
+            wg_public_key: None,
         };
+
+        if let Err(e) = config.ensure_wireguard_keypair() {
+            return DaemonResponse::Error(format!("Failed to generate WireGuard keypair: {}", e));
+        }
 
         if let Err(e) = config.save(&self.config.data_dir) {
             return DaemonResponse::Error(format!("Failed to save server config: {}", e));
@@ -123,35 +145,63 @@ impl Daemon {
         DaemonResponse::Ok(Some("Server configuration set".to_string()))
     }
 
-    async fn handle_get_server(&self) -> DaemonResponse {
-        let server_config = self.server_config.lock().await;
-        match server_config.as_ref() {
-            Some(config) => DaemonResponse::ServerConfig {
-                address: config.address.clone(),
-                invite_code: config.invite_code.clone(),
-                verify_tls: config.verify_tls,
-                registered: config.node_key.is_some(),
-            },
-            None => DaemonResponse::Error("Server not configured".to_string()),
+    async fn handle_register(
+        &self,
+        address: String,
+        invite_code: String,
+        verify_tls: bool,
+    ) -> DaemonResponse {
+        let mut config = ServerConfig {
+            address,
+            invite_code,
+            verify_tls,
+            node_key: None,
+            wg_private_key: None,
+            wg_public_key: None,
+        };
+
+        if let Err(e) = config.ensure_wireguard_keypair() {
+            return DaemonResponse::Error(format!("Failed to generate WireGuard keypair: {}", e));
         }
-    }
 
-    async fn handle_register(&self) -> DaemonResponse {
-        let mut server_config = self.server_config.lock().await;
-        match server_config.as_mut() {
-            Some(config) => {
-                // In a real implementation, this would register with the server
-                // and obtain a node key
-                config.node_key = Some("generated-node-key".to_string());
-
-                if let Err(e) = config.save(&self.config.data_dir) {
-                    return DaemonResponse::Error(format!("Failed to save node key: {}", e));
-                }
-
-                DaemonResponse::Ok(Some("Registration successful".to_string()))
+        let rest_client = match ServerRestClient::new(&config) {
+            Ok(client) => client,
+            Err(e) => {
+                return DaemonResponse::Error(format!("Failed to create server client: {}", e));
             }
-            None => DaemonResponse::Error("Server not configured".to_string()),
+        };
+
+        let node_name = std::env::var("HOSTNAME").unwrap_or_else(|_| "cat4igp-client".to_string());
+        let registration = match rest_client.register(&node_name, &config.invite_code).await {
+            Ok(response) => response,
+            Err(e) => {
+                return DaemonResponse::Error(format!("Registration failed: {}", e));
+            }
+        };
+
+        if !registration.success {
+            return DaemonResponse::Error("Registration failed: server returned unsuccessful response".to_string());
         }
+
+        config.node_key = Some(registration.auth_key);
+
+        if let Some(public_key) = config.wg_public_key.clone() {
+            if let Err(e) = rest_client.update_wireguard_pubkey(&public_key).await {
+                return DaemonResponse::Error(format!(
+                    "Registration succeeded but failed to sync WireGuard public key: {}",
+                    e
+                ));
+            }
+        }
+
+        if let Err(e) = config.save(&self.config.data_dir) {
+            return DaemonResponse::Error(format!("Failed to save server config: {}", e));
+        }
+
+        let mut server_config = self.server_config.lock().await;
+        *server_config = Some(config);
+
+        DaemonResponse::Ok(Some("Registration successful".to_string()))
     }
 
     async fn handle_restart(&self) -> DaemonResponse {
@@ -165,7 +215,7 @@ impl Daemon {
     }
 
     async fn handle_get_config(&self) -> DaemonResponse {
-        match serde_json::to_value(&self.config) {
+        match serde_json::to_value(&*self.config) {
             Ok(value) => DaemonResponse::Config(value),
             Err(e) => DaemonResponse::Error(format!("Failed to serialize config: {}", e)),
         }
@@ -215,6 +265,15 @@ impl Daemon {
         let listener = UnixListener::bind(&self.config.daemon_socket)?;
         println!("✓ Listening on socket: {:?}", self.config.daemon_socket);
 
+        if let Err(e) = self.sync_public_key_on_startup().await {
+            eprintln!("[daemon] startup WireGuard public key sync failed: {}", e);
+        }
+
+        let daemon_for_updates = self.clone_for_handler();
+        tokio::spawn(async move {
+            daemon_for_updates.run_update_loop().await;
+        });
+
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -245,6 +304,150 @@ impl Daemon {
             // do not clone memory! clone the Arc instead
             memory: Arc::clone(&self.memory),
         })
+    }
+
+    async fn run_update_loop(self: Arc<Self>) {
+        let mut self_info_interval = tokio::time::interval(Duration::from_secs(300));
+        let mut all_nodes_interval = tokio::time::interval(Duration::from_secs(300));
+        let mut wg_tunnel_interval = tokio::time::interval(Duration::from_secs(30));
+
+        loop {
+            tokio::select! {
+                _ = self_info_interval.tick() => {
+                    if let Err(e) = self.poll_self_info().await {
+                        eprintln!("[daemon] self info poll failed: {}", e);
+                        self.memory.set_last_poll_error(Some(format!("self poll failed: {}", e))).await;
+                    } else {
+                        self.memory.set_last_poll_error(None).await;
+                    }
+                }
+                _ = all_nodes_interval.tick() => {
+                    if let Err(e) = self.poll_all_nodes().await {
+                        eprintln!("[daemon] all nodes poll failed: {}", e);
+                        self.memory.set_last_poll_error(Some(format!("node list poll failed: {}", e))).await;
+                    } else {
+                        self.memory.set_last_poll_error(None).await;
+                    }
+                }
+                _ = wg_tunnel_interval.tick() => {
+                    if let Err(e) = self.poll_wireguard_tunnels().await {
+                        eprintln!("[daemon] wireguard poll failed: {}", e);
+                        self.memory.set_last_poll_error(Some(format!("wireguard poll failed: {}", e))).await;
+                    } else {
+                        self.memory.set_last_poll_error(None).await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn registered_server_config(&self) -> Result<ServerConfig, String> {
+        let cfg = self.server_config.lock().await.clone();
+        let cfg = cfg.ok_or_else(|| "server not configured".to_string())?;
+        if cfg.node_key.as_deref().unwrap_or_default().is_empty() {
+            return Err("server configured but not registered".to_string());
+        }
+        Ok(cfg)
+    }
+
+    async fn retry_with_backoff<T, F, Fut>(&self, label: &str, mut op: F) -> Result<T, String>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>>,
+    {
+        let mut delay_secs = 1u64;
+        for attempt in 1..=5 {
+            match op().await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    if attempt == 5 {
+                        return Err(format!("{} failed after {} attempts: {}", label, attempt, e));
+                    }
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                    delay_secs = (delay_secs * 2).min(60);
+                }
+            }
+        }
+
+        Err(format!("{} failed", label))
+    }
+
+    async fn poll_self_info(&self) -> Result<(), String> {
+        let cfg = self.registered_server_config().await?;
+        let client = ServerRestClient::new(&cfg).map_err(|e| e.to_string())?;
+        let response = self
+            .retry_with_backoff("/client/self", || {
+                let client = client.clone();
+                async move { client.get_self_info().await }
+            })
+            .await?;
+        self.memory.set_node_info(response).await;
+        Ok(())
+    }
+
+    async fn poll_all_nodes(&self) -> Result<(), String> {
+        let cfg = self.registered_server_config().await?;
+        let client = ServerRestClient::new(&cfg).map_err(|e| e.to_string())?;
+        let response = self
+            .retry_with_backoff("/client/all_nodes", || {
+                let client = client.clone();
+                async move { client.get_all_nodes().await }
+            })
+            .await?;
+        self.memory.set_all_nodes(response).await;
+        Ok(())
+    }
+
+    async fn poll_wireguard_tunnels(&self) -> Result<(), String> {
+        let cfg = self.registered_server_config().await?;
+        let client = ServerRestClient::new(&cfg).map_err(|e| e.to_string())?;
+        let response = self
+            .retry_with_backoff("/client/wg_tun", || {
+                let client = client.clone();
+                async move { client.get_wireguard_tunnels().await }
+            })
+            .await?;
+
+        self.memory.set_wireguard_tunnels(response.clone()).await;
+
+        let local_private_key = cfg
+            .wg_private_key
+            .clone()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "wireguard private key missing from server configuration".to_string())?;
+
+        self.memory
+            .reconcile_wireguard_tunnels(&response, &local_private_key)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn sync_public_key_on_startup(&self) -> Result<(), String> {
+        let cfg = match self.server_config.lock().await.clone() {
+            Some(cfg) => cfg,
+            None => return Ok(()),
+        };
+
+        let node_key = cfg.node_key.as_deref().unwrap_or_default();
+        if node_key.is_empty() {
+            return Ok(());
+        }
+
+        let public_key = cfg
+            .wg_public_key
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "wireguard public key missing from server configuration".to_string())?;
+
+        let client = ServerRestClient::new(&cfg).map_err(|e| e.to_string())?;
+        self.retry_with_backoff("/client/wg_pubkey", || {
+            let client = client.clone();
+            let public_key = public_key.to_string();
+            async move { client.update_wireguard_pubkey(&public_key).await }
+        })
+        .await
+        .map(|_| ())
     }
 }
 

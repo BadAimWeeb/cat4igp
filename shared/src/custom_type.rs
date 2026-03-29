@@ -6,6 +6,7 @@ pub enum WireguardAnswered {
     Answered = 1,
     RejectedGeneric = 2,
     RejectedNoIpStack = 3,
+    RejectedFakeTCPNotSupported = 4,
     Unknown = -1
 }
 
@@ -16,6 +17,7 @@ impl From<i16> for WireguardAnswered {
             1 => WireguardAnswered::Answered,
             2 => WireguardAnswered::RejectedGeneric,
             3 => WireguardAnswered::RejectedNoIpStack,
+            4 => WireguardAnswered::RejectedFakeTCPNotSupported,
             _ => WireguardAnswered::Unknown,
         }
     }
@@ -28,6 +30,7 @@ impl From<WireguardAnswered> for i16 {
             WireguardAnswered::Answered => 1,
             WireguardAnswered::RejectedGeneric => 2,
             WireguardAnswered::RejectedNoIpStack => 3,
+            WireguardAnswered::RejectedFakeTCPNotSupported => 4,
             WireguardAnswered::Unknown => -1,
         }
     }

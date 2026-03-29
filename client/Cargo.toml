@@ -7,22 +7,23 @@ edition = "2024"
 blake2 = "0.10.6"
 futures-util = "0.3.31"
 ipnet = "2.11.0"
-rtnetlink = "0.18.1"
+rtnetlink = "0.20.0"
 tokio = { version = "1.48.0", features = ["full"] }
 wireguard-control = "1.7.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "1.0.3+spec-1.1.0"
 clap = { version = "4.4", features = ["derive"] }
-reqwest = "0.11"
-dns-lookup = "1.0"
-rustls = "0.21"
-tokio-rustls = "0.24"
-webpki-roots = "0.25"
-rand = "0.8"
+reqwest = { version = "0.13.2", features = ["json"] }
+dns-lookup = "3.0.1"
+rustls = "0.23.37"
+tokio-rustls = "0.26.4"
+webpki-roots = "1.0.6"
+rand = "0.10.0"
 udp_sas = "0.1"
 libc = "0.2"
 cat4igp-shared = { workspace = true }
+cat4igp-libfec = { workspace = true }
 base32 = "0.5.1"
 
 [dev-dependencies]
