@@ -1,3 +1,10 @@
+# Packaged installations
+
+For distro packages, use `/etc/cat4igp/client.toml` and the packaged service.
+See [packaging setup](packaging/README.md) for current CLI commands, enrollment
+and persistent OpenWrt state. The older standalone examples below are not the
+package installation contract; configuration files accepted by the daemon are TOML.
+
 # cat4igp Client Configuration and Usage Guide
 
 ## Overview

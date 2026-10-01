@@ -1,0 +1,37 @@
+#!/bin/sh /etc/rc.common
+
+# 25.12 default_postinst exports pkgname before invoking enable/start.
+# Suppress only those package-manager calls; never disable admin-created links.
+if [ "${pkgname:-}" = cat4igp-client ]; then
+	case "$action" in
+		enable|start)
+			enable() { return 0; }
+			start() { return 0; }
+			return 0
+			;;
+	esac
+fi
+
+START=95
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	local config=/etc/cat4igp/client.toml
+	[ -f "$config" ] && [ -r "$config" ] || {
+		logger -t cat4igp-client "Missing or unreadable configuration: $config"
+		return 1
+	}
+	umask 077
+	mkdir -p /etc/cat4igp/state || return 1
+	chmod 0700 /etc/cat4igp/state || return 1
+
+	procd_open_instance
+	# procd has no umask parameter; set it in the exec wrapper, not just rc.common.
+	procd_set_param command /bin/sh -c 'umask 077; exec /usr/bin/cat4igp-client daemon --config "$1"' sh "$config"
+	procd_set_param file "$config"
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}

@@ -15,3 +15,7 @@ This will attempt to address those drawbacks.
 **WORK-IN-PROGRESS**
 
 **This is not available in Windows.**
+
+Client packages for Alpine, Debian, Arch Linux and OpenWrt, plus portable static binaries, are
+built by GitHub Actions. See [packaging and service setup](packaging/README.md)
+for supported targets, snapshot artifacts and tagged releases.

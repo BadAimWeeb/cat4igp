@@ -1,0 +1,34 @@
+#!/usr/bin/make -f
+
+export CARGO_TARGET_DIR := $(CURDIR)/target
+export DEB_BUILD_OPTIONS := $(DEB_BUILD_OPTIONS) noautodbgsym
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	cargo build --locked --release -p cat4igp-client
+
+override_dh_auto_test:
+	target/release/cat4igp-client --help >/dev/null
+
+override_dh_auto_install:
+	install -Dm755 target/release/cat4igp-client debian/cat4igp-client/usr/bin/cat4igp-client
+	install -Dm600 packaging/client.toml debian/cat4igp-client/etc/cat4igp/client.toml
+	install -dm700 debian/cat4igp-client/var/lib/cat4igp-client
+	install -Dm644 packaging/cat4igp-client.service debian/cat4igp-client/usr/lib/systemd/system/cat4igp-client.service
+	install -Dm644 LICENSE debian/cat4igp-client/usr/share/doc/cat4igp-client/copyright
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
+
+override_dh_fixperms:
+	dh_fixperms
+	chmod 0600 debian/cat4igp-client/etc/cat4igp/client.toml
+	chmod 0700 debian/cat4igp-client/var/lib/cat4igp-client
+	sh debian/check.sh debian/cat4igp-client usr/lib/systemd/system/cat4igp-client.service
+
+override_dh_auto_clean:
+	cargo clean

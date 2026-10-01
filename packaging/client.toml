@@ -1,0 +1,10 @@
+# Enrollment and network settings are configured by the administrator.
+daemon_socket = "/var/run/cat4igp-client.sock"
+data_dir = "/var/lib/cat4igp-client"
+
+[port_range]
+min = 51820
+max = 52000 # Exclusive
+
+[tunnel_protocols]
+wireguard = true

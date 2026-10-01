@@ -1,0 +1,36 @@
+# Local CI build: copy the full workspace to ./workspace before invoking abuild.
+pkgname=cat4igp-client
+pkgver=${pkgver:-0.1.0}
+pkgrel=0
+pkgdesc="WireGuard mesh network client"
+url="https://github.com/BadAimWeeb/cat4igp"
+arch="x86_64 aarch64"
+license="MIT"
+depends="ca-certificates openrc"
+makedepends="cmake"
+source=""
+options="net !dbg"
+builddir="$srcdir/workspace"
+
+# ponytail: binary packages from workflow-provided sources only; archive sources for distro submission.
+prepare() {
+	mkdir -p "$builddir"
+	cp -a "$startdir/workspace/." "$builddir/"
+}
+
+build() {
+	CARGO_TARGET_DIR="$builddir/target" cargo build --locked --release -p cat4igp-client
+}
+
+check() {
+	"$builddir/target/release/cat4igp-client" --help >/dev/null
+}
+
+package() {
+	install -Dm755 "$builddir/target/release/cat4igp-client" "$pkgdir/usr/bin/cat4igp-client"
+	install -Dm600 "$builddir/packaging/client.toml" "$pkgdir/etc/cat4igp/client.toml"
+	install -dm700 "$pkgdir/var/lib/cat4igp-client"
+	install -Dm755 "$builddir/packaging/cat4igp-client.openrc" "$pkgdir/etc/init.d/cat4igp-client"
+	install -Dm644 "$builddir/LICENSE" "$pkgdir/usr/share/licenses/cat4igp-client/LICENSE"
+	sh "$builddir/packaging/debian/check.sh" "$pkgdir" etc/init.d/cat4igp-client
+}

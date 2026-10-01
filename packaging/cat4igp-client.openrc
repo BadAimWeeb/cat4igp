@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+
+description="CAT4IGP WireGuard mesh client"
+supervisor="supervise-daemon"
+command="/usr/bin/cat4igp-client"
+command_args="daemon --config /etc/cat4igp/client.toml"
+umask=0077
+
+depend() {
+    need net
+}
+
+start_pre() {
+    if ! test -r /etc/cat4igp/client.toml; then
+        eerror "Missing or unreadable /etc/cat4igp/client.toml"
+        return 1
+    fi
+    checkpath --directory --mode 0700 --owner root:root /var/lib/cat4igp-client
+}

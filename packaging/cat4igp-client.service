@@ -1,0 +1,17 @@
+[Unit]
+Description=CAT4IGP WireGuard mesh client
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/test -r /etc/cat4igp/client.toml
+ExecStart=/usr/bin/cat4igp-client daemon --config /etc/cat4igp/client.toml
+StateDirectory=cat4igp-client
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

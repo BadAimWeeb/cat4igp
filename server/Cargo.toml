@@ -2,6 +2,7 @@
 name = "cat4igp-server"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 axum = { version = "0.8.7", features = ["ws", "multipart", "http2", "macros"] }

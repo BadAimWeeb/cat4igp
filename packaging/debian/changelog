@@ -1,0 +1,5 @@
+cat4igp-client (0.1.0-1) unstable; urgency=medium
+
+  * Initial client-only package. CI replaces the version for snapshots/releases.
+
+ -- BadAimWeeb <badaimweeb@protonmail.com>  Thu, 01 Oct 2026 00:00:00 +0000

@@ -304,7 +304,6 @@ async fn start_daemon(config: config::ClientConfig) -> Result<(), Box<dyn std::e
 
     let daemon = daemon::Daemon::new(config).await?;
     println!("✓ Daemon initialized");
-    println!("  Daemon secret: {}", daemon.get_secret());
 
     if daemon.is_server_configured().await {
         println!("✓ Server is configured");

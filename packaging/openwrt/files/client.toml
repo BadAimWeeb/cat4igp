@@ -1,0 +1,11 @@
+daemon_socket = "/var/run/cat4igp-client.sock"
+data_dir = "/etc/cat4igp/state"
+control_network_id = "default"
+control_bootstrap_addresses = []
+
+[port_range]
+min = 51820
+max = 52000
+
+[tunnel_protocols]
+wireguard = true
