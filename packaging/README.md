@@ -34,7 +34,12 @@ architecture Linux machine with Docker, using `alpine`, `debian`, `arch` or
 Both OpenWrt builds require an x86_64 host.
 Outputs go to `dist/DISTRO-ARCH/`. The workflow builds only `cat4igp-client`
 with locked dependencies. Rust and native crypto compilation need substantial
-memory, disk space and network access; OpenWrt also builds its Rust host toolchain.
+memory, disk space and network access. OpenWrt uses the checksummed prebuilt
+release SDK for its C compiler/sysroot and upstream Rust 1.94.0 binaries plus
+the matching musl standard library; it does not rebuild rustc or LLVM.
+The pinned feed still supplies Cargo/linker integration. This prebuilt Rust
+path supports only the listed x86_64 and aarch64 targets; custom targets may
+require the feed's source-built `rust/host` toolchain.
 
 Standalone packages are not published through signed distribution
 repositories. Alpine packages use a disposable build signing key: installation

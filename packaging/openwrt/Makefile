@@ -10,7 +10,9 @@ PKG_SOURCE_URL:=file://$(DL_DIR)
 # ponytail: local workflow sources only; pass PKG_HASH for verified release archives.
 PKG_HASH?=skip
 PKG_LICENSE:=MIT
-PKG_BUILD_DEPENDS:=rust/host cmake/host
+# Workflow installs pinned upstream rustc/cargo and the target standard library.
+# ponytail: x86_64/aarch64 musl only; restore rust/host for custom Rust targets.
+PKG_BUILD_DEPENDS:=cmake/host
 PKG_BUILD_PARALLEL:=1
 MAKE_PATH:=client
 

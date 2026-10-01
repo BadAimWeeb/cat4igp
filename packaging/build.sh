@@ -159,6 +159,12 @@ case $DISTRO in
         cp workspace/packaging/arch/PKGBUILD .
         makepkg --noconfirm ;;
     openwrt)
+        # The SDK already supplies the target C toolchain. Use upstream Rust
+        # binaries instead of rebuilding rustc/LLVM through rust/host.
+        curl -fL --retry 3 https://sh.rustup.rs -o rustup.sh
+        sh rustup.sh -y --profile minimal --default-toolchain 1.94.0
+        export RUSTUP_TOOLCHAIN=1.94.0
+        rustup target add "$ARCH-unknown-linux-musl"
         case $ARCH in
             x86_64) target=x86/64; name=x86-64; checksum=0c8df0151a1e88feb7c03d694d61f6a18d51872815b7c811d76e2b77504d5e9c ;;
             aarch64) target=armsr/armv8; name=armsr-armv8; checksum=1b0316604a3e820b2b008a1baff3f9dac6716af942bef800930e58c7de98c98b ;;
