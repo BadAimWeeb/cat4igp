@@ -19,3 +19,6 @@ This will attempt to address those drawbacks.
 Client packages for Alpine, Debian, Arch Linux and OpenWrt, plus portable static binaries, are
 built by GitHub Actions. See [packaging and service setup](packaging/README.md)
 for supported targets, snapshot artifacts and tagged releases.
+
+The server is published as a multiarchitecture Alpine image in GitHub Packages;
+see [server container setup](server/CONTAINER.md).

@@ -1,0 +1,7 @@
+.git
+target
+dist
+.env
+**/.env
+**/*.db
+**/*.db-*
