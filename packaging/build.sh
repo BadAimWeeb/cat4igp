@@ -45,7 +45,7 @@ fi
 
 [[ $# == 2 || ($# == 3 && $3 == --inside) ]] || die 'Usage: build.sh DISTRO ARCH | --check'
 distro=$1 arch=$2
-case "$distro/$arch" in alpine/x86_64|alpine/aarch64|debian/x86_64|debian/aarch64|arch/x86_64|openwrt/x86_64|openwrt/aarch64|static/x86_64|static/aarch64) ;; *) die 'Unsupported target' ;; esac
+case "$distro/$arch" in alpine/x86_64|alpine/aarch64|alpine/riscv64|debian/x86_64|debian/aarch64|debian/riscv64|arch/x86_64|openwrt/x86_64|openwrt/aarch64|static/x86_64|static/aarch64) ;; *) die 'Unsupported target' ;; esac
 expected_host=$arch
 [[ $distro != openwrt ]] || expected_host=x86_64
 [[ $(uname -m) == "$expected_host" ]] || die "This build requires a $expected_host host"
@@ -84,6 +84,9 @@ fi
 case $distro in
     alpine|static)
         apk add --no-cache alpine-sdk cmake curl musl-dev gcc g++ libgcc coreutils perl linux-headers
+        if [[ $arch == riscv64 ]]; then
+            apk add --no-cache rust=1.96.1-r0 cargo=1.96.1-r0
+        fi
         adduser -D builder; addgroup builder abuild ;;
     debian|openwrt)
         apt-get install -y --no-install-recommends build-essential cmake curl debhelper devscripts fakeroot \
@@ -113,8 +116,15 @@ su builder -s /bin/bash <<'BUILD'
 set -euo pipefail
 cd "$WORK"
 export PATH="$HOME/.cargo/bin:$PATH"
-if [[ $DISTRO != openwrt ]]; then
+if [[ $DISTRO == alpine && $ARCH == riscv64 ]]; then
+    # ponytail: upstream 1.94 lacks this musl host; use Alpine's pinned native
+    # compiler until upstream distributes riscv64gc musl host tools.
+    unset RUSTUP_TOOLCHAIN
+    rustc --version
+    cargo --version
+elif [[ $DISTRO != openwrt ]]; then
     host="$ARCH-unknown-linux-gnu"
+    [[ $ARCH != riscv64 ]] || host=riscv64gc-unknown-linux-gnu
     [[ $DISTRO != alpine && $DISTRO != static ]] || host="$ARCH-unknown-linux-musl"
     curl -fL --retry 3 https://sh.rustup.rs -o rustup.sh
     sh rustup.sh -y --profile minimal --default-host "$host" --default-toolchain 1.94.0

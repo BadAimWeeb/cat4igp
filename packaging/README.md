@@ -7,8 +7,8 @@ starting them**. Linux kernel WireGuard support is required; OpenWrt declares
 
 | Build environment | Architectures | Service |
 | --- | --- | --- |
-| Alpine 3.24 | x86_64, aarch64 | OpenRC |
-| Debian 13 (trixie) | amd64, arm64 | systemd |
+| Alpine 3.24 | x86_64, aarch64, riscv64 | OpenRC |
+| Debian 13 (trixie) | amd64, arm64, riscv64 | systemd |
 | Arch Linux | x86_64 | systemd |
 | OpenWrt 25.12.5 | x86/64, armsr/armv8 | procd |
 | Static musl binary | x86_64, aarch64 | Administrator-managed |
@@ -23,7 +23,7 @@ bit-for-bit reproducible builds.
 Default-branch commits and manual runs produce SNAPSHOT packages retained as
 Actions artifacts for 14 days. Versions include the commit time and hash
 (Alpine and OpenWrt encode the hash as a number) and sort before the corresponding final
-release. Release tags must be `vX.Y.Z` matching `client/Cargo.toml`; all nine
+release. Release tags must be `vX.Y.Z` matching `client/Cargo.toml`; all eleven
 builds must succeed before GitHub Releases receives packages and SHA256SUMS.
 Manual runs never publish releases. Release filenames identify the distro
 and architecture to avoid collisions.
@@ -31,6 +31,12 @@ and architecture to avoid collisions.
 For local builds, invoke `bash packaging/build.sh DISTRO ARCH` on a matching
 architecture Linux machine with Docker, using `alpine`, `debian`, `arch` or
 `openwrt` or `static` and `x86_64` or `aarch64` (Arch supports x86_64 only).
+Debian and Alpine additionally support `riscv64`, built natively on
+`ubuntu-24.04-riscv` RISE runners. Debian uses Rust 1.94.0's
+`riscv64gc-unknown-linux-gnu` host; Alpine uses its native Rust/Cargo
+1.96.1-r0 packages because upstream 1.94.0 has no prebuilt RISC-V musl host.
+Alpine's native Cargo does not apply the rustup toolchain file. RISC-V builds
+use the toolchain's default RV64GC baseline, not runner-specific CPU tuning.
 Both OpenWrt builds require an x86_64 host.
 Outputs go to `dist/DISTRO-ARCH/`. The workflow builds only `cat4igp-client`
 with locked dependencies. Rust and native crypto compilation need substantial
