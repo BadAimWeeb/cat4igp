@@ -9,5 +9,3 @@ pub trait Tunnel {
     fn is_ift_created(&self) -> bool;
     fn is_connected(&self) -> Result<bool, Box<dyn std::error::Error>>;
 }
-
-

@@ -72,9 +72,8 @@ Returns daemon running status, server configuration state, and node key presence
 ### SetServer
 ```rust
 DaemonRequest::SetServer {
-    address: "https://server.example.com:8443",
+    address: "/dns4/controller.example.com/tcp/9000/p2p/12D3KooW...",
     invite_code: "invite-code-here",
-    verify_tls: true,
 }
 ```
 Configures server settings and saves to `<data_dir>/server.json`.
@@ -130,12 +129,7 @@ DaemonResponse::Status {
 
 ### ServerConfig
 ```rust
-DaemonResponse::ServerConfig {
-    address: "https://server.example.com:8443",
-    invite_code: "invite-code",
-    verify_tls: true,
-    registered: false,
-}
+DaemonResponse::Config(serde_json::Value)
 ```
 
 ### Config
@@ -181,26 +175,18 @@ DaemonResponse::Config(serde_json::Value)
 
 ```bash
 # Set server configuration
-./target/debug/client server --set "https://server.example.com:8443,my-invite-code"
+./target/debug/client register --server /dns4/controller.example.com/tcp/9000/p2p/12D3KooW... --invite my-invite-code
 
 # Output:
 # ✓ Server configuration set
 
-# Get server configuration
-./target/debug/client server --get
-
-# Output:
-# Server Configuration:
-#   Address: https://server.example.com:8443
-#   Invite Code: my-invite-code
-#   Verify TLS: true
-#   Registered: No
+# The daemon stores enrollment state in <data_dir>/server.json with mode 0600.
 ```
 
 ### Register with Server
 
 ```bash
-./target/debug/client server --register
+./target/debug/client register --server /dns4/controller.example.com/tcp/9000/p2p/12D3KooW... --invite my-invite-code
 
 # Output:
 # ✓ Registration successful

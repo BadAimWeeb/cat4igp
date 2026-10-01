@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use cat4igp_libfec::{FecConfig, FecDecoder, FecEncoder, FecMode};
+use std::collections::HashSet;
 
 fn payload_for(i: u16) -> Vec<u8> {
     i.to_be_bytes().to_vec()

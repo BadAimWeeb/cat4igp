@@ -20,7 +20,7 @@ pub struct WireGuardTunnel {
     peer_public_key: String,
     peer_endpoint: Option<SocketAddr>,
     listen_port: Option<u16>,
-    force_userspace: bool
+    force_userspace: bool,
 }
 
 impl WireGuardTunnel {
@@ -37,7 +37,7 @@ impl WireGuardTunnel {
             peer_public_key,
             peer_endpoint,
             listen_port,
-            force_userspace: false
+            force_userspace: false,
         }
     }
 
@@ -54,7 +54,7 @@ impl WireGuardTunnel {
             peer_public_key,
             peer_endpoint,
             listen_port,
-            force_userspace: true
+            force_userspace: true,
         }
     }
 
@@ -191,7 +191,15 @@ impl Tunnel for WireGuardTunnel {
     fn is_ift_created(&self) -> bool {
         let name = &InterfaceName::from_str(self.interface.as_str());
         if let Ok(ifname) = name {
-            Device::get(ifname, if self.force_userspace { Backend::Userspace } else { BACKEND }).is_ok()
+            Device::get(
+                ifname,
+                if self.force_userspace {
+                    Backend::Userspace
+                } else {
+                    BACKEND
+                },
+            )
+            .is_ok()
         } else {
             false
         }

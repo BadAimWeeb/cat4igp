@@ -2,9 +2,9 @@ use crate::config::Config;
 use crate::control::PeerState;
 use crate::fec::{FecConfig, FecDecoder, FecEncoder};
 use crate::handshake::{
-    choose_server_role, decode_control_message, decode_resume_plaintext, derive_shared_key, encode_control_message,
-    encode_resume_plaintext, encrypt_with_key, random_nonce, random_u64, ControlMessage, Hello, HelloAck, Resume,
-    ResumeAck,
+    choose_server_role, decode_control_message, decode_resume_plaintext, derive_shared_key,
+    encode_control_message, encode_resume_plaintext, encrypt_with_key, random_nonce, random_u64,
+    ControlMessage, Hello, HelloAck, Resume, ResumeAck,
 };
 use crate::proto::{decode_packet, encode_packet, FLAG_CONTROL};
 use crate::stats::Counters;
@@ -163,7 +163,11 @@ async fn send_control_packet(
     Ok(())
 }
 
-pub async fn spawn(config: Config, peer_state: PeerState, counters: Arc<Counters>) -> Result<(Runtime, BoundAddrs), std::io::Error> {
+pub async fn spawn(
+    config: Config,
+    peer_state: PeerState,
+    counters: Arc<Counters>,
+) -> Result<(Runtime, BoundAddrs), std::io::Error> {
     let fec_socket = Arc::new(UdpSocket::bind(config.fec_bind).await?);
     let local_socket = Arc::new(UdpSocket::bind(config.local_bind).await?);
 
@@ -346,11 +350,15 @@ pub async fn spawn(config: Config, peer_state: PeerState, counters: Arc<Counters
                 };
 
                 if (packet.header.flags & FLAG_CONTROL) != 0 {
-                    counters.handshake_rx_packets.fetch_add(1, Ordering::Relaxed);
+                    counters
+                        .handshake_rx_packets
+                        .fetch_add(1, Ordering::Relaxed);
                     let control = match decode_control_message(&packet.payload) {
                         Ok(msg) => msg,
                         Err(_) => {
-                            counters.dropped_invalid_control.fetch_add(1, Ordering::Relaxed);
+                            counters
+                                .dropped_invalid_control
+                                .fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                     };
@@ -370,8 +378,15 @@ pub async fn spawn(config: Config, peer_state: PeerState, counters: Arc<Counters
                                     msg.session_id,
                                 );
 
-                                lock.maybe_establish_from_remote(src, msg.session_id, msg.timestamp_ms, msg.public_key);
-                                counters.handshake_established.fetch_add(1, Ordering::Relaxed);
+                                lock.maybe_establish_from_remote(
+                                    src,
+                                    msg.session_id,
+                                    msg.timestamp_ms,
+                                    msg.public_key,
+                                );
+                                counters
+                                    .handshake_established
+                                    .fetch_add(1, Ordering::Relaxed);
 
                                 Some(ControlMessage::HelloAck(HelloAck {
                                     session_id: lock.local_session_id,
@@ -381,20 +396,39 @@ pub async fn spawn(config: Config, peer_state: PeerState, counters: Arc<Counters
                                 }))
                             }
                             ControlMessage::HelloAck(msg) => {
-                                lock.maybe_establish_from_remote(src, msg.session_id, msg.timestamp_ms, msg.public_key);
-                                counters.handshake_established.fetch_add(1, Ordering::Relaxed);
+                                lock.maybe_establish_from_remote(
+                                    src,
+                                    msg.session_id,
+                                    msg.timestamp_ms,
+                                    msg.public_key,
+                                );
+                                counters
+                                    .handshake_established
+                                    .fetch_add(1, Ordering::Relaxed);
                                 None
                             }
                             ControlMessage::Resume(msg) => {
-                                let accepted = if let (Some(key), Some(remote_session_id)) = (lock.shared_key, lock.remote_session_id) {
-                                    let decrypted = crate::handshake::decrypt_with_key(key, msg.nonce, &msg.ciphertext);
+                                let accepted = if let (Some(key), Some(remote_session_id)) =
+                                    (lock.shared_key, lock.remote_session_id)
+                                {
+                                    let decrypted = crate::handshake::decrypt_with_key(
+                                        key,
+                                        msg.nonce,
+                                        &msg.ciphertext,
+                                    );
                                     if let Ok(plain) = decrypted {
-                                        if let Ok((sender_local, sender_remote, _ts)) = decode_resume_plaintext(&plain) {
-                                            if sender_local == remote_session_id && sender_remote == lock.local_session_id {
+                                        if let Ok((sender_local, sender_remote, _ts)) =
+                                            decode_resume_plaintext(&plain)
+                                        {
+                                            if sender_local == remote_session_id
+                                                && sender_remote == lock.local_session_id
+                                            {
                                                 lock.active_peer = Some(src);
                                                 lock.configured_peer = Some(src);
                                                 lock.established = true;
-                                                counters.resume_success.fetch_add(1, Ordering::Relaxed);
+                                                counters
+                                                    .resume_success
+                                                    .fetch_add(1, Ordering::Relaxed);
                                                 true
                                             } else {
                                                 false
@@ -428,7 +462,9 @@ pub async fn spawn(config: Config, peer_state: PeerState, counters: Arc<Counters
 
                     if let Some(msg) = response {
                         if send_control_packet(&fec_socket, src, msg).await.is_ok() {
-                            counters.handshake_tx_packets.fetch_add(1, Ordering::Relaxed);
+                            counters
+                                .handshake_tx_packets
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     continue;
@@ -440,12 +476,16 @@ pub async fn spawn(config: Config, peer_state: PeerState, counters: Arc<Counters
                 };
 
                 let Some(peer_addr) = established_peer else {
-                    counters.dropped_unestablished.fetch_add(1, Ordering::Relaxed);
+                    counters
+                        .dropped_unestablished
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
 
                 if src != peer_addr {
-                    counters.dropped_unestablished.fetch_add(1, Ordering::Relaxed);
+                    counters
+                        .dropped_unestablished
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
@@ -458,7 +498,11 @@ pub async fn spawn(config: Config, peer_state: PeerState, counters: Arc<Counters
                 };
 
                 for payload in recovered {
-                    if local_socket.send_to(&payload, cfg.local_app_endpoint).await.is_ok() {
+                    if local_socket
+                        .send_to(&payload, cfg.local_app_endpoint)
+                        .await
+                        .is_ok()
+                    {
                         counters.local_tx_packets.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -466,5 +510,11 @@ pub async fn spawn(config: Config, peer_state: PeerState, counters: Arc<Counters
         })
     };
 
-    Ok((Runtime { local_task, fec_task }, bound))
+    Ok((
+        Runtime {
+            local_task,
+            fec_task,
+        },
+        bound,
+    ))
 }

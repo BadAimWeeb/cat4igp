@@ -1,8 +1,7 @@
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Queryable, Selectable)]
-#[derive(Clone)]
+#[derive(Queryable, Selectable, Clone)]
 #[diesel(table_name = crate::schema::nodes)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Node {
@@ -20,8 +19,29 @@ pub struct NewNode<'a> {
     pub auth_key: &'a str,
 }
 
-#[derive(Queryable, Selectable)]
-#[derive(Clone)]
+#[derive(Queryable, Selectable, Clone)]
+#[diesel(table_name = crate::schema::node_control_identities)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct NodeControlIdentity {
+    pub node_id: i32,
+    pub peer_id: String,
+    pub signing_key: String,
+    pub encryption_key: String,
+    pub topology_revision: i64,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = crate::schema::node_control_identities)]
+pub struct NewNodeControlIdentity<'a> {
+    pub node_id: i32,
+    pub peer_id: &'a str,
+    pub signing_key: &'a str,
+    pub encryption_key: &'a str,
+}
+
+#[derive(Queryable, Selectable, Clone)]
 #[diesel(table_name = crate::schema::wireguard_static_key)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct WireguardStaticKey {
@@ -37,8 +57,7 @@ pub struct NewWireguardStaticKey<'a> {
     pub public_key: &'a str,
 }
 
-#[derive(Queryable, Selectable)]
-#[derive(Clone)]
+#[derive(Queryable, Selectable, Clone)]
 #[diesel(table_name = crate::schema::wireguard_tunnels)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct WireguardTunnel {
@@ -65,12 +84,10 @@ pub struct NewWireguardTunnel {
     pub endpoint_peer1: Option<String>,
     pub endpoint_peer2: Option<String>,
     pub mtu: i32,
-    pub endpoint_ipv6: bool
+    pub endpoint_ipv6: bool,
 }
 
-#[derive(Queryable, Selectable)]
-#[derive(Clone)]
-#[derive(Serialize, Deserialize)]
+#[derive(Queryable, Selectable, Clone, Serialize, Deserialize)]
 #[diesel(table_name = crate::schema::invites)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Invite {
@@ -92,8 +109,7 @@ pub struct NewInvite<'a> {
     pub override_join_mesh: Option<i32>,
 }
 
-#[derive(Queryable, Selectable)]
-#[derive(Clone)]
+#[derive(Queryable, Selectable, Clone)]
 #[diesel(table_name = crate::schema::mesh_groups)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct MeshGroup {
@@ -101,7 +117,7 @@ pub struct MeshGroup {
     pub name: String,
     pub auto_wireguard: bool,
     pub auto_wireguard_mtu: i32,
-    pub created_at: chrono::NaiveDateTime
+    pub created_at: chrono::NaiveDateTime,
 }
 
 #[derive(Insertable)]
@@ -112,15 +128,14 @@ pub struct NewMeshGroup<'a> {
     pub auto_wireguard_mtu: i32,
 }
 
-#[derive(Queryable, Selectable)]
-#[derive(Clone)]
+#[derive(Queryable, Selectable, Clone)]
 #[diesel(table_name = crate::schema::mesh_group_memberships)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct MeshGroupMembership {
     pub id: i32,
     pub mesh_group_id: i32,
     pub node_id: i32,
-    pub created_at: chrono::NaiveDateTime
+    pub created_at: chrono::NaiveDateTime,
 }
 
 #[derive(Insertable)]
@@ -130,8 +145,7 @@ pub struct NewMeshGroupMembership {
     pub node_id: i32,
 }
 
-#[derive(Queryable, Selectable)]
-#[derive(Clone)]
+#[derive(Queryable, Selectable, Clone)]
 #[diesel(table_name = crate::schema::settings)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Setting {

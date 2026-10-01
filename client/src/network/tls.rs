@@ -13,7 +13,11 @@ impl TlsVerifier {
     }
 
     /// Verify a server connection
-    pub async fn verify_server(&self, _host: &str, _port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn verify_server(
+        &self,
+        _host: &str,
+        _port: u16,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // For now, we'll skip actual TLS verification
         // In a production system, this would establish a TLS connection and verify certificates
         Ok(())
@@ -21,7 +25,9 @@ impl TlsVerifier {
 }
 
 /// Create TLS configuration for client connections
-pub fn create_tls_config(client_config: &ClientConfig) -> Result<Option<TlsVerifier>, Box<dyn std::error::Error>> {
+pub fn create_tls_config(
+    client_config: &ClientConfig,
+) -> Result<Option<TlsVerifier>, Box<dyn std::error::Error>> {
     // Server configuration is stored separately in data_dir, not in ClientConfig
     // For now, return None since we don't have server config here
     let _ = client_config;

@@ -1,12 +1,14 @@
 use rand::prelude::*;
-use std::net::{IpAddr, ToSocketAddrs, Ipv4Addr, Ipv6Addr};
-use std::time::Duration;
-use std::os::unix::io::AsRawFd;
-use tokio::net::UdpSocket;
 use rand::seq::SliceRandom;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::os::unix::io::AsRawFd;
+use std::time::Duration;
+use tokio::net::UdpSocket;
 
-const IPV4_STUN_LIST_URL: &str = "https://raw.githubusercontent.com/pradt2/always-online-stun/master/valid_ipv4s.txt";
-const IPV6_STUN_LIST_URL: &str = "https://raw.githubusercontent.com/pradt2/always-online-stun/master/valid_ipv6s.txt";
+const IPV4_STUN_LIST_URL: &str =
+    "https://raw.githubusercontent.com/pradt2/always-online-stun/master/valid_ipv4s.txt";
+const IPV6_STUN_LIST_URL: &str =
+    "https://raw.githubusercontent.com/pradt2/always-online-stun/master/valid_ipv6s.txt";
 const IPV4_NAT_TESTING_LIST_URL: &str = "https://raw.githubusercontent.com/pradt2/always-online-stun/master/valid_nat_testing_ipv4s.txt";
 const IPV6_NAT_TESTING_LIST_URL: &str = "https://raw.githubusercontent.com/pradt2/always-online-stun/master/valid_nat_testing_ipv6s.txt";
 
@@ -15,25 +17,25 @@ const IPV6_NAT_TESTING_LIST_URL: &str = "https://raw.githubusercontent.com/pradt
 pub enum NatType {
     /// Open Internet - no NAT detected
     OpenInternet,
-    
+
     /// Endpoint-Independent Mapping + Endpoint-Independent Filtering (Full Cone NAT)
     EndpointIndependentNoFiltering,
-    
+
     /// Endpoint-Independent Mapping + Address-Dependent Filtering (Restricted Cone NAT)
     EndpointIndependentAddressFiltering,
-    
+
     /// Endpoint-Independent Mapping + Address and Port-Dependent Filtering (Port Restricted Cone NAT)
     EndpointIndependentAddressPortFiltering,
-    
+
     /// Address-Dependent Mapping
     AddressDependentMapping,
-    
+
     /// Address and Port-Dependent Mapping (Symmetric NAT)
     AddressPortDependentMapping,
 
     /// No UDP connectivity
     NoUdpConnectivity,
-    
+
     /// NAT type could not be determined
     Unknown,
 }
@@ -264,6 +266,52 @@ impl PublicIpDetector {
         Err("Failed to detect public IPv6 address from any STUN server".to_string())
     }
 
+    /// Discover the mapped address from the UDP port intended for the tunnel.
+    pub async fn mapped_addr_from_port(
+        &self,
+        port: u16,
+        ipv6: bool,
+    ) -> Result<std::net::SocketAddr, String> {
+        let socket = UdpSocket::bind(if ipv6 {
+            format!("[::]:{port}")
+        } else {
+            format!("0.0.0.0:{port}")
+        })
+        .await
+        .map_err(|error| format!("failed to bind UDP port {port}: {error}"))?;
+        let mut servers = if ipv6 {
+            self.ipv6_servers.clone()
+        } else {
+            self.ipv4_servers.clone()
+        };
+        servers.shuffle(&mut rand::rng());
+        for server in servers {
+            let addresses: Vec<IpAddr> = if ipv6 {
+                server.ipv6_addrs.into_iter().map(IpAddr::V6).collect()
+            } else {
+                server.ipv4_addrs.into_iter().map(IpAddr::V4).collect()
+            };
+            for ip in addresses {
+                let server = std::net::SocketAddr::new(ip, server.port);
+                socket
+                    .send_to(&self.create_stun_binding_request(), server)
+                    .await
+                    .map_err(|error| format!("failed to send STUN request: {error}"))?;
+                let mut response = [0; 512];
+                if let Ok(Ok((length, _))) =
+                    tokio::time::timeout(self.timeout, socket.recv_from(&mut response)).await
+                {
+                    if let Ok(mapped) = self.parse_mapped_socket_addr(&response[..length]) {
+                        if mapped.is_ipv6() == ipv6 {
+                            return Ok(mapped);
+                        }
+                    }
+                }
+            }
+        }
+        Err("no STUN server returned a mapped address".to_string())
+    }
+
     /// Detect NAT type for IPv4 using 2 STUN servers
     /// Detect NAT type for IPv4 using RFC 5780
     pub async fn detect_nat_type_ipv4(&self) -> Result<NatType, String> {
@@ -273,10 +321,14 @@ impl PublicIpDetector {
 
         // Pick a random NAT testing server
         let mut rng = rand::rng();
-        let server = self.ipv4_nat_servers.choose(&mut rng)
+        let server = self
+            .ipv4_nat_servers
+            .choose(&mut rng)
             .ok_or("No NAT testing servers available")?;
 
-        let server_ip = server.ipv4_addrs.first()
+        let server_ip = server
+            .ipv4_addrs
+            .first()
             .ok_or("NAT testing server has no IPv4 addresses")?;
         let server_addr = format!("{}:{}", server_ip, server.port);
 
@@ -291,10 +343,14 @@ impl PublicIpDetector {
 
         // Pick a random NAT testing server
         let mut rng = rand::rng();
-        let server = self.ipv6_nat_servers.choose(&mut rng)
+        let server = self
+            .ipv6_nat_servers
+            .choose(&mut rng)
             .ok_or("No NAT testing servers available")?;
 
-        let server_ip = server.ipv6_addrs.first()
+        let server_ip = server
+            .ipv6_addrs
+            .first()
             .ok_or("NAT testing server has no IPv6 addresses")?;
         let server_addr = format!("[{}]:{}", server_ip, server.port);
 
@@ -309,18 +365,17 @@ impl PublicIpDetector {
     ) -> Result<NatType, String> {
         // RFC 5780 Section 4: NAT Behavior Discovery
         // IMPORTANT: All tests must share the same socket to preserve source port
-        
+
         // Create shared socket for all tests
         let bind_addr = if is_ipv4 { "0.0.0.0:0" } else { "[::]:0" };
         let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| format!("Failed to bind socket: {}", e))?;
-        
+
         // Enable IP_PKTINFO/IPV6_RECVPKTINFO for recv_sas to work
         let raw_fd = socket.as_raw_fd();
-        udp_sas::set_pktinfo(raw_fd)
-            .map_err(|e| format!("Failed to enable pktinfo: {}", e))?;
-        
+        udp_sas::set_pktinfo(raw_fd).map_err(|e| format!("Failed to enable pktinfo: {}", e))?;
+
         // Test I: Basic binding request to get mapped address and actual interface IP
         let test1_result = self.stun_test_basic(&socket, server_addr).await;
 
@@ -332,7 +387,7 @@ impl PublicIpDetector {
                 return Ok(NatType::NoUdpConnectivity);
             }
         };
-        
+
         // Check if we're behind NAT by comparing with actual interface IP
         if test1_mapped_addr.ip() == local_interface_ip {
             // No NAT - Open Internet
@@ -341,11 +396,14 @@ impl PublicIpDetector {
 
         // Test II: Request with CHANGE-REQUEST to test filtering
         // Try to get response from alternate IP and port
-        let test2_response = self.stun_test_change_request(&socket, server_addr, true, true).await;
-        
+        let test2_response = self
+            .stun_test_change_request(&socket, server_addr, true, true)
+            .await;
+
         // Test III: Request from same server but different port (if Test II failed)
         let test3_response = if test2_response.is_err() {
-            self.stun_test_change_request(&socket, server_addr, false, true).await
+            self.stun_test_change_request(&socket, server_addr, false, true)
+                .await
         } else {
             Ok(()) // Test II passed, skip Test III
         };
@@ -357,7 +415,7 @@ impl PublicIpDetector {
             let alt_server = self.ipv4_servers.choose(&mut rng).unwrap();
             let alt_ip = alt_server.ipv4_addrs.first().unwrap();
             let alt_addr = format!("{}:{}", alt_ip, alt_server.port);
-            
+
             match self.stun_test_basic(&socket, &alt_addr).await {
                 Ok((alt_mapped, _)) => {
                     // Compare mapped addresses
@@ -379,7 +437,7 @@ impl PublicIpDetector {
             let alt_server = self.ipv6_servers.choose(&mut rng).unwrap();
             let alt_ip = alt_server.ipv6_addrs.first().unwrap();
             let alt_addr = format!("[{}]:{}", alt_ip, alt_server.port);
-            
+
             match self.stun_test_basic(&socket, &alt_addr).await {
                 Ok((alt_mapped, _)) => {
                     // Compare mapped addresses
@@ -391,7 +449,7 @@ impl PublicIpDetector {
                         "address-port-dependent"
                     }
                 }
-                Err(_) => "unknown"
+                Err(_) => "unknown",
             }
         } else {
             "unknown"
@@ -412,13 +470,9 @@ impl PublicIpDetector {
                     Ok(NatType::EndpointIndependentAddressPortFiltering)
                 }
             }
-            "address-dependent" => {
-                Ok(NatType::AddressDependentMapping)
-            }
-            "address-port-dependent" => {
-                Ok(NatType::AddressPortDependentMapping)
-            }
-            _ => Ok(NatType::Unknown)
+            "address-dependent" => Ok(NatType::AddressDependentMapping),
+            "address-port-dependent" => Ok(NatType::AddressPortDependentMapping),
+            _ => Ok(NatType::Unknown),
         }
     }
 
@@ -429,62 +483,71 @@ impl PublicIpDetector {
         server_addr: &str,
     ) -> Result<(std::net::SocketAddr, IpAddr), String> {
         use std::os::unix::io::AsRawFd;
-        
+
         // Send basic STUN binding request
         let request = self.create_stun_binding_request();
-        socket.send_to(&request, server_addr).await
+        socket
+            .send_to(&request, server_addr)
+            .await
             .map_err(|e| format!("Failed to send STUN request: {}", e))?;
 
         // Receive response with actual interface IP using recv_sas
         let raw_fd = socket.as_raw_fd();
         let timeout = self.timeout;
-        
+
         // Use recv_sas in a blocking task with proper fd handling
-        let (n, _peer_addr, local_interface_ip, response) = tokio::task::spawn_blocking(move || {
-            // Create a temporary socket wrapper just for mode setting
-            // We won't use from_raw_fd to avoid ownership issues
-            
-            // Set non-blocking to false using fcntl directly
-            let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
-            if flags < 0 {
-                return Err("Failed to get socket flags".to_string());
-            }
-            
-            let new_flags = flags & !libc::O_NONBLOCK;
-            if unsafe { libc::fcntl(raw_fd, libc::F_SETFL, new_flags) } < 0 {
-                return Err("Failed to set socket to blocking mode".to_string());
-            }
-            
-            // Set read timeout
-            let tv = libc::timeval {
-                tv_sec: timeout.as_secs() as libc::time_t,
-                tv_usec: timeout.subsec_micros() as libc::suseconds_t,
-            };
-            
-            if unsafe { libc::setsockopt(raw_fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, 
-                                        &tv as *const _ as *const libc::c_void, 
-                                        std::mem::size_of::<libc::timeval>() as libc::socklen_t) } < 0 {
-                return Err("Failed to set socket timeout".to_string());
-            }
-            
-            let mut buf = vec![0; 512];
-            let result = udp_sas::recv_sas(raw_fd, &mut buf)
-                .map_err(|e| format!("recv_sas error: {}", e))?;
-            
-            // Set back to non-blocking
-            let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
-            if flags >= 0 {
-                unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-            }
-            
-            Ok::<_, String>((result.0, result.1, result.2, buf))
-        })
-        .await
-        .map_err(|e| format!("Task error: {}", e))??;
+        let (n, _peer_addr, local_interface_ip, response) =
+            tokio::task::spawn_blocking(move || {
+                // Create a temporary socket wrapper just for mode setting
+                // We won't use from_raw_fd to avoid ownership issues
+
+                // Set non-blocking to false using fcntl directly
+                let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+                if flags < 0 {
+                    return Err("Failed to get socket flags".to_string());
+                }
+
+                let new_flags = flags & !libc::O_NONBLOCK;
+                if unsafe { libc::fcntl(raw_fd, libc::F_SETFL, new_flags) } < 0 {
+                    return Err("Failed to set socket to blocking mode".to_string());
+                }
+
+                // Set read timeout
+                let tv = libc::timeval {
+                    tv_sec: timeout.as_secs() as libc::time_t,
+                    tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+                };
+
+                if unsafe {
+                    libc::setsockopt(
+                        raw_fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVTIMEO,
+                        &tv as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                    )
+                } < 0
+                {
+                    return Err("Failed to set socket timeout".to_string());
+                }
+
+                let mut buf = vec![0; 512];
+                let result = udp_sas::recv_sas(raw_fd, &mut buf)
+                    .map_err(|e| format!("recv_sas error: {}", e))?;
+
+                // Set back to non-blocking
+                let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+                if flags >= 0 {
+                    unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+                }
+
+                Ok::<_, String>((result.0, result.1, result.2, buf))
+            })
+            .await
+            .map_err(|e| format!("Task error: {}", e))??;
 
         // Extract the local interface IP
-        let local_ip = local_interface_ip
-            .ok_or("Local interface IP not available".to_string())?;
+        let local_ip = local_interface_ip.ok_or("Local interface IP not available".to_string())?;
 
         // Extract mapped address from STUN response
         let mapped_addr = self.parse_mapped_socket_addr(&response[..n])?;
@@ -502,7 +565,9 @@ impl PublicIpDetector {
     ) -> Result<(), String> {
         // Create STUN binding request with CHANGE-REQUEST attribute
         let request = self.create_stun_change_request(change_ip, change_port);
-        socket.send_to(&request, server_addr).await
+        socket
+            .send_to(&request, server_addr)
+            .await
             .map_err(|e| format!("Failed to send STUN change request: {}", e))?;
 
         // Try to receive response - if we get one, the test passed
@@ -518,20 +583,20 @@ impl PublicIpDetector {
     /// Create STUN binding request with CHANGE-REQUEST attribute
     fn create_stun_change_request(&self, change_ip: bool, change_port: bool) -> Vec<u8> {
         let mut request = vec![0x00, 0x01]; // Message type: Binding Request
-        
+
         // Message length will be updated after adding attributes
         request.extend_from_slice(&[0x00, 0x08]); // Length: 8 bytes (one attribute)
         request.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]); // Magic cookie
         request.extend_from_slice(&[0x00; 12]); // Transaction ID
-        
+
         // CHANGE-REQUEST attribute (0x0003)
         request.extend_from_slice(&[0x00, 0x03]); // Attribute type
         request.extend_from_slice(&[0x00, 0x04]); // Attribute length: 4 bytes
-        
+
         // Flag bits: bit 1 = change IP, bit 2 = change port
         let flags: u32 = ((change_ip as u32) << 1) | ((change_port as u32) << 2);
         request.extend_from_slice(&flags.to_be_bytes());
-        
+
         request
     }
 
@@ -550,14 +615,15 @@ impl PublicIpDetector {
         let mut offset = 20;
         while offset + 4 <= 20 + response_len {
             let attr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
-            let attr_len = u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
+            let attr_len =
+                u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
             let attr_data_offset = offset + 4;
 
             // XOR-MAPPED-ADDRESS (0x0020)
             if attr_type == 0x0020 && attr_data_offset + attr_len <= response.len() {
                 let data = &response[attr_data_offset..attr_data_offset + attr_len];
                 let family = data[1];
-                
+
                 if family == 0x01 {
                     // IPv4
                     let magic = [0x21, 0x12, 0xa4, 0x42];
@@ -669,17 +735,24 @@ impl PublicIpDetector {
         let mut offset = 20;
         while offset + 4 <= 20 + response_len {
             let attr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
-            let attr_len = u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
+            let attr_len =
+                u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
             let attr_data_offset = offset + 4;
 
             // XOR-MAPPED-ADDRESS (0x0020)
             if attr_type == 0x0020 && attr_data_offset + attr_len <= response.len() {
-                return self.parse_xor_mapped_address(&response[attr_data_offset..attr_data_offset + attr_len], is_ipv4);
+                return self.parse_xor_mapped_address(
+                    &response[attr_data_offset..attr_data_offset + attr_len],
+                    is_ipv4,
+                );
             }
 
             // MAPPED-ADDRESS (0x0001) - fallback
             if attr_type == 0x0001 && attr_data_offset + attr_len <= response.len() {
-                return self.parse_mapped_address(&response[attr_data_offset..attr_data_offset + attr_len], is_ipv4);
+                return self.parse_mapped_address(
+                    &response[attr_data_offset..attr_data_offset + attr_len],
+                    is_ipv4,
+                );
             }
 
             // Move to next attribute (with padding to 4-byte boundary)
@@ -781,5 +854,18 @@ mod tests {
     fn test_detector_with_timeout() {
         let detector = PublicIpDetector::new().with_timeout(Duration::from_secs(10));
         assert_eq!(detector.timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn parses_xor_mapped_ipv4_socket_address() {
+        let detector = PublicIpDetector::new();
+        let mut response = vec![0x01, 0x01, 0, 12, 0x21, 0x12, 0xa4, 0x42];
+        response.extend_from_slice(&[0; 12]);
+        response.extend_from_slice(&[0, 0x20, 0, 8, 0, 1, 0x21 ^ 0x12, 0x12 ^ 0x34]);
+        response.extend_from_slice(&[0x21 ^ 203, 0x12 ^ 0, 0xa4 ^ 113, 0x42 ^ 9]);
+        assert_eq!(
+            detector.parse_mapped_socket_addr(&response).unwrap(),
+            "203.0.113.9:4660".parse().unwrap()
+        );
     }
 }

@@ -1,7 +1,7 @@
-use std::path::Path;
 use std::io;
-use tokio::net::UnixStream;
+use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 
 use super::protocol::{DaemonRequest, DaemonResponse, SharedSecret};
 
@@ -34,7 +34,10 @@ impl DaemonClient {
         let mut stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("Failed to connect to daemon at {:?}: {}", self.socket_path, e),
+                format!(
+                    "Failed to connect to daemon at {:?}: {}",
+                    self.socket_path, e
+                ),
             )
         })?;
 
@@ -45,7 +48,10 @@ impl DaemonClient {
         };
 
         let message_bytes = serde_json::to_vec(&message).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Failed to serialize request: {}", e))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to serialize request: {}", e),
+            )
         })?;
 
         // Send length prefix
@@ -71,7 +77,10 @@ impl DaemonClient {
         stream.read_exact(&mut response_buffer).await?;
 
         let response: DaemonResponse = serde_json::from_slice(&response_buffer).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Invalid response JSON: {}", e))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid response JSON: {}", e),
+            )
         })?;
 
         Ok(response)

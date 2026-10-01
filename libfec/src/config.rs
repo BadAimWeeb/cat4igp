@@ -40,7 +40,11 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn new(fec_bind: SocketAddr, local_bind: SocketAddr, local_app_endpoint: SocketAddr) -> Self {
+    pub fn new(
+        fec_bind: SocketAddr,
+        local_bind: SocketAddr,
+        local_app_endpoint: SocketAddr,
+    ) -> Self {
         Self {
             fec_bind,
             local_bind,

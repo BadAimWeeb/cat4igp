@@ -57,6 +57,13 @@ pub fn register_node(
         .filter(code.eq(invitation_key))
         .first::<Invite>(conn)?;
 
+    if inv
+        .expires_at
+        .is_some_and(|expires| expires < chrono::Utc::now().naive_utc())
+    {
+        return Err(diesel::result::Error::NotFound);
+    }
+
     if let Some(max) = inv.max_uses {
         if inv.used_count >= max {
             return Err(diesel::result::Error::NotFound);
@@ -79,6 +86,68 @@ pub fn register_node(
         .get_result::<crate::models::Node>(conn)?;
 
     Ok((node.id, nauthk, inv.override_join_mesh))
+}
+
+pub fn register_control_identity(
+    conn: &mut SqliteConnection,
+    node_id_val: i32,
+    peer_id_val: &str,
+    signing_key_val: &str,
+    encryption_key_val: &str,
+) -> Result<(), diesel::result::Error> {
+    use crate::schema::node_control_identities;
+
+    diesel::insert_into(node_control_identities::table)
+        .values(&crate::models::NewNodeControlIdentity {
+            node_id: node_id_val,
+            peer_id: peer_id_val,
+            signing_key: signing_key_val,
+            encryption_key: encryption_key_val,
+        })
+        .execute(conn)?;
+    Ok(())
+}
+
+pub fn control_identity_for_peer(
+    conn: &mut SqliteConnection,
+    peer_id_val: &str,
+) -> Result<crate::models::NodeControlIdentity, diesel::result::Error> {
+    use crate::schema::node_control_identities::dsl::*;
+
+    node_control_identities
+        .filter(peer_id.eq(peer_id_val))
+        .select(crate::models::NodeControlIdentity::as_select())
+        .first(conn)
+}
+
+pub fn control_identity_for_node(
+    conn: &mut SqliteConnection,
+    node_id_val: i32,
+) -> Result<crate::models::NodeControlIdentity, diesel::result::Error> {
+    use crate::schema::node_control_identities::dsl::*;
+
+    node_control_identities
+        .filter(node_id.eq(node_id_val))
+        .select(crate::models::NodeControlIdentity::as_select())
+        .first(conn)
+}
+
+pub fn bump_control_revision(
+    conn: &mut SqliteConnection,
+    node_id_val: i32,
+) -> Result<i64, diesel::result::Error> {
+    use crate::schema::node_control_identities::dsl::*;
+
+    diesel::update(node_control_identities.filter(node_id.eq(node_id_val)))
+        .set((
+            topology_revision.eq(topology_revision + 1),
+            updated_at.eq(chrono::Utc::now().naive_utc()),
+        ))
+        .execute(conn)?;
+    node_control_identities
+        .filter(node_id.eq(node_id_val))
+        .select(topology_revision)
+        .first(conn)
 }
 
 pub fn get_invites(
@@ -179,8 +248,12 @@ pub fn create_wireguard_tunnel(
 
     let existing_tunnel = wgt_dsl::wireguard_tunnels
         .filter(
-            ((wgt_dsl::node_id_peer1.eq(peer1_id).and(wgt_dsl::node_id_peer2.eq(peer2_id)))
-                .or(wgt_dsl::node_id_peer1.eq(peer2_id).and(wgt_dsl::node_id_peer2.eq(peer1_id))))
+            ((wgt_dsl::node_id_peer1
+                .eq(peer1_id)
+                .and(wgt_dsl::node_id_peer2.eq(peer2_id)))
+            .or(wgt_dsl::node_id_peer1
+                .eq(peer2_id)
+                .and(wgt_dsl::node_id_peer2.eq(peer1_id))))
             .and(wgt_dsl::endpoint_ipv6.eq(endpoint_should_be_ipv6)),
         )
         .first::<crate::models::WireguardTunnel>(conn)
@@ -220,6 +293,67 @@ pub fn get_wireguard_answers(
     Ok(results)
 }
 
+/// The transport-independent desired WireGuard state for one node.
+pub fn topology_snapshot(
+    conn: &mut SqliteConnection,
+    node_id_val: i32,
+    revision: i64,
+) -> Result<cat4igp_shared::control::TopologySnapshot, diesel::result::Error> {
+    let tunnels = get_wireguard_answers(conn, node_id_val)?;
+    let tunnels = tunnels
+        .into_iter()
+        .map(|tunnel| {
+            let self_p1 = tunnel.node_id_peer1 == node_id_val;
+            let peer_node_id = if self_p1 {
+                tunnel.node_id_peer2
+            } else {
+                tunnel.node_id_peer1
+            };
+            let local_endpoint = if self_p1 {
+                tunnel.endpoint_peer1.clone()
+            } else {
+                tunnel.endpoint_peer2.clone()
+            };
+            Ok(cat4igp_shared::control::WireguardTunnelInfo {
+                tunnel_id: tunnel.id,
+                peer_node_id,
+                public_key: get_wireguard_pubkey(conn, peer_node_id).unwrap_or_default(),
+                preferred_port: local_endpoint
+                    .as_deref()
+                    .and_then(|endpoint| endpoint.parse::<std::net::SocketAddr>().ok())
+                    .map_or(0, |endpoint| endpoint.port()),
+                remote_endpoint: if self_p1 {
+                    tunnel.endpoint_peer2
+                } else {
+                    tunnel.endpoint_peer1
+                },
+                local_answered: if self_p1 {
+                    tunnel.peer1_answered.into()
+                } else {
+                    tunnel.peer2_answered.into()
+                },
+                remote_response: if self_p1 {
+                    tunnel.peer2_answered.into()
+                } else {
+                    tunnel.peer1_answered.into()
+                },
+                mtu: tunnel.mtu,
+                endpoint_ipv6: tunnel.endpoint_ipv6,
+                fec: tunnel.fec,
+                faketcp: tunnel.faketcp,
+                created_at: tunnel.created_at.and_utc().timestamp_millis(),
+                updated_at: tunnel.updated_at.and_utc().timestamp_millis(),
+            })
+        })
+        .collect::<Result<Vec<_>, diesel::result::Error>>()?;
+
+    Ok(cat4igp_shared::control::TopologySnapshot {
+        node_id: node_id_val,
+        revision,
+        tunnels,
+    })
+}
+
 pub fn answer_wireguard_tunnel(
     conn: &mut SqliteConnection,
     tunnel_id_val: i32,
@@ -230,12 +364,9 @@ pub fn answer_wireguard_tunnel(
     use crate::schema::wireguard_tunnels::dsl::*;
 
     let target = wireguard_tunnels.filter(id.eq(tunnel_id_val));
+    let tunnel = target.first::<crate::models::WireguardTunnel>(conn)?;
 
-    if target
-        .filter(node_id_peer1.eq(node_id_val))
-        .first::<crate::models::WireguardTunnel>(conn)
-        .is_ok()
-    {
+    if tunnel.node_id_peer1 == node_id_val {
         if let Some(decline) = decline_type {
             diesel::update(target)
                 .set((
@@ -253,7 +384,7 @@ pub fn answer_wireguard_tunnel(
                 ))
                 .execute(conn)?;
         }
-    } else {
+    } else if tunnel.node_id_peer2 == node_id_val {
         if let Some(decline) = decline_type {
             diesel::update(target)
                 .set((
@@ -271,9 +402,59 @@ pub fn answer_wireguard_tunnel(
                 ))
                 .execute(conn)?;
         }
+    } else {
+        return Err(diesel::result::Error::NotFound);
     }
 
     Ok(())
+}
+
+pub fn tunnel_peer_node_ids(
+    conn: &mut SqliteConnection,
+    tunnel_id_val: i32,
+) -> Result<(i32, i32), diesel::result::Error> {
+    use crate::schema::wireguard_tunnels::dsl::*;
+
+    wireguard_tunnels
+        .filter(id.eq(tunnel_id_val))
+        .select((node_id_peer1, node_id_peer2))
+        .first(conn)
+}
+
+pub fn tunnel_endpoint_ipv6(
+    conn: &mut SqliteConnection,
+    tunnel_id_val: i32,
+) -> Result<bool, diesel::result::Error> {
+    use crate::schema::wireguard_tunnels::dsl::*;
+    wireguard_tunnels
+        .filter(id.eq(tunnel_id_val))
+        .select(endpoint_ipv6)
+        .first(conn)
+}
+
+pub fn tunnel_node_ids_for_node(
+    conn: &mut SqliteConnection,
+    node_id_val: i32,
+) -> Result<Vec<i32>, diesel::result::Error> {
+    use crate::schema::wireguard_tunnels::dsl::*;
+
+    let pairs = wireguard_tunnels
+        .filter(
+            node_id_peer1
+                .eq(node_id_val)
+                .or(node_id_peer2.eq(node_id_val)),
+        )
+        .select((node_id_peer1, node_id_peer2))
+        .load::<(i32, i32)>(conn)?;
+    let mut node_ids = vec![node_id_val];
+    for (peer1, peer2) in pairs {
+        for node_id in [peer1, peer2] {
+            if !node_ids.contains(&node_id) {
+                node_ids.push(node_id);
+            }
+        }
+    }
+    Ok(node_ids)
 }
 
 pub fn get_mesh_members(

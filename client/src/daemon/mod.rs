@@ -1,19 +1,24 @@
+use futures_util::StreamExt;
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use std::io;
-use std::future::Future;
 use std::time::Duration;
-use tokio::net::{UnixListener, UnixStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::config::ClientConfig;
 use crate::config::ServerConfig;
-use crate::server_rest::client::ServerRestClient;
+use cat4igp_shared::{
+    control::{ControlRequest, ControlResponse, MessageMeta, TopologySnapshot, TunnelAnswer},
+    custom_type::WireguardAnswered,
+};
 
-pub mod protocol;
 pub mod client;
+pub mod control;
 mod daemon_memory;
+pub mod protocol;
 
 use protocol::{DaemonRequest, DaemonResponse, SharedSecret};
 
@@ -23,6 +28,8 @@ pub struct Daemon {
     server_config: Arc<Mutex<Option<ServerConfig>>>,
     secret: SharedSecret,
     memory: Arc<daemon_memory::DaemonMemory>,
+    control_sync: Arc<Mutex<()>>,
+    control_plane: Arc<Mutex<Option<control::ControlPlane>>>,
 }
 
 /// IPC message envelope
@@ -40,9 +47,7 @@ impl Daemon {
             Ok(s) => s,
             Err(_) => {
                 let new_secret = SharedSecret::generate();
-                let secret = SharedSecret {
-                    secret: new_secret,
-                };
+                let secret = SharedSecret { secret: new_secret };
                 secret.save(&config.data_dir)?;
                 secret
             }
@@ -52,6 +57,7 @@ impl Daemon {
         let mut server_config = ServerConfig::load(&config.data_dir).ok();
         if let Some(cfg) = server_config.as_mut() {
             cfg.ensure_wireguard_keypair()?;
+            cfg.ensure_control_keypair()?;
             cfg.save(&config.data_dir)?;
         }
 
@@ -62,6 +68,8 @@ impl Daemon {
             server_config: Arc::new(Mutex::new(server_config)),
             secret,
             memory: Arc::new(daemon_memory::DaemonMemory::new(cfg_clone)),
+            control_sync: Arc::new(Mutex::new(())),
+            control_plane: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -77,13 +85,11 @@ impl Daemon {
             DaemonRequest::SetServer {
                 address,
                 invite_code,
-                verify_tls,
-            } => self.handle_set_server(address, invite_code, verify_tls).await,
+            } => self.handle_set_server(address, invite_code).await,
             DaemonRequest::Register {
                 address,
                 invite_code,
-                verify_tls,
-            } => self.handle_register(address, invite_code, verify_tls).await,
+            } => self.handle_register(address, invite_code).await,
             DaemonRequest::Restart => self.handle_restart().await,
             DaemonRequest::Shutdown => self.handle_shutdown().await,
             DaemonRequest::GetConfig => self.handle_get_config().await,
@@ -103,8 +109,7 @@ impl Daemon {
             let server_configured = server_config.is_some();
             let node_key_present = server_config
                 .as_ref()
-                .and_then(|s| s.node_key.clone())
-                .is_some();
+                .is_some_and(|s| s.controller_peer_id.is_some());
             (server_configured, node_key_present)
         };
         let poll_error = self.memory.get_last_poll_error().await;
@@ -117,24 +122,36 @@ impl Daemon {
         }
     }
 
-    async fn handle_set_server(
-        &self,
-        address: String,
-        invite_code: String,
-        verify_tls: bool,
-    ) -> DaemonResponse {
+    async fn handle_set_server(&self, address: String, invite_code: String) -> DaemonResponse {
         let mut server_config = self.server_config.lock().await;
         let mut config = ServerConfig {
-            address,
+            address: address.clone(),
             invite_code,
-            verify_tls,
-            node_key: None,
             wg_private_key: None,
             wg_public_key: None,
+            control_private_key: None,
+            control_encryption_private_key: None,
+            controller_peer_id: None,
+            controller_signing_key: None,
+            controller_encryption_key: None,
+            control_bootstrap_addresses: Vec::new(),
+            control_private_network_key: self.config.control_private_network_key.clone(),
+            topology_revision: 0,
+            control_node_id: None,
+            control_network_id: self.config.control_network_id.clone(),
         };
 
         if let Err(e) = config.ensure_wireguard_keypair() {
             return DaemonResponse::Error(format!("Failed to generate WireGuard keypair: {}", e));
+        }
+        if let Err(e) = config.ensure_control_keypair() {
+            return DaemonResponse::Error(format!("Failed to generate control identity: {}", e));
+        }
+        if let Err(e) = config.ensure_control_encryption_key() {
+            return DaemonResponse::Error(format!(
+                "Failed to generate control encryption identity: {}",
+                e
+            ));
         }
 
         if let Err(e) = config.save(&self.config.data_dir) {
@@ -145,53 +162,54 @@ impl Daemon {
         DaemonResponse::Ok(Some("Server configuration set".to_string()))
     }
 
-    async fn handle_register(
-        &self,
-        address: String,
-        invite_code: String,
-        verify_tls: bool,
-    ) -> DaemonResponse {
+    async fn handle_register(&self, address: String, invite_code: String) -> DaemonResponse {
         let mut config = ServerConfig {
-            address,
+            address: address.clone(),
             invite_code,
-            verify_tls,
-            node_key: None,
             wg_private_key: None,
             wg_public_key: None,
+            control_private_key: None,
+            control_encryption_private_key: None,
+            controller_peer_id: None,
+            controller_signing_key: None,
+            controller_encryption_key: None,
+            control_bootstrap_addresses: Vec::new(),
+            control_private_network_key: self.config.control_private_network_key.clone(),
+            topology_revision: 0,
+            control_node_id: None,
+            control_network_id: self.config.control_network_id.clone(),
         };
 
         if let Err(e) = config.ensure_wireguard_keypair() {
             return DaemonResponse::Error(format!("Failed to generate WireGuard keypair: {}", e));
         }
+        if let Err(e) = config.ensure_control_keypair() {
+            return DaemonResponse::Error(format!("Failed to generate control identity: {}", e));
+        }
+        if let Err(e) = config.ensure_control_encryption_key() {
+            return DaemonResponse::Error(format!(
+                "Failed to generate control encryption identity: {}",
+                e
+            ));
+        }
 
-        let rest_client = match ServerRestClient::new(&config) {
-            Ok(client) => client,
-            Err(e) => {
-                return DaemonResponse::Error(format!("Failed to create server client: {}", e));
-            }
-        };
-
+        let mut bootstrap_addresses = self.config.control_bootstrap_addresses.clone();
+        if !bootstrap_addresses.contains(&address) {
+            bootstrap_addresses.insert(0, address);
+        }
         let node_name = std::env::var("HOSTNAME").unwrap_or_else(|_| "cat4igp-client".to_string());
-        let registration = match rest_client.register(&node_name, &config.invite_code).await {
+        let registration = match control::enroll(&mut config, &bootstrap_addresses, node_name).await
+        {
             Ok(response) => response,
             Err(e) => {
                 return DaemonResponse::Error(format!("Registration failed: {}", e));
             }
         };
-
-        if !registration.success {
-            return DaemonResponse::Error("Registration failed: server returned unsuccessful response".to_string());
-        }
-
-        config.node_key = Some(registration.auth_key);
-
-        if let Some(public_key) = config.wg_public_key.clone() {
-            if let Err(e) = rest_client.update_wireguard_pubkey(&public_key).await {
-                return DaemonResponse::Error(format!(
-                    "Registration succeeded but failed to sync WireGuard public key: {}",
-                    e
-                ));
-            }
+        if !matches!(
+            registration,
+            cat4igp_shared::control::ControlResponse::Enrolled(_)
+        ) {
+            return DaemonResponse::Error("Registration rejected by controller".to_string());
         }
 
         if let Err(e) = config.save(&self.config.data_dir) {
@@ -200,6 +218,11 @@ impl Daemon {
 
         let mut server_config = self.server_config.lock().await;
         *server_config = Some(config);
+        drop(server_config);
+        if let Err(error) = self.start_control_plane().await {
+            eprintln!("[daemon] control plane start failed: {error}");
+            self.memory.set_last_poll_error(Some(error)).await;
+        }
 
         DaemonResponse::Ok(Some("Registration successful".to_string()))
     }
@@ -265,14 +288,21 @@ impl Daemon {
         let listener = UnixListener::bind(&self.config.daemon_socket)?;
         println!("✓ Listening on socket: {:?}", self.config.daemon_socket);
 
-        if let Err(e) = self.sync_public_key_on_startup().await {
-            eprintln!("[daemon] startup WireGuard public key sync failed: {}", e);
+        if let Err(error) = self.start_control_plane().await {
+            eprintln!("[daemon] control plane start failed: {error}");
+            self.memory.set_last_poll_error(Some(error)).await;
         }
-
-        let daemon_for_updates = self.clone_for_handler();
+        let daemon_for_control = self.clone_for_handler();
         tokio::spawn(async move {
-            daemon_for_updates.run_update_loop().await;
+            daemon_for_control.run_control_update_loop().await;
         });
+        #[cfg(target_os = "linux")]
+        {
+            let daemon_for_network = self.clone_for_handler();
+            tokio::spawn(async move {
+                daemon_for_network.run_network_change_loop().await;
+            });
+        }
 
         loop {
             match listener.accept().await {
@@ -303,151 +333,349 @@ impl Daemon {
             },
             // do not clone memory! clone the Arc instead
             memory: Arc::clone(&self.memory),
+            control_sync: Arc::clone(&self.control_sync),
+            control_plane: Arc::clone(&self.control_plane),
         })
     }
 
-    async fn run_update_loop(self: Arc<Self>) {
-        let mut self_info_interval = tokio::time::interval(Duration::from_secs(300));
-        let mut all_nodes_interval = tokio::time::interval(Duration::from_secs(300));
-        let mut wg_tunnel_interval = tokio::time::interval(Duration::from_secs(30));
-
-        loop {
-            tokio::select! {
-                _ = self_info_interval.tick() => {
-                    if let Err(e) = self.poll_self_info().await {
-                        eprintln!("[daemon] self info poll failed: {}", e);
-                        self.memory.set_last_poll_error(Some(format!("self poll failed: {}", e))).await;
-                    } else {
-                        self.memory.set_last_poll_error(None).await;
-                    }
-                }
-                _ = all_nodes_interval.tick() => {
-                    if let Err(e) = self.poll_all_nodes().await {
-                        eprintln!("[daemon] all nodes poll failed: {}", e);
-                        self.memory.set_last_poll_error(Some(format!("node list poll failed: {}", e))).await;
-                    } else {
-                        self.memory.set_last_poll_error(None).await;
-                    }
-                }
-                _ = wg_tunnel_interval.tick() => {
-                    if let Err(e) = self.poll_wireguard_tunnels().await {
-                        eprintln!("[daemon] wireguard poll failed: {}", e);
-                        self.memory.set_last_poll_error(Some(format!("wireguard poll failed: {}", e))).await;
-                    } else {
-                        self.memory.set_last_poll_error(None).await;
-                    }
-                }
-            }
-        }
-    }
-
-    async fn registered_server_config(&self) -> Result<ServerConfig, String> {
-        let cfg = self.server_config.lock().await.clone();
-        let cfg = cfg.ok_or_else(|| "server not configured".to_string())?;
-        if cfg.node_key.as_deref().unwrap_or_default().is_empty() {
-            return Err("server configured but not registered".to_string());
-        }
-        Ok(cfg)
-    }
-
-    async fn retry_with_backoff<T, F, Fut>(&self, label: &str, mut op: F) -> Result<T, String>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>>,
-    {
-        let mut delay_secs = 1u64;
-        for attempt in 1..=5 {
-            match op().await {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    if attempt == 5 {
-                        return Err(format!("{} failed after {} attempts: {}", label, attempt, e));
-                    }
-                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                    delay_secs = (delay_secs * 2).min(60);
-                }
-            }
-        }
-
-        Err(format!("{} failed", label))
-    }
-
-    async fn poll_self_info(&self) -> Result<(), String> {
-        let cfg = self.registered_server_config().await?;
-        let client = ServerRestClient::new(&cfg).map_err(|e| e.to_string())?;
-        let response = self
-            .retry_with_backoff("/client/self", || {
-                let client = client.clone();
-                async move { client.get_self_info().await }
-            })
-            .await?;
-        self.memory.set_node_info(response).await;
-        Ok(())
-    }
-
-    async fn poll_all_nodes(&self) -> Result<(), String> {
-        let cfg = self.registered_server_config().await?;
-        let client = ServerRestClient::new(&cfg).map_err(|e| e.to_string())?;
-        let response = self
-            .retry_with_backoff("/client/all_nodes", || {
-                let client = client.clone();
-                async move { client.get_all_nodes().await }
-            })
-            .await?;
-        self.memory.set_all_nodes(response).await;
-        Ok(())
-    }
-
-    async fn poll_wireguard_tunnels(&self) -> Result<(), String> {
-        let cfg = self.registered_server_config().await?;
-        let client = ServerRestClient::new(&cfg).map_err(|e| e.to_string())?;
-        let response = self
-            .retry_with_backoff("/client/wg_tun", || {
-                let client = client.clone();
-                async move { client.get_wireguard_tunnels().await }
-            })
-            .await?;
-
-        self.memory.set_wireguard_tunnels(response.clone()).await;
-
-        let local_private_key = cfg
-            .wg_private_key
-            .clone()
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "wireguard private key missing from server configuration".to_string())?;
-
-        self.memory
-            .reconcile_wireguard_tunnels(&response, &local_private_key)
-            .await?;
-
-        Ok(())
-    }
-
-    async fn sync_public_key_on_startup(&self) -> Result<(), String> {
-        let cfg = match self.server_config.lock().await.clone() {
-            Some(cfg) => cfg,
-            None => return Ok(()),
-        };
-
-        let node_key = cfg.node_key.as_deref().unwrap_or_default();
-        if node_key.is_empty() {
+    async fn start_control_plane(&self) -> Result<(), String> {
+        if self.control_plane.lock().await.is_some() {
             return Ok(());
         }
+        let config = self
+            .server_config
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "control plane is not enrolled".to_string())?;
+        let (updates, mut received) = mpsc::channel(8);
+        let plane = control::start(config, updates)?;
+        *self.control_plane.lock().await = Some(plane);
+        let daemon = self.clone_for_handler();
+        tokio::spawn(async move {
+            while let Some(snapshot) = received.recv().await {
+                if let Err(error) = daemon.apply_pushed_snapshot(snapshot).await {
+                    eprintln!("[daemon] pushed topology apply failed: {error}");
+                    daemon.memory.set_last_poll_error(Some(error)).await;
+                }
+            }
+        });
+        Ok(())
+    }
 
-        let public_key = cfg
-            .wg_public_key
+    async fn run_control_update_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Err(error) = self.sync_control_snapshot().await {
+                if error != "control plane is not enrolled" {
+                    eprintln!("[daemon] control snapshot sync failed: {error}");
+                    self.memory.set_last_poll_error(Some(error)).await;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_network_change_loop(self: Arc<Self>) {
+        let (connection, _, mut messages) = match rtnetlink::new_multicast_connection(&[
+            rtnetlink::MulticastGroup::Link,
+            rtnetlink::MulticastGroup::Ipv4Ifaddr,
+            rtnetlink::MulticastGroup::Ipv6Ifaddr,
+        ]) {
+            Ok(connection) => connection,
+            Err(error) => {
+                eprintln!("[daemon] network change watcher unavailable: {error}");
+                return;
+            }
+        };
+        tokio::spawn(connection);
+        while messages.next().await.is_some() {
+            // ponytail: track interface indexes to skip CAT interfaces if event volume becomes material.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Err(error) = self.sync_control_snapshot().await {
+                if error != "control plane is not enrolled" {
+                    eprintln!("[daemon] network-change endpoint refresh failed: {error}");
+                }
+            }
+        }
+    }
+
+    async fn apply_pushed_snapshot(&self, snapshot: TopologySnapshot) -> Result<(), String> {
+        let _sync = self.control_sync.lock().await;
+        let mut config = self
+            .server_config
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "control plane is not enrolled".to_string())?;
+        if snapshot.node_id != config.control_node_id.unwrap_or_default()
+            || snapshot.revision <= config.topology_revision
+        {
+            return Ok(());
+        }
+        let private_key = config
+            .wg_private_key
             .as_deref()
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "wireguard public key missing from server configuration".to_string())?;
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| "wireguard private key missing from server configuration".to_string())?
+            .to_owned();
+        self.answer_pending_tunnels(&mut config, &snapshot).await?;
+        self.memory
+            .apply_topology_snapshot(snapshot.clone(), &private_key)
+            .await?;
+        self.report_connectivity().await;
+        config.topology_revision = snapshot.revision;
+        config
+            .save(&self.config.data_dir)
+            .map_err(|error| error.to_string())?;
+        *self.server_config.lock().await = Some(config);
+        if self.memory.disconnected_tunnel_ids().await.is_empty() {
+            self.memory.set_last_poll_error(None).await;
+        }
+        Ok(())
+    }
 
-        let client = ServerRestClient::new(&cfg).map_err(|e| e.to_string())?;
-        self.retry_with_backoff("/client/wg_pubkey", || {
-            let client = client.clone();
-            let public_key = public_key.to_string();
-            async move { client.update_wireguard_pubkey(&public_key).await }
-        })
-        .await
-        .map(|_| ())
+    async fn sync_control_snapshot(&self) -> Result<(), String> {
+        let _sync = self.control_sync.lock().await;
+        let mut config = self
+            .server_config
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "control plane is not enrolled".to_string())?;
+        if config.controller_peer_id.is_none() || config.control_bootstrap_addresses.is_empty() {
+            return Err("control plane is not enrolled".to_string());
+        }
+
+        let response = self
+            .control_plane
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "control plane is not enrolled".to_string())?
+            .request(cat4igp_shared::control::ControlRequest::Snapshot)
+            .await?;
+        config
+            .save(&self.config.data_dir)
+            .map_err(|error| error.to_string())?;
+        *self.server_config.lock().await = Some(config.clone());
+
+        match response {
+            ControlResponse::SnapshotEnvelope(envelope) => {
+                let signing_key = config
+                    .controller_signing_key
+                    .as_deref()
+                    .ok_or_else(|| "controller signing key is not enrolled".to_string())?;
+                let encryption_key = config
+                    .control_encryption_private_key
+                    .as_deref()
+                    .ok_or_else(|| "control encryption identity is not enrolled".to_string())?;
+                let node_id = config
+                    .control_node_id
+                    .ok_or_else(|| "control node id is not enrolled".to_string())?;
+                let snapshot = cat4igp_shared::control::open_topology_snapshot(
+                    signing_key,
+                    encryption_key,
+                    &config.control_network_id,
+                    node_id,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|_| "system clock is before Unix epoch".to_string())?
+                        .as_millis()
+                        .try_into()
+                        .map_err(|_| "system clock is out of range".to_string())?,
+                    &envelope,
+                )
+                .map_err(str::to_string)?;
+                if snapshot.revision < config.topology_revision {
+                    return Err("controller returned a stale topology snapshot".to_string());
+                }
+                let private_key = config
+                    .wg_private_key
+                    .as_deref()
+                    .filter(|key| !key.is_empty())
+                    .ok_or_else(|| {
+                        "wireguard private key missing from server configuration".to_string()
+                    })?
+                    .to_owned();
+                self.answer_pending_tunnels(&mut config, &snapshot).await?;
+                self.memory
+                    .apply_topology_snapshot(snapshot.clone(), &private_key)
+                    .await?;
+                self.report_connectivity().await;
+                config.topology_revision = snapshot.revision;
+                config
+                    .save(&self.config.data_dir)
+                    .map_err(|error| error.to_string())?;
+                *self.server_config.lock().await = Some(config);
+                if self.memory.disconnected_tunnel_ids().await.is_empty() {
+                    self.memory.set_last_poll_error(None).await;
+                }
+                Ok(())
+            }
+            ControlResponse::Rejected(error) => Err(error),
+            _ => Err("unexpected control response".to_string()),
+        }
+    }
+
+    async fn answer_pending_tunnels(
+        &self,
+        config: &mut ServerConfig,
+        snapshot: &TopologySnapshot,
+    ) -> Result<(), String> {
+        for tunnel in snapshot.tunnels.iter().filter(|tunnel| {
+            matches!(
+                tunnel.local_answered,
+                WireguardAnswered::Unanswered | WireguardAnswered::Answered
+            )
+        }) {
+            let node_id = config
+                .control_node_id
+                .ok_or_else(|| "control node id is not enrolled".to_string())?;
+            let signing_key = config
+                .ensure_control_keypair()
+                .map_err(|error| error.to_string())?;
+            let controller_key = config
+                .controller_encryption_key
+                .as_deref()
+                .ok_or_else(|| "controller encryption key is not enrolled".to_string())?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| "system clock is before Unix epoch".to_string())?
+                .as_millis()
+                .try_into()
+                .map_err(|_| "system clock is out of range".to_string())?;
+            let (endpoint, decline_type) = if tunnel.faketcp {
+                if matches!(tunnel.local_answered, WireguardAnswered::Unanswered) {
+                    (None, Some(4))
+                } else {
+                    continue;
+                }
+            } else {
+                match self.local_endpoint(tunnel).await {
+                    Ok(endpoint) => {
+                        let endpoint = endpoint.to_string();
+                        if matches!(tunnel.local_answered, WireguardAnswered::Answered)
+                            && !self
+                                .memory
+                                .endpoint_changed(tunnel.tunnel_id, &endpoint)
+                                .await
+                        {
+                            continue;
+                        }
+                        (Some(endpoint), None)
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[daemon] tunnel {} cannot advertise endpoint: {error}",
+                            tunnel.tunnel_id
+                        );
+                        if matches!(tunnel.local_answered, WireguardAnswered::Unanswered) {
+                            self.memory.release_tunnel_port(tunnel.tunnel_id).await;
+                            (None, Some(3))
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+            };
+            let answer = TunnelAnswer {
+                tunnel_id: tunnel.tunnel_id,
+                endpoint,
+                decline_type,
+            };
+            let response = self
+                .control_plane
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| "control plane is not enrolled".to_string())?
+                .request(ControlRequest::TunnelAnswerEnvelope(
+                    cat4igp_shared::control::seal_tunnel_answer(
+                        &signing_key,
+                        controller_key,
+                        MessageMeta {
+                            message_id: format!("{:032x}", rand08::random::<u128>()),
+                            network_id: config.control_network_id.clone(),
+                            recipient_node_id: node_id,
+                            issued_at_ms: now,
+                            expires_at_ms: now + 60_000,
+                            topology_revision: config.topology_revision,
+                        },
+                        &answer,
+                    )
+                    .map_err(str::to_string)?,
+                ))
+                .await?;
+            match response {
+                ControlResponse::Accepted => {
+                    if let Some(endpoint) = answer.endpoint {
+                        self.memory
+                            .remember_endpoint(tunnel.tunnel_id, endpoint)
+                            .await;
+                    }
+                }
+                ControlResponse::Rejected(error) => {
+                    return Err(format!(
+                        "tunnel {} answer rejected: {error}",
+                        tunnel.tunnel_id
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "unexpected answer response for tunnel {}",
+                        tunnel.tunnel_id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn report_connectivity(&self) {
+        let disconnected = self.memory.disconnected_tunnel_ids().await;
+        if disconnected.is_empty() {
+            return;
+        }
+        self.memory
+            .set_last_poll_error(Some(format!(
+                "direct UDP handshake pending for tunnels: {}",
+                disconnected
+                    .into_iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))
+            .await;
+    }
+
+    async fn local_endpoint(
+        &self,
+        tunnel: &cat4igp_shared::control::WireguardTunnelInfo,
+    ) -> Result<SocketAddr, String> {
+        let port = self.memory.reserve_tunnel_port(tunnel.tunnel_id).await?;
+        let hostname = if tunnel.endpoint_ipv6 {
+            self.config.public_hostname_ipv6.as_deref()
+        } else {
+            self.config.public_hostname_ipv4.as_deref()
+        };
+        if let Some(hostname) = hostname {
+            let address = format!("{hostname}:{port}")
+                .to_socket_addrs()
+                .map_err(|error| format!("failed to resolve {hostname}: {error}"))?
+                .find(|address| address.is_ipv6() == tunnel.endpoint_ipv6)
+                .ok_or_else(|| format!("{hostname} has no requested address family"))?;
+            if address.ip().is_unspecified() || address.ip().is_multicast() {
+                return Err("configured endpoint is unspecified or multicast".to_string());
+            }
+            return Ok(address);
+        }
+        let mut detector = crate::network::PublicIpDetector::new();
+        detector.init().await?;
+        detector
+            .mapped_addr_from_port(port, tunnel.endpoint_ipv6)
+            .await
     }
 }
 
@@ -469,16 +697,20 @@ async fn handle_client(mut stream: UnixStream, daemon: Arc<Daemon>) -> io::Resul
     let mut buffer = vec![0u8; len];
     stream.read_exact(&mut buffer).await?;
 
-    let message: IpcMessage = serde_json::from_slice(&buffer).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("Invalid JSON: {}", e))
-    })?;
+    let message: IpcMessage = serde_json::from_slice(&buffer)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid JSON: {}", e)))?;
 
     // Handle the request
-    let response = daemon.handle_request(message.request, &message.secret).await;
+    let response = daemon
+        .handle_request(message.request, &message.secret)
+        .await;
 
     // Send the response
     let response_bytes = serde_json::to_vec(&response).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("Failed to serialize response: {}", e))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to serialize response: {}", e),
+        )
     })?;
 
     let response_len = (response_bytes.len() as u32).to_be_bytes();
@@ -518,9 +750,8 @@ mod tests {
         let secret = daemon.get_secret().to_string();
 
         let req = DaemonRequest::SetServer {
-            address: "https://example.com".to_string(),
+            address: "/ip4/127.0.0.1/tcp/9000/p2p/12D3KooWExample".to_string(),
             invite_code: "test-invite".to_string(),
-            verify_tls: true,
         };
 
         let response = daemon.handle_request(req, &secret).await;
@@ -550,6 +781,14 @@ mod tests {
                 assert!(msg.contains("Authentication"));
             }
             _ => panic!("Expected error response"),
+        }
+    }
+
+    #[test]
+    fn rejects_unspecified_or_multicast_endpoint() {
+        for endpoint in ["0.0.0.0:1", "[::]:1", "224.0.0.1:1", "[ff02::1]:1"] {
+            let endpoint: SocketAddr = endpoint.parse().unwrap();
+            assert!(endpoint.ip().is_unspecified() || endpoint.ip().is_multicast());
         }
     }
 }

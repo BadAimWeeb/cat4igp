@@ -1,25 +1,37 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::fs;
 use std::io;
+use std::path::Path;
 use wireguard_control::Key;
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, io::Error> {
+    if !value.len().is_multiple_of(2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid hex key",
+        ));
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid hex key"))
+        })
+        .collect()
+}
 
 /// Server configuration stored in the work directory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// Server address (e.g., "https://example.com" or "http://127.0.0.1:8080")
+    /// Controller bootstrap multiaddress, including `/p2p/<peer-id>` during enrollment.
     pub address: String,
-    
-    /// Whether to verify TLS certificates (only applies to HTTPS)
-    #[serde(default = "default_tls_verify")]
-    pub verify_tls: bool,
-    
+
     /// Invite code for server registration
     pub invite_code: String,
-    
-    /// Node authentication key returned by server registration.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_key: Option<String>,
 
     /// Local WireGuard private key used to create tunnels.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -28,10 +40,43 @@ pub struct ServerConfig {
     /// Local WireGuard public key announced to the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wg_public_key: Option<String>,
-}
 
-fn default_tls_verify() -> bool {
-    true
+    /// Persistent libp2p identity; separate from the WireGuard key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_private_key: Option<String>,
+
+    /// Persistent X25519 private key for future recipient-private control payloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_encryption_private_key: Option<String>,
+
+    /// Pinned controller peer identity from the enrollment bundle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_peer_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_signing_key: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_encryption_key: Option<String>,
+
+    /// Controller bootstrap multiaddresses from the enrollment bundle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_bootstrap_addresses: Vec<String>,
+
+    /// libp2p PSK key-file content for the private control network.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_private_network_key: Option<String>,
+
+    /// Last accepted complete topology revision.
+    #[serde(default)]
+    pub topology_revision: i64,
+
+    /// Controller-assigned recipient identifier for topology PubSub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_node_id: Option<i32>,
+
+    #[serde(default = "default_control_network_id")]
+    pub control_network_id: String,
 }
 
 impl ServerConfig {
@@ -40,10 +85,18 @@ impl ServerConfig {
         Self {
             address,
             invite_code,
-            verify_tls: true,
-            node_key: None,
             wg_private_key: None,
             wg_public_key: None,
+            control_private_key: None,
+            control_encryption_private_key: None,
+            controller_peer_id: None,
+            controller_signing_key: None,
+            controller_encryption_key: None,
+            control_bootstrap_addresses: Vec::new(),
+            control_private_network_key: None,
+            topology_revision: 0,
+            control_node_id: None,
+            control_network_id: default_control_network_id(),
         }
     }
 
@@ -67,6 +120,41 @@ impl ServerConfig {
         Ok(())
     }
 
+    pub fn ensure_control_keypair(&mut self) -> Result<libp2p::identity::Keypair, io::Error> {
+        let keypair = match &self.control_private_key {
+            Some(encoded) => libp2p::identity::Keypair::from_protobuf_encoding(&hex_decode(
+                encoded,
+            )?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid control key"))?,
+            None => libp2p::identity::Keypair::generate_ed25519(),
+        };
+        self.control_private_key =
+            Some(hex_encode(&keypair.to_protobuf_encoding().map_err(
+                |_| io::Error::other("failed to encode control key"),
+            )?));
+        Ok(keypair)
+    }
+
+    pub fn ensure_control_encryption_key(&mut self) -> Result<String, io::Error> {
+        let private = match &self.control_encryption_private_key {
+            Some(encoded) => {
+                let bytes = hex_decode(encoded)?;
+                let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid encryption key")
+                })?;
+                x25519_dalek::StaticSecret::from(bytes)
+            }
+            None => {
+                let generated = x25519_dalek::StaticSecret::random_from_rng(rand08::rngs::OsRng);
+                self.control_encryption_private_key = Some(hex_encode(&generated.to_bytes()));
+                generated
+            }
+        };
+        Ok(hex_encode(
+            x25519_dalek::PublicKey::from(&private).as_bytes(),
+        ))
+    }
+
     /// Load server configuration from file
     pub fn load(data_dir: &Path) -> io::Result<Self> {
         let config_path = data_dir.join("server.json");
@@ -78,9 +166,8 @@ impl ServerConfig {
         }
 
         let content = fs::read_to_string(config_path)?;
-        serde_json::from_str(&content).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-        })
+        serde_json::from_str(&content)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
     /// Save server configuration to file
@@ -89,7 +176,12 @@ impl ServerConfig {
         let config_path = data_dir.join("server.json");
         let content = serde_json::to_string_pretty(&self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        fs::write(config_path, content)?;
+        fs::write(&config_path, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
@@ -106,34 +198,10 @@ impl ServerConfig {
         }
         Ok(())
     }
+}
 
-    /// Get the host from server address
-    pub fn get_host(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let address = &self.address;
-        let address = if address.starts_with("https://") {
-            &address[8..]
-        } else if address.starts_with("http://") {
-            &address[7..]
-        } else {
-            address
-        };
-
-        // Split by '/' to remove path component if present
-        let host = address.split('/').next().unwrap_or(address);
-        
-        // Check if it's an IP address with port
-        if let Ok(addr) = host.parse::<std::net::SocketAddr>() {
-            Ok(addr.ip().to_string())
-        } else {
-            // It might be a hostname with port, split by ':'
-            Ok(host.split(':').next().unwrap_or(host).to_string())
-        }
-    }
-
-    /// Check if server address uses HTTPS
-    pub fn uses_https(&self) -> bool {
-        self.address.starts_with("https://")
-    }
+fn default_control_network_id() -> String {
+    "default".to_string()
 }
 
 #[cfg(test)]
@@ -149,16 +217,13 @@ mod tests {
         );
         assert_eq!(config.address, "https://example.com:8443");
         assert_eq!(config.invite_code, "invite123");
-        assert!(config.verify_tls);
     }
 
     #[test]
     fn test_server_config_save_load() {
         let temp_dir = TempDir::new().unwrap();
-        let config = ServerConfig::new(
-            "https://example.com".to_string(),
-            "test-invite".to_string(),
-        );
+        let config =
+            ServerConfig::new("https://example.com".to_string(), "test-invite".to_string());
 
         config.save(temp_dir.path()).unwrap();
         let loaded = ServerConfig::load(temp_dir.path()).unwrap();
@@ -168,26 +233,27 @@ mod tests {
     }
 
     #[test]
-    fn test_get_host() {
-        let config = ServerConfig::new(
-            "https://example.com:8443".to_string(),
-            "invite".to_string(),
-        );
-        assert_eq!(config.get_host().unwrap(), "example.com");
+    fn control_identity_is_persistent() {
+        let mut config = ServerConfig::new("control".to_string(), "invite".to_string());
+        let first = config
+            .ensure_control_keypair()
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let second = config
+            .ensure_control_keypair()
+            .unwrap()
+            .public()
+            .to_peer_id();
+        assert_eq!(first, second);
     }
 
     #[test]
-    fn test_uses_https() {
-        let https_config = ServerConfig::new(
-            "https://example.com".to_string(),
-            "invite".to_string(),
+    fn control_encryption_identity_is_persistent() {
+        let mut config = ServerConfig::new("control".to_string(), "invite".to_string());
+        assert_eq!(
+            config.ensure_control_encryption_key().unwrap(),
+            config.ensure_control_encryption_key().unwrap()
         );
-        assert!(https_config.uses_https());
-
-        let http_config = ServerConfig::new(
-            "http://example.com".to_string(),
-            "invite".to_string(),
-        );
-        assert!(!http_config.uses_https());
     }
 }

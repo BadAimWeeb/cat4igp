@@ -8,7 +8,7 @@ The cat4igp client has been enhanced with:
 2. **CLI Interface**: Command-line options for managing the daemon
 3. **Public IP Detection**: STUN-based detection of public IPv4 and IPv6 addresses
 4. **WireGuard Response Handler**: Smart IP address selection for connection responses
-5. **TLS Support**: Configuration for HTTPS server connections
+5. **Private libp2p control plane**: PSK-protected, encrypted controller communication
 
 ## Configuration File Format
 
@@ -29,13 +29,21 @@ max = 52000
 [tunnel_protocols]
 wireguard = true
 
-# Optional public hostname for connection responses
-public_hostname = "example.com"
+# Optional reachable addresses. The matching family is advertised with the
+# allocated tunnel UDP port; IPv6 uses the IPv6 value.
+public_hostname_ipv4 = "example.com"
+public_hostname_ipv6 = "vpn6.example.com"
 
-# Server connection settings
-[server]
-address = "https://example.com:8443"
-verify_tls = true
+# Additional controller multiaddresses for bootstrap/failover. Each must include
+# the same `/p2p/<controller-peer-id>` as the address passed to `register`.
+control_bootstrap_addresses = [
+  "/dns4/controller-backup.example.com/tcp/9000/p2p/12D3KooW..."
+]
+
+# Required libp2p private-network key file, issued out of band with the invite.
+control_private_network_key = """/key/swarm/psk/1.0.0/
+/base16/
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"""
 ```
 
 ### JSON Format
@@ -51,11 +59,11 @@ verify_tls = true
   "tunnel_protocols": {
     "wireguard": true
   },
-  "public_hostname": "example.com",
-  "server": {
-    "address": "https://example.com:8443",
-    "verify_tls": true
-  }
+  "public_hostname_ipv4": "example.com",
+  "public_hostname_ipv6": "vpn6.example.com",
+  "control_bootstrap_addresses": [
+    "/dns4/controller.example.com/tcp/9000/p2p/12D3KooW..."
+  ]
 }
 ```
 
@@ -131,44 +139,32 @@ The `PublicIpDetector` uses STUN (Session Traversal Utilities for NAT) to detect
 - Support for both IPv4 and IPv6
 - Automatic fallback between servers
 
-### WireGuard Response Handler
+### Direct WireGuard connectivity
 
-When a client connects via WireGuard, the handler can respond with the appropriate IP address:
+For each controller-requested link, a node advertises an endpoint in this order:
 
-```rust
-let handler = WireGuardResponseHandler::new(config);
+1. Resolve `public_hostname_ipv4` or `public_hostname_ipv6` and combine it with the allocated tunnel port.
+2. If the relevant hostname is unset, issue STUN from that requested UDP port and advertise STUN's mapped address and **actual mapped port**.
+3. If neither yields a valid endpoint for the requested family, reject that link with `RejectedNoIpStack`.
 
-// Handle IPv4 request
-let response = handler.handle_request(AddressFamily::IPv4).await?;
-match response {
-    WireGuardResponse::Address(ip) => println!("Responding with: {}", ip),
-    WireGuardResponse::Empty => println!("No suitable address found"),
-}
-```
+Nodes exchange endpoints through the controller, send a short UDP punch burst, then use WireGuard persistent keepalive. They re-advertise a changed endpoint after control polling or Linux link/address events.
 
-The response logic:
-1. Detects public IP using STUN
-2. Validates the IP matches either:
-   - A local network interface address, OR
-   - The configured public hostname (DNS lookup)
-3. Returns the IP if valid, empty if unsuitable, or error if address family unavailable
+This is best effort. Permit and, when necessary, forward the configured UDP range at the host and edge firewall. Do not use a private, unspecified, multicast, split-horizon, or controller-only hostname. Symmetric NAT and restrictive endpoint-dependent firewalls can still prevent direct connectivity; CAT4IGP does not relay traffic.
 
-### Server Configuration
+### Controller bootstrap servers
 
-The server address configuration supports:
+`register --server` takes a controller libp2p multiaddress containing
+`/p2p/<controller-peer-id>`. Configure `control_bootstrap_addresses` for
+additional reachable addresses. The client tries each address in order and
+requires every configured address to identify the same controller peer.
+`control_private_network_key` is required and must match the controller's
+`CONTROL_PRIVATE_NETWORK_KEY` environment variable.
 
-- **HTTPS**: `https://example.com:8443` - TLS verification enabled by default
-- **HTTP**: `http://example.com:8080` - No TLS verification
-- **Hostname or IP**: Both are supported
-- **Ports**: Custom ports can be specified
-
-TLS verification can be disabled per-connection or globally in configuration:
-
-```toml
-[server]
-address = "https://internal.example.com"
-verify_tls = false  # Disable certificate verification
-```
+The controller stores its libp2p signing and encryption identities in its
+database. On enrollment, the client pins the controller peer ID, signing key,
+encryption key, recipient node ID, and control-network ID in
+`<data_dir>/server.json` (mode `0600`). Topology snapshots are signed and
+recipient-encrypted for both PubSub delivery and recovery requests.
 
 ## Programmatic Configuration
 
@@ -183,7 +179,7 @@ let mut config = ClientConfig::default();
 
 // Customize
 config.daemon_socket = PathBuf::from("/tmp/my-client.sock");
-config.public_hostname = Some("my-server.example.com".to_string());
+config.public_hostname_ipv4 = Some("my-server.example.com".to_string());
 
 // Save to file
 config.save_to_file("my-config.toml")?;
@@ -207,7 +203,7 @@ daemon_socket = "/tmp/cat4igp-client.sock"
 data_dir = "/var/lib/cat4igp-client"
 port_range = { min = 51820, max = 52000 }
 tunnel_protocols = { wireguard = true }
-server = { address = "https://localhost:8443", verify_tls = true }
+control_bootstrap_addresses = ["/dns4/controller.example.com/tcp/9000/p2p/12D3KooW..."]
 ```
 
 ## Module Structure
@@ -225,6 +221,7 @@ All operations return proper error types:
 - **Configuration errors**: Invalid port ranges, missing files, parse errors
 - **Network errors**: STUN server timeouts, DNS lookup failures
 - **Address family errors**: Specific errors when IPv4/IPv6 not available
+- **Direct-link errors**: Pending WireGuard handshake when NAT or firewall policy blocks direct UDP
 
 ## Testing
 
@@ -233,7 +230,6 @@ Run tests for configuration management:
 ```bash
 cargo test --package client config::tests
 cargo test --package client public_ip::tests
-cargo test --package client wireguard_response::tests
 ```
 
 ## Future Enhancements

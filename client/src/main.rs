@@ -3,11 +3,10 @@ mod daemon;
 mod interface;
 mod network;
 mod tunnel;
-mod server_rest;
 
-use daemon::protocol::DaemonRequest;
-use daemon::client::DaemonClient;
 use clap::{Parser, Subcommand};
+use daemon::client::DaemonClient;
+use daemon::protocol::DaemonRequest;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -33,17 +32,13 @@ enum Commands {
 
     /// Register with server
     Register {
-        /// Server address (example: https://controller.example.com)
+        /// Controller multiaddress including `/p2p/<peer-id>`
         #[arg(long)]
         server: String,
 
         /// Invite code from the controller
         #[arg(long)]
         invite: String,
-
-        /// Disable TLS certificate verification
-        #[arg(long, default_value_t = false)]
-        insecure: bool,
     },
 
     /// Daemon control commands
@@ -86,9 +81,10 @@ enum Commands {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let config_path = cli.config.clone().unwrap_or_else(|| {
-        PathBuf::from("/etc/cat4igp/client.toml")
-    });
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/etc/cat4igp/client.toml"));
 
     match cli.command {
         Some(Commands::Daemon { config: cmd_config }) => {
@@ -103,26 +99,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             start_daemon(client_config).await?;
         }
 
-        Some(Commands::Register {
-            server,
-            invite,
-            insecure,
-        }) => {
+        Some(Commands::Register { server, invite }) => {
             let client_config = if config_path.exists() {
                 config::ClientConfig::from_file(&config_path)?
             } else {
                 config::ClientConfig::default()
             };
 
-            let client = DaemonClient::new(
-                &client_config.daemon_socket,
-                &client_config.data_dir,
-            )?;
+            let client = DaemonClient::new(&client_config.daemon_socket, &client_config.data_dir)?;
 
             let request = DaemonRequest::Register {
                 address: server,
                 invite_code: invite,
-                verify_tls: !insecure,
             };
 
             match client.send_request(request).await? {
@@ -147,10 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config::ClientConfig::default()
             };
 
-            let client = DaemonClient::new(
-                &client_config.daemon_socket,
-                &client_config.data_dir,
-            )?;
+            let client = DaemonClient::new(&client_config.daemon_socket, &client_config.data_dir)?;
 
             let request = DaemonRequest::Status;
             match client.send_request(request).await? {
@@ -162,8 +147,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } => {
                     println!("Daemon Status:");
                     println!("  Running: {}", if running { "Yes" } else { "No" });
-                    println!("  Server Configured: {}", if server_configured { "Yes" } else { "No" });
-                    println!("  Node Key Present: {}", if node_key_present { "Yes" } else { "No" });
+                    println!(
+                        "  Server Configured: {}",
+                        if server_configured { "Yes" } else { "No" }
+                    );
+                    println!(
+                        "  Node Key Present: {}",
+                        if node_key_present { "Yes" } else { "No" }
+                    );
                     if let Some(msg) = message {
                         println!("  Message: {}", msg);
                     }
@@ -191,7 +182,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Some(Commands::ShowConfig { config: cmd_config, json }) => {
+        Some(Commands::ShowConfig {
+            config: cmd_config,
+            json,
+        }) => {
             let config_path = cmd_config.unwrap_or(config_path);
             let client_config = if config_path.exists() {
                 config::ClientConfig::from_file(&config_path)?
@@ -208,13 +202,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Some(Commands::PublicIp { family, nat }) => {
             let mut detector = network::public_ip::PublicIpDetector::new();
-            
+
             // Initialize detector by fetching STUN server lists
             if let Err(e) = detector.init().await {
                 eprintln!("Failed to initialize STUN detector: {}", e);
                 std::process::exit(1);
             }
-            
+
             if nat {
                 // Detect NAT type
                 match family.as_deref() {
@@ -296,7 +290,10 @@ async fn start_daemon(config: config::ClientConfig) -> Result<(), Box<dyn std::e
     println!("Configuration:");
     println!("  Daemon socket: {:?}", config.daemon_socket);
     println!("  Data directory: {:?}", config.data_dir);
-    println!("  Port range: {}-{}", config.port_range.min, config.port_range.max);
+    println!(
+        "  Port range: {}-{}",
+        config.port_range.min, config.port_range.max
+    );
 
     if let Some(hostname) = &config.public_hostname_ipv4 {
         println!("  Public IPv4 hostname: {}", hostname);
@@ -322,4 +319,3 @@ async fn start_daemon(config: config::ClientConfig) -> Result<(), Box<dyn std::e
 
     Ok(())
 }
-

@@ -42,6 +42,18 @@ diesel::table! {
 }
 
 diesel::table! {
+    node_control_identities (node_id) {
+        node_id -> Integer,
+        peer_id -> Text,
+        signing_key -> Text,
+        encryption_key -> Text,
+        topology_revision -> BigInt,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+    }
+}
+
+diesel::table! {
     settings (id) {
         id -> Integer,
         key -> Text,
@@ -81,6 +93,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     invites,
     mesh_group_memberships,
     mesh_groups,
+    node_control_identities,
     nodes,
     settings,
     wireguard_static_key,

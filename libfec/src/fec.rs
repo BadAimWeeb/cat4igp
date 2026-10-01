@@ -156,8 +156,10 @@ impl FecEncoder {
         }
 
         if parity_shards > 0 {
-            let rs = ReedSolomon::new(data_shards, parity_shards).map_err(|_| FecError::InvalidShardConfig)?;
-            rs.encode(&mut shards).map_err(|_| FecError::InvalidShardConfig)?;
+            let rs = ReedSolomon::new(data_shards, parity_shards)
+                .map_err(|_| FecError::InvalidShardConfig)?;
+            rs.encode(&mut shards)
+                .map_err(|_| FecError::InvalidShardConfig)?;
         }
 
         let block_id = self.block_id;
@@ -255,15 +257,18 @@ impl FecDecoder {
             return Err(FecError::FrameMalformed);
         }
 
-        let state = self.blocks.entry(parsed.block_id).or_insert_with(|| BlockState {
-            mode: parsed.mode,
-            data_shards,
-            parity_shards,
-            shard_len: parsed.shard_data.len(),
-            shards: vec![None; total_shards],
-            delivered: vec![false; data_shards],
-            created_at: Instant::now(),
-        });
+        let state = self
+            .blocks
+            .entry(parsed.block_id)
+            .or_insert_with(|| BlockState {
+                mode: parsed.mode,
+                data_shards,
+                parity_shards,
+                shard_len: parsed.shard_data.len(),
+                shards: vec![None; total_shards],
+                delivered: vec![false; data_shards],
+                created_at: Instant::now(),
+            });
 
         if state.mode != parsed.mode
             || state.data_shards != data_shards
@@ -302,7 +307,8 @@ impl FecDecoder {
         let present = state.shards.iter().filter(|s| s.is_some()).count();
         if present >= state.data_shards && state.delivered.iter().any(|d| !*d) {
             let mut work = state.shards.clone();
-            let rs = ReedSolomon::new(state.data_shards, state.parity_shards).map_err(|_| FecError::InvalidShardConfig)?;
+            let rs = ReedSolomon::new(state.data_shards, state.parity_shards)
+                .map_err(|_| FecError::InvalidShardConfig)?;
             if rs.reconstruct(&mut work).is_ok() {
                 state.shards = work;
                 for data_idx in 0..state.data_shards {
@@ -330,7 +336,8 @@ impl FecDecoder {
 
     fn gc(&mut self) {
         let ttl = self.ttl;
-        self.blocks.retain(|_, block| block.created_at.elapsed() <= ttl);
+        self.blocks
+            .retain(|_, block| block.created_at.elapsed() <= ttl);
         self.mode1_fast_seen
             .retain(|_, (created_at, _)| created_at.elapsed() <= ttl);
     }

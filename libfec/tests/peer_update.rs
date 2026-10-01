@@ -1,7 +1,7 @@
+use cat4igp_libfec::{Config, FecMode, PeerEngine};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Duration};
-use cat4igp_libfec::{Config, FecMode, PeerEngine};
 
 fn localhost(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
@@ -25,9 +25,7 @@ async fn peer_address_can_change_on_the_fly() {
     peer1_cfg.encode_fast_send = false;
     peer1_cfg.decode_fast_send = false;
 
-    let peer1 = PeerEngine::start(peer1_cfg)
-    .await
-    .expect("start peer1");
+    let peer1 = PeerEngine::start(peer1_cfg).await.expect("start peer1");
 
     let mut peer2_cfg = Config::new(localhost(0), localhost(0), app_peer2_addr);
     peer2_cfg.fec_mode = FecMode::Mode0;
@@ -37,9 +35,7 @@ async fn peer_address_can_change_on_the_fly() {
     peer2_cfg.encode_fast_send = false;
     peer2_cfg.decode_fast_send = false;
 
-    let peer2 = PeerEngine::start(peer2_cfg)
-    .await
-    .expect("start peer2");
+    let peer2 = PeerEngine::start(peer2_cfg).await.expect("start peer2");
 
     let mut cfg = Config::new(localhost(0), localhost(0), sender_addr);
     cfg.fec_mode = FecMode::Mode0;
@@ -54,7 +50,9 @@ async fn peer_address_can_change_on_the_fly() {
     let handle = engine.handle();
 
     for _ in 0..100 {
-        if handle.stats().handshake_established > 0 && peer1.handle().stats().handshake_established > 0 {
+        if handle.stats().handshake_established > 0
+            && peer1.handle().stats().handshake_established > 0
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -75,7 +73,9 @@ async fn peer_address_can_change_on_the_fly() {
     handle.set_peer_addr(peer2.handle().fec_bind_addr()).await;
 
     for _ in 0..100 {
-        if handle.stats().handshake_established > 1 && peer2.handle().stats().handshake_established > 0 {
+        if handle.stats().handshake_established > 1
+            && peer2.handle().stats().handshake_established > 0
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

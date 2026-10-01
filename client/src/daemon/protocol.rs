@@ -1,8 +1,8 @@
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::fs;
 use std::io;
+use std::path::Path;
 
 /// Request sent from CLI to daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,13 +13,11 @@ pub enum DaemonRequest {
     SetServer {
         address: String,
         invite_code: String,
-        verify_tls: bool,
     },
     /// Register with server and store node key
     Register {
         address: String,
         invite_code: String,
-        verify_tls: bool,
     },
     /// Restart the daemon
     Restart,
@@ -52,7 +50,6 @@ pub enum DaemonResponse {
     ServerConfig {
         address: String,
         invite_code: String,
-        verify_tls: bool,
         registered: bool,
     },
     /// Daemon configuration details
@@ -153,7 +150,6 @@ mod tests {
         let req = DaemonRequest::SetServer {
             address: "https://example.com".to_string(),
             invite_code: "abc123".to_string(),
-            verify_tls: true,
         };
         let json = serde_json::to_string(&req).unwrap();
         let deserialized: DaemonRequest = serde_json::from_str(&json).unwrap();
@@ -161,7 +157,6 @@ mod tests {
             DaemonRequest::SetServer {
                 address,
                 invite_code,
-                ..
             } => {
                 assert_eq!(address, "https://example.com");
                 assert_eq!(invite_code, "abc123");

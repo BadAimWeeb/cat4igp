@@ -5,4 +5,11 @@ edition = "2024"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
 chrono = { workspace = true }
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+hkdf = "0.12"
+libp2p = { workspace = true }
+rand08 = { package = "rand", version = "0.8" }
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }

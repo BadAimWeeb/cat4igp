@@ -6,7 +6,7 @@ pub enum WireguardAnswered {
     Answered = 1,
     RejectedGeneric = 2,
     RejectedNoIpStack = 3,
-    Unknown = -1
+    Unknown = -1,
 }
 
 impl From<i16> for WireguardAnswered {

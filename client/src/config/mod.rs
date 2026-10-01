@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::fs;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 pub mod server;
 pub use server::ServerConfig;
@@ -11,21 +11,32 @@ pub use server::ServerConfig;
 pub struct ClientConfig {
     /// Path to the daemon socket file to listen on
     pub daemon_socket: PathBuf,
-    
+
     /// Directory for working data storage
     pub data_dir: PathBuf,
-    
+
     /// Usable port range for tunnels
     pub port_range: PortRange,
-    
+
     /// Enabled tunnel protocols
     pub tunnel_protocols: TunnelProtocols,
-    
+
     /// Optional public IPv4 hostname for responding to connection requests
     pub public_hostname_ipv4: Option<String>,
-    
+
     /// Optional public IPv6 hostname for responding to connection requests
     pub public_hostname_ipv6: Option<String>,
+
+    /// Additional controller multiaddresses used if the enrollment address is unavailable.
+    #[serde(default)]
+    pub control_bootstrap_addresses: Vec<String>,
+
+    /// libp2p PSK key-file content for the private control network.
+    pub control_private_network_key: Option<String>,
+
+    /// Private control network identifier shared with the controller.
+    #[serde(default = "default_control_network_id")]
+    pub control_network_id: String,
 }
 
 /// Port range configuration
@@ -64,14 +75,22 @@ impl Default for ClientConfig {
         ClientConfig {
             daemon_socket: PathBuf::from("/tmp/cat4igp-client.sock"),
             data_dir: PathBuf::from("/var/lib/cat4igp-client"),
-            port_range: PortRange { min: 51820, max: 52000 },
-            tunnel_protocols: TunnelProtocols {
-                wireguard: true,
+            port_range: PortRange {
+                min: 51820,
+                max: 52000,
             },
+            tunnel_protocols: TunnelProtocols { wireguard: true },
             public_hostname_ipv4: None,
             public_hostname_ipv6: None,
+            control_bootstrap_addresses: Vec::new(),
+            control_private_network_key: None,
+            control_network_id: default_control_network_id(),
         }
     }
+}
+
+fn default_control_network_id() -> String {
+    "default".to_string()
 }
 
 impl ClientConfig {

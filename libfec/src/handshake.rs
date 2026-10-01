@@ -84,7 +84,12 @@ pub fn generate_local_keypair() -> ([u8; 32], [u8; 32]) {
     (secret.to_bytes(), public.to_bytes())
 }
 
-pub fn derive_shared_key(local_secret: [u8; 32], remote_public: [u8; 32], local_session: u64, remote_session: u64) -> [u8; 32] {
+pub fn derive_shared_key(
+    local_secret: [u8; 32],
+    remote_public: [u8; 32],
+    local_session: u64,
+    remote_session: u64,
+) -> [u8; 32] {
     let secret = StaticSecret::from(local_secret);
     let remote = PublicKey::from(remote_public);
     let shared = secret.diffie_hellman(&remote);
@@ -99,16 +104,28 @@ pub fn derive_shared_key(local_secret: [u8; 32], remote_public: [u8; 32], local_
     key
 }
 
-pub fn encrypt_with_key(key: [u8; 32], nonce: [u8; 12], plaintext: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+pub fn encrypt_with_key(
+    key: [u8; 32],
+    nonce: [u8; 12],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, HandshakeError> {
     let cipher = ChaCha20Poly1305::new((&key).into());
     let nonce = Nonce::from_slice(&nonce);
-    cipher.encrypt(nonce, plaintext).map_err(|_| HandshakeError::Crypto)
+    cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|_| HandshakeError::Crypto)
 }
 
-pub fn decrypt_with_key(key: [u8; 32], nonce: [u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+pub fn decrypt_with_key(
+    key: [u8; 32],
+    nonce: [u8; 12],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, HandshakeError> {
     let cipher = ChaCha20Poly1305::new((&key).into());
     let nonce = Nonce::from_slice(&nonce);
-    cipher.decrypt(nonce, ciphertext).map_err(|_| HandshakeError::Crypto)
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| HandshakeError::Crypto)
 }
 
 pub fn random_nonce() -> [u8; 12] {
@@ -162,8 +179,16 @@ pub fn decode_control_message(buf: &[u8]) -> Result<ControlMessage, HandshakeErr
             if buf.len() < 1 + 8 + 8 + 32 {
                 return Err(HandshakeError::TooShort);
             }
-            let session_id = u64::from_be_bytes(buf[1..9].try_into().map_err(|_| HandshakeError::InvalidPayload)?);
-            let timestamp_ms = u64::from_be_bytes(buf[9..17].try_into().map_err(|_| HandshakeError::InvalidPayload)?);
+            let session_id = u64::from_be_bytes(
+                buf[1..9]
+                    .try_into()
+                    .map_err(|_| HandshakeError::InvalidPayload)?,
+            );
+            let timestamp_ms = u64::from_be_bytes(
+                buf[9..17]
+                    .try_into()
+                    .map_err(|_| HandshakeError::InvalidPayload)?,
+            );
             let mut public_key = [0u8; 32];
             public_key.copy_from_slice(&buf[17..49]);
             Ok(ControlMessage::Hello(Hello {
@@ -176,8 +201,16 @@ pub fn decode_control_message(buf: &[u8]) -> Result<ControlMessage, HandshakeErr
             if buf.len() < 1 + 8 + 8 + 32 + 1 {
                 return Err(HandshakeError::TooShort);
             }
-            let session_id = u64::from_be_bytes(buf[1..9].try_into().map_err(|_| HandshakeError::InvalidPayload)?);
-            let timestamp_ms = u64::from_be_bytes(buf[9..17].try_into().map_err(|_| HandshakeError::InvalidPayload)?);
+            let session_id = u64::from_be_bytes(
+                buf[1..9]
+                    .try_into()
+                    .map_err(|_| HandshakeError::InvalidPayload)?,
+            );
+            let timestamp_ms = u64::from_be_bytes(
+                buf[9..17]
+                    .try_into()
+                    .map_err(|_| HandshakeError::InvalidPayload)?,
+            );
             let mut public_key = [0u8; 32];
             public_key.copy_from_slice(&buf[17..49]);
             let role = match buf[49] {
@@ -196,10 +229,18 @@ pub fn decode_control_message(buf: &[u8]) -> Result<ControlMessage, HandshakeErr
             if buf.len() < 1 + 8 + 12 + 2 {
                 return Err(HandshakeError::TooShort);
             }
-            let session_id = u64::from_be_bytes(buf[1..9].try_into().map_err(|_| HandshakeError::InvalidPayload)?);
+            let session_id = u64::from_be_bytes(
+                buf[1..9]
+                    .try_into()
+                    .map_err(|_| HandshakeError::InvalidPayload)?,
+            );
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&buf[9..21]);
-            let ciphertext_len = u16::from_be_bytes(buf[21..23].try_into().map_err(|_| HandshakeError::InvalidPayload)?) as usize;
+            let ciphertext_len = u16::from_be_bytes(
+                buf[21..23]
+                    .try_into()
+                    .map_err(|_| HandshakeError::InvalidPayload)?,
+            ) as usize;
             if buf.len() != 23 + ciphertext_len {
                 return Err(HandshakeError::InvalidPayload);
             }
@@ -213,7 +254,11 @@ pub fn decode_control_message(buf: &[u8]) -> Result<ControlMessage, HandshakeErr
             if buf.len() < 1 + 8 + 1 {
                 return Err(HandshakeError::TooShort);
             }
-            let session_id = u64::from_be_bytes(buf[1..9].try_into().map_err(|_| HandshakeError::InvalidPayload)?);
+            let session_id = u64::from_be_bytes(
+                buf[1..9]
+                    .try_into()
+                    .map_err(|_| HandshakeError::InvalidPayload)?,
+            );
             let accepted = buf[9] == 1;
             Ok(ControlMessage::ResumeAck(ResumeAck {
                 session_id,
@@ -224,7 +269,12 @@ pub fn decode_control_message(buf: &[u8]) -> Result<ControlMessage, HandshakeErr
     }
 }
 
-pub fn choose_server_role(local_timestamp: u64, remote_timestamp: u64, local_session: u64, remote_session: u64) -> Role {
+pub fn choose_server_role(
+    local_timestamp: u64,
+    remote_timestamp: u64,
+    local_session: u64,
+    remote_session: u64,
+) -> Role {
     if local_timestamp < remote_timestamp {
         Role::Server
     } else if local_timestamp > remote_timestamp {
@@ -236,7 +286,11 @@ pub fn choose_server_role(local_timestamp: u64, remote_timestamp: u64, local_ses
     }
 }
 
-pub fn encode_resume_plaintext(local_session: u64, remote_session: u64, timestamp_ms: u64) -> Vec<u8> {
+pub fn encode_resume_plaintext(
+    local_session: u64,
+    remote_session: u64,
+    timestamp_ms: u64,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(24);
     out.extend_from_slice(&local_session.to_be_bytes());
     out.extend_from_slice(&remote_session.to_be_bytes());
@@ -248,9 +302,21 @@ pub fn decode_resume_plaintext(buf: &[u8]) -> Result<(u64, u64, u64), HandshakeE
     if buf.len() != 24 {
         return Err(HandshakeError::InvalidPayload);
     }
-    let local_session = u64::from_be_bytes(buf[0..8].try_into().map_err(|_| HandshakeError::InvalidPayload)?);
-    let remote_session = u64::from_be_bytes(buf[8..16].try_into().map_err(|_| HandshakeError::InvalidPayload)?);
-    let timestamp_ms = u64::from_be_bytes(buf[16..24].try_into().map_err(|_| HandshakeError::InvalidPayload)?);
+    let local_session = u64::from_be_bytes(
+        buf[0..8]
+            .try_into()
+            .map_err(|_| HandshakeError::InvalidPayload)?,
+    );
+    let remote_session = u64::from_be_bytes(
+        buf[8..16]
+            .try_into()
+            .map_err(|_| HandshakeError::InvalidPayload)?,
+    );
+    let timestamp_ms = u64::from_be_bytes(
+        buf[16..24]
+            .try_into()
+            .map_err(|_| HandshakeError::InvalidPayload)?,
+    );
     Ok((local_session, remote_session, timestamp_ms))
 }
 

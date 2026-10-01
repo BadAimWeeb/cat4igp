@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum WireguardAnswered {
     Unanswered = 0,
     Answered = 1,
     RejectedGeneric = 2,
     RejectedNoIpStack = 3,
     RejectedFakeTCPNotSupported = 4,
-    Unknown = -1
+    Unknown = -1,
 }
 
 impl From<i16> for WireguardAnswered {

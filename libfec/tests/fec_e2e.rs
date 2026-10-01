@@ -1,8 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use cat4igp_libfec::{Config, FecMode, PeerEngine};
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout, Duration};
-use cat4igp_libfec::{Config, FecMode, PeerEngine};
 
 fn localhost(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
@@ -124,8 +124,14 @@ async fn run_e2e_udp_passthrough(mode: FecMode, data_shards: u8, parity_shards: 
     got_at_b.sort();
     got_at_a.sort();
 
-    assert_eq!(got_at_b, expected_at_b, "A->B UDP stack passthrough mismatch");
-    assert_eq!(got_at_a, expected_at_a, "B->A UDP stack passthrough mismatch");
+    assert_eq!(
+        got_at_b, expected_at_b,
+        "A->B UDP stack passthrough mismatch"
+    );
+    assert_eq!(
+        got_at_a, expected_at_a,
+        "B->A UDP stack passthrough mismatch"
+    );
 }
 
 #[tokio::test]

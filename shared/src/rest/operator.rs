@@ -1,17 +1,17 @@
-use serde::{Serialize, Deserialize};
 use chrono;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CreateInvitePayload {
     pub expires_at: Option<i64>,
     pub max_uses: Option<i32>,
-    pub join_mesh: Option<i32>
+    pub join_mesh: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CreateInviteResponse {
     pub success: bool,
-    pub invite_code: String
+    pub invite_code: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

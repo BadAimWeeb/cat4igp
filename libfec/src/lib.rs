@@ -12,8 +12,8 @@ pub use fec::{FecConfig, FecDecoder, FecEncoder, FecError, FecMode};
 pub use stats::Snapshot;
 pub use transport::{TokioUdpPipe, TransportError, UdpPipe};
 
-pub use proto::{decode_packet, encode_packet, Header, Packet, ProtoError, MAGIC, VERSION};
 pub use handshake::{ControlMessage, HandshakeError, Role};
+pub use proto::{decode_packet, encode_packet, Header, Packet, ProtoError, MAGIC, VERSION};
 
 use crate::control::PeerState;
 use crate::engine::Runtime;
@@ -74,7 +74,8 @@ impl PeerEngine {
 
         let peer_state = PeerState::new(config.initial_peer_addr);
         let counters = Arc::new(stats::Counters::default());
-        let (runtime, bound) = engine::spawn(config, peer_state.clone(), Arc::clone(&counters)).await?;
+        let (runtime, bound) =
+            engine::spawn(config, peer_state.clone(), Arc::clone(&counters)).await?;
 
         let handle = EngineHandle {
             peer_state,

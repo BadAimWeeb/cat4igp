@@ -1,0 +1,9 @@
+CREATE TABLE node_control_identities (
+    node_id INTEGER PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    peer_id TEXT NOT NULL UNIQUE,
+    signing_key TEXT NOT NULL,
+    encryption_key TEXT NOT NULL,
+    topology_revision BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
