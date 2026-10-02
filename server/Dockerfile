@@ -17,11 +17,8 @@ RUN apk add --no-cache ca-certificates libgcc sqlite-libs \
     && adduser -S -D -H -u 10001 -G cat4igp cat4igp \
     && mkdir /data && chown cat4igp:cat4igp /data && chmod 0700 /data
 COPY --from=build /src/target/release/cat4igp-server /usr/bin/cat4igp-server
-COPY server/migrations /usr/share/cat4igp/migrations
 COPY LICENSE /usr/share/licenses/cat4igp/LICENSE
 ENV DATABASE_URL=/data/cat4igp.db
 WORKDIR /data
 USER 10001:10001
-# ponytail: migrations are administrator-managed; add transactional migration
-# execution when the server has an embedded migration runner.
 ENTRYPOINT ["/usr/bin/cat4igp-server"]

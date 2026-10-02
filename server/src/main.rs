@@ -525,9 +525,34 @@ async fn run_control_plane() -> Result<(), Box<dyn std::error::Error + Send + Sy
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), String> {
     dotenv().ok();
     tracing_subscriber::fmt::init();
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    let manual = match args.as_slice() {
+        [] => false,
+        [command] if command == "migrate" => true,
+        _ => return Err("usage: cat4igp-server [migrate]".into()),
+    };
+    let apply = if manual {
+        true
+    } else {
+        match env::var("AUTO_MIGRATE") {
+            Err(env::VarError::NotPresent) => true,
+            Ok(value) if value == "true" => true,
+            Ok(value) if value == "false" => false,
+            _ => return Err("AUTO_MIGRATE must be true or false".into()),
+        }
+    };
+    let database_url =
+        env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set".to_string())?;
+    let mut conn = diesel::SqliteConnection::establish(&database_url)
+        .map_err(|e| format!("Cannot open database: {e}"))?;
+    db::migrate(&mut conn, apply).map_err(|e| format!("Database migration failed: {e}"))?;
+    drop(conn);
+    if manual {
+        return Ok(());
+    }
     let app = router::make_router().await.unwrap();
     let listener = tokio::net::TcpListener::bind(
         env::var("BIND_HOST_PORT").expect("BIND_HOST_PORT must be set"),
@@ -538,4 +563,5 @@ async fn main() {
         result = axum::serve(listener, app) => result.unwrap(),
         result = run_control_plane() => panic!("control plane stopped: {result:?}"),
     }
+    Ok(())
 }

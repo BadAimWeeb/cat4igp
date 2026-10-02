@@ -8,6 +8,7 @@ license = "MIT"
 axum = { version = "0.8.7", features = ["ws", "multipart", "http2", "macros"] }
 chrono = { workspace = true }
 diesel = { version = "2.3.4", features = ["sqlite", "returning_clauses_for_sqlite_3_35", "chrono"] }
+diesel_migrations = { version = "2.3", features = ["sqlite"] }
 dotenvy = "0.15.7"
 futures-util = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }

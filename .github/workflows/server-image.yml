@@ -83,7 +83,8 @@ jobs:
             test -w /data
             test -x /usr/bin/cat4igp-server
             test -f /usr/share/licenses/cat4igp/LICENSE
-            test -n "$(find /usr/share/cat4igp/migrations -name up.sql -print)"
+            cat4igp-server migrate
+            AUTO_MIGRATE=false cat4igp-server migrate
             output=$(ldd /usr/bin/cat4igp-server 2>&1)
             ! printf "%s" "$output" | grep -E "not found|Error loading|Error relocating"
           '

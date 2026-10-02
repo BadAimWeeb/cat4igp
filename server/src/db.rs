@@ -3,8 +3,91 @@ use crate::{
     models::{Invite, Node},
 };
 use diesel::prelude::*;
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use std::env;
 use uuid::Uuid;
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use diesel::{connection::SimpleConnection, migration::MigrationSource};
+
+    #[test]
+    fn embedded_migration_lifecycle() {
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        assert!(migrate(&mut conn, false).is_err());
+        migrate(&mut conn, true).unwrap();
+        assert_eq!(conn.applied_migrations().unwrap().len(), 5);
+        migrate(&mut conn, true).unwrap();
+        migrate(&mut conn, false).unwrap();
+        assert_eq!(conn.applied_migrations().unwrap().len(), 5);
+        crate::schema::node_control_identities::table
+            .count()
+            .get_result::<i64>(&mut conn)
+            .unwrap();
+
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        let mut migrations =
+            <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(
+                &MIGRATIONS,
+            )
+            .unwrap();
+        migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
+        assert!(conn.applied_migrations().unwrap().is_empty());
+        conn.run_migrations(&migrations[..3]).unwrap();
+        conn.batch_execute("INSERT INTO wireguard_tunnels (id, node_id_peer1, node_id_peer2, endpoint_ipv6) VALUES (1, 10, 20, 0);
+            ALTER TABLE wireguard_tunnels ADD COLUMN faketcp BOOL NOT NULL DEFAULT 0;").unwrap();
+        // The UDP migration adds fec before hitting this deliberately conflicting column.
+        assert!(migrate(&mut conn, true).is_err());
+        assert_eq!(conn.applied_migrations().unwrap().len(), 3);
+        assert!(
+            conn.batch_execute("SELECT fec FROM wireguard_tunnels")
+                .is_err()
+        );
+        conn.batch_execute("ALTER TABLE wireguard_tunnels DROP COLUMN faketcp")
+            .unwrap();
+        migrate(&mut conn, true).unwrap();
+        use crate::schema::wireguard_tunnels::dsl::*;
+        assert_eq!(
+            wireguard_tunnels
+                .select((id, node_id_peer1, node_id_peer2, fec, faketcp))
+                .first::<(i32, i32, i32, bool, bool)>(&mut conn)
+                .unwrap(),
+            (1, 10, 20, false, false)
+        );
+        conn.revert_last_migration(MIGRATIONS).unwrap();
+        conn.revert_last_migration(MIGRATIONS).unwrap();
+        conn.batch_execute("SELECT override_join_mesh FROM invites")
+            .unwrap();
+        migrate(&mut conn, true).unwrap();
+    }
+}
+
+pub fn migrate(conn: &mut SqliteConnection, apply: bool) -> Result<(), String> {
+    if !apply {
+        if conn
+            .has_pending_migration(MIGRATIONS)
+            .map_err(|e| e.to_string())?
+        {
+            return Err("pending database migrations; run cat4igp-server migrate".into());
+        }
+        return Ok(());
+    }
+    // ponytail: one migration writer; coordinate externally before multi-instance upgrades.
+    let versions = conn
+        .run_pending_migrations(MIGRATIONS)
+        .map_err(|e| e.to_string())?;
+    for version in &versions {
+        eprintln!("Applied database migration {version}");
+    }
+    eprintln!(
+        "Database is up to date ({} migrations applied)",
+        versions.len()
+    );
+    Ok(())
+}
 
 pub fn establish_connection() -> SqliteConnection {
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
