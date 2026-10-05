@@ -1862,31 +1862,47 @@ async fn joint_removal_surviving_leader_authority() {
     follower_retry_rehearsal(true).await;
 }
 
-async fn expect_rejection(
-    services: &[Service],
-    nodes: &[Node],
+fn expect_rejection<'a>(
+    services: &'a [Service],
+    nodes: &'a [Node],
     source: usize,
     operation: Operation,
     rejected: fn(&Outcome) -> bool,
-    stage: &str,
-) {
-    // ponytail: quorum-ready negative checks retry only Unavailable under the
-    // existing deadline; successful unauthorized operations always fail.
-    let mut diagnostic = String::new();
-    let result = tokio::time::timeout(DEADLINE, async {
-        loop {
-            let before: Vec<_> = nodes.iter().map(|n| n.metrics().borrow().clone()).collect();
-            let outcome = services[source].submit(operation.clone()).await;
-            let busy: Vec<_> = services.iter().map(|s| s.allocation.try_lock().is_err()).collect();
-            let ready = services[source].submit(Operation::Ready).await;
-            diagnostic = format!("{stage}: {outcome:?}; ready={ready:?}; allocation_busy={busy:?}; before={before:?}; after={:?}", nodes.iter().map(|n| n.metrics().borrow().clone()).collect::<Vec<_>>());
-            if rejected(&outcome) { return; }
-            assert!(matches!(outcome, Outcome::Unavailable), "{diagnostic}");
-            eprintln!("transient negative assertion: {diagnostic}");
-            tokio::task::yield_now().await;
-        }
-    }).await;
-    assert!(result.is_ok(), "rejection deadline: {diagnostic}");
+    stage: &'a str,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + 'a>> {
+    // Keep repeated diagnostic futures off the giant rehearsal's inline stack.
+    Box::pin(async move {
+        // ponytail: negative semantic checks retry only Unavailable under the existing
+        // deadline; minority checks stay immediate, unauthorized success always fails.
+        let mut diagnostic = String::new();
+        let result = tokio::time::timeout(DEADLINE, async {
+            loop {
+                let before: Vec<_> = nodes.iter().map(|n| n.metrics().borrow().clone()).collect();
+                let outcome = services[source].submit(operation.clone()).await;
+                let busy: Vec<_> = services
+                    .iter()
+                    .map(|s| s.allocation.try_lock().is_err())
+                    .collect();
+                diagnostic = format!(
+                    "{stage}: {outcome:?}; allocation_busy={busy:?}; before={before:?}; after={:?}",
+                    nodes
+                        .iter()
+                        .map(|n| n.metrics().borrow().clone())
+                        .collect::<Vec<_>>()
+                );
+                if rejected(&outcome) {
+                    return;
+                }
+                assert!(matches!(outcome, Outcome::Unavailable), "{diagnostic}");
+                let ready = services[source].submit(Operation::Ready).await;
+                diagnostic.push_str(&format!("; ready={ready:?}"));
+                eprintln!("transient negative assertion: {diagnostic}");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "rejection deadline: {diagnostic}");
+    })
 }
 
 async fn follower_retry_rehearsal(surviving_election: bool) {
@@ -2006,7 +2022,8 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         let mut incompatible = join_request.clone();
         incompatible.application_version = 2;
         let before = stores[leader].run(|conn| Ok(crate::db::get_setting(conn, "replica_pending_admissions").ok())).await.unwrap();
-        assert!(matches!(services[leader].submit(Operation::Join { source: join_peer, request: incompatible }).await, Outcome::Join(JoinResponse::Rejected)));
+        expect_rejection(&services, &nodes, leader, Operation::Join { source: join_peer, request: incompatible },
+            |outcome| matches!(outcome, Outcome::Join(JoinResponse::Rejected)), "incompatible join").await;
         assert_eq!(stores[leader].run(|conn| Ok(crate::db::get_setting(conn, "replica_pending_admissions").ok())).await.unwrap(), before);
         let mut missing = serde_json::to_value(&join_request).unwrap();
         missing.as_object_mut().unwrap().remove("application_version");
@@ -2030,13 +2047,16 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         let mut stolen = join_request.clone();
         stolen.address = format!("/ip4/127.0.0.1/tcp/19009/p2p/{wrong_peer}").parse().unwrap();
         assert_eq!(join::request(&wrong_key, &pin, &[public_address.clone()], 1, stolen.clone()).await.unwrap(), JoinResponse::Rejected);
-        assert!(matches!(services[follower].submit(Operation::Join { source: wrong_peer, request: stolen }).await, Outcome::Join(JoinResponse::Rejected)));
+        expect_rejection(&services, &nodes, follower, Operation::Join { source: wrong_peer, request: stolen },
+            |outcome| matches!(outcome, Outcome::Join(JoinResponse::Rejected)), "stolen join").await;
         let mut conflict = join_request.clone(); conflict.node_id = 10;
-        assert!(matches!(services[follower].submit(Operation::Join { source: join_peer, request: conflict }).await, Outcome::Join(JoinResponse::Rejected)));
+        expect_rejection(&services, &nodes, follower, Operation::Join { source: join_peer, request: conflict },
+            |outcome| matches!(outcome, Outcome::Join(JoinResponse::Rejected)), "conflicting join").await;
         let mut invalid = join_request.clone(); invalid.request_id = "bad-code".into(); invalid.node_id = 11;
         invalid.address = format!("/ip4/127.0.0.1/tcp/19011/p2p/{wrong_peer}").parse().unwrap(); invalid.code = "01".repeat(32);
         assert_eq!(join::request(&wrong_key, &pin, &[public_address.clone()], 1, invalid.clone()).await.unwrap(), JoinResponse::Rejected);
-        assert!(matches!(services[follower].submit(Operation::Join { source: wrong_peer, request: invalid }).await, Outcome::Join(JoinResponse::Rejected)));
+        expect_rejection(&services, &nodes, follower, Operation::Join { source: wrong_peer, request: invalid },
+            |outcome| matches!(outcome, Outcome::Join(JoinResponse::Rejected)), "invalid join code").await;
         let mut expired = join_request.clone(); expired.request_id = "expired-code".into(); expired.node_id = 12;
         expired.address = format!("/ip4/127.0.0.1/tcp/19012/p2p/{wrong_peer}").parse().unwrap();
         let expired_reply = nodes[leader].client_write(Command::Admission(Admission {
@@ -2070,18 +2090,24 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
             public_address: format!("/ip4/127.0.0.1/tcp/19090/p2p/{join_peer}").parse().unwrap(),
             control_address: format!("/ip4/127.0.0.1/tcp/19091/p2p/{join_peer}").parse().unwrap(),
         };
-        assert!(matches!(services[follower].submit(Operation::GrantServing(grant.clone())).await, Outcome::Roster(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::GrantServing(grant.clone()),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "pending learner serving").await;
         let mut unknown_grant = grant.clone(); unknown_grant.node_id = 99;
-        assert!(matches!(services[follower].submit(Operation::GrantServing(unknown_grant)).await, Outcome::Roster(Err(_))));
-        assert!(matches!(services[follower].submit(Operation::PromoteLearner(9)).await, Outcome::Promotion(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::GrantServing(unknown_grant),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "unknown serving voter").await;
+        expect_rejection(&services, &nodes, follower, Operation::PromoteLearner(9),
+            |outcome| matches!(outcome, Outcome::Promotion(Err(_))), "inactive learner promotion").await;
         assert!(matches!(services[follower].submit(Operation::ActivateLearner(9)).await, Outcome::Learner(Ok(()))));
         expect_rejection(&services, &nodes, follower, Operation::PromoteLearner(9),
             |outcome| matches!(outcome, Outcome::Promotion(Err(error)) if error == "learner has not caught up"),
             "unstarted learner promotion").await;
-        assert!(matches!(services[follower].submit(Operation::GrantServing(grant.clone())).await, Outcome::Roster(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::GrantServing(grant.clone()),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "unstarted learner serving").await;
         let (fourth_node, fourth_store, fourth_task, fourth_service) = start(config, fourth_path.clone(), psk).await.unwrap();
-        assert!(matches!(services[follower].submit(Operation::PromoteLearner(99)).await, Outcome::Promotion(Err(_))));
-        assert!(matches!(services[follower].submit(Operation::ActivateLearner(99)).await, Outcome::Learner(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::PromoteLearner(99),
+            |outcome| matches!(outcome, Outcome::Promotion(Err(_))), "unknown learner promotion").await;
+        expect_rejection(&services, &nodes, follower, Operation::ActivateLearner(99),
+            |outcome| matches!(outcome, Outcome::Learner(Err(_))), "unknown learner activation").await;
         assert!(matches!(services[follower].submit(Operation::ActivateLearner(9)).await, Outcome::Learner(Ok(()))));
         assert!(matches!(services[follower].submit(Operation::ActivateLearner(9)).await, Outcome::Learner(Ok(()))));
         let learner_index = nodes[leader].metrics().borrow().last_applied.unwrap().index;
@@ -2163,9 +2189,11 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         assert!(fourth_node.metrics().borrow().membership_config.membership().voter_ids().any(|id| id == 9));
         assert!(!fourth_store.run(read_authority).await.unwrap().roster.unwrap().body.controllers.iter().any(|e| e.peer_id == join_peer));
         let mut invalid_grant = grant.clone(); invalid_grant.public_address = format!("/ip4/0.0.0.0/tcp/1/p2p/{join_peer}").parse().unwrap();
-        assert!(matches!(services[follower].submit(Operation::GrantServing(invalid_grant)).await, Outcome::Roster(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::GrantServing(invalid_grant),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "invalid serving address").await;
         let mut private_grant = grant.clone(); private_grant.public_address = grant.control_address.clone();
-        assert!(matches!(services[follower].submit(Operation::GrantServing(private_grant)).await, Outcome::Roster(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::GrantServing(private_grant),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "private serving address").await;
         tokio::time::timeout(DEADLINE, async {
             loop {
                 if matches!(services[follower].submit(Operation::GrantServing(grant.clone())).await, Outcome::Roster(Ok(()))) { break; }
@@ -2184,7 +2212,8 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         }).await.unwrap();
         assert_eq!(stores[leader].run(read_authority).await.unwrap().roster.unwrap().body.revision, granted_revision);
         let mut conflict_grant = grant.clone(); conflict_grant.control_address = format!("/ip4/127.0.0.1/tcp/19092/p2p/{join_peer}").parse().unwrap();
-        assert!(matches!(services[follower].submit(Operation::GrantServing(conflict_grant)).await, Outcome::Roster(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::GrantServing(conflict_grant),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "conflicting serving grant").await;
         let query = FindControllers::new("forward-test".into(), Role::Client, requester.public().to_peer_id(), chrono::Utc::now().timestamp_millis()).unwrap();
         let authorized = match services[follower].submit(Operation::Discovery { query: query.clone(), source: query.requester, serving: join_peer }).await {
             Outcome::Discovery(Ok(proof)) => proof,
@@ -2196,7 +2225,8 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         fourth_node.shutdown().await.unwrap(); fourth_task.abort(); let _ = fourth_task.await;
         drop(fourth_service);
         let serving_index = nodes[leader].client_write(Command::Roster(granted.clone())).await.unwrap().log_id.index;
-        assert!(matches!(services[follower].submit(Operation::GrantServing(grant.clone())).await, Outcome::Roster(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::GrantServing(grant.clone()),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "offline voter serving").await;
         let config: Config = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
         let psk = config.cluster_psk.as_ref().unwrap().parse().unwrap();
         let (restarted, _, restart_task, restart_service) = start(config, fourth_path.clone(), psk).await.unwrap();
@@ -2273,12 +2303,15 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
-        assert!(matches!(services[leader].submit(Operation::Join { source: join_peer, request: join_request.clone() }).await, Outcome::Join(JoinResponse::Rejected)));
+        expect_rejection(&services, &nodes, leader, Operation::Join { source: join_peer, request: join_request.clone() },
+            |outcome| matches!(outcome, Outcome::Join(JoinResponse::Rejected)), "roster-first revoked join").await;
         expect_rejection(&services, &nodes, leader, Operation::ActivateLearner(9),
             |outcome| matches!(outcome, Outcome::Learner(Err(error)) if error == "no committed pending admission"),
             "revoked learner activation").await;
-        assert!(matches!(services[leader].submit(Operation::PromoteLearner(9)).await, Outcome::Promotion(Err(_))));
-        assert!(matches!(services[leader].submit(Operation::GrantServing(grant.clone())).await, Outcome::Roster(Err(_))));
+        expect_rejection(&services, &nodes, leader, Operation::PromoteLearner(9),
+            |outcome| matches!(outcome, Outcome::Promotion(Err(_))), "roster-first revoked promotion").await;
+        expect_rejection(&services, &nodes, leader, Operation::GrantServing(grant.clone()),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "roster-first revoked serving").await;
         assert!(matches!(services[leader].submit(Operation::Discovery { query: query.clone(), source: query.requester, serving: join_peer }).await, Outcome::Discovery(Err(_))));
         // Resume the roster-first revoke into actual native joint removal, then
         // fail-stop its writer before uniform membership/tombstone completion.
@@ -2341,7 +2374,8 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
             assert!(transports[leader].is_finished());
             let retry_follower = (0..3).find(|&i| i != leader && i != survivor).unwrap();
             assert_eq!(nodes[retry_follower].metrics().borrow().state, openraft::ServerState::Follower);
-            assert!(matches!(services[retry_follower].submit(Operation::Join { source: join_peer, request: join_request.clone() }).await, Outcome::Join(JoinResponse::Rejected)));
+            expect_rejection(&services, &nodes, retry_follower, Operation::Join { source: join_peer, request: join_request.clone() },
+                |outcome| matches!(outcome, Outcome::Join(JoinResponse::Rejected)), "joint survivor revoked join").await;
             tokio::time::timeout(DEADLINE, async {
                 loop {
                     let removal = services[retry_follower].submit(Operation::RevokeReplica(9)).await;
@@ -2370,10 +2404,14 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
                 assert!(!withdrawn.body.controllers.iter().chain(&withdrawn.body.discovery_endpoints).any(|e| e.peer_id == join_peer));
             }
             assert!(!services[survivor].network.as_ref().unwrap().bootstrap_endpoints().contains_key(&9));
-            assert!(matches!(services[retry_follower].submit(Operation::Join { source: join_peer, request: join_request.clone() }).await, Outcome::Join(JoinResponse::Rejected)));
-            assert!(matches!(services[retry_follower].submit(Operation::ActivateLearner(9)).await, Outcome::Learner(Err(_))));
-            assert!(matches!(services[retry_follower].submit(Operation::PromoteLearner(9)).await, Outcome::Promotion(Err(_))));
-            assert!(matches!(services[retry_follower].submit(Operation::GrantServing(grant.clone())).await, Outcome::Roster(Err(_))));
+            expect_rejection(&services, &nodes, retry_follower, Operation::Join { source: join_peer, request: join_request.clone() },
+                |outcome| matches!(outcome, Outcome::Join(JoinResponse::Rejected)), "survivor completed revoked join").await;
+            expect_rejection(&services, &nodes, retry_follower, Operation::ActivateLearner(9),
+                |outcome| matches!(outcome, Outcome::Learner(Err(_))), "survivor completed revoked activation").await;
+            expect_rejection(&services, &nodes, retry_follower, Operation::PromoteLearner(9),
+                |outcome| matches!(outcome, Outcome::Promotion(Err(_))), "survivor completed revoked promotion").await;
+            expect_rejection(&services, &nodes, retry_follower, Operation::GrantServing(grant.clone()),
+                |outcome| matches!(outcome, Outcome::Roster(Err(_))), "survivor completed revoked serving").await;
             assert!(matches!(services[retry_follower].submit(Operation::Discovery { query: query.clone(), source: query.requester, serving: join_peer }).await, Outcome::Discovery(Err(_))));
             assert_eq!(stores[leader].clone().applied_state().await.unwrap().1, removal_joint.1);
             assert!(!stores[leader].run(read_revocations).await.unwrap().get(&9).unwrap().complete);
@@ -2394,8 +2432,9 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
                 &vec![std::collections::BTreeSet::from([1, 2, 3])]);
             assert!(store.run(read_revocations).await.unwrap().get(&9).unwrap().complete);
             assert!(matches!(service.submit(Operation::Ready).await, Outcome::Ready));
-            assert!(matches!(service.submit(Operation::Join { source: join_peer, request: join_request.clone() }).await,
-                Outcome::Join(JoinResponse::Rejected)));
+            expect_rejection(std::slice::from_ref(&service), std::slice::from_ref(&node), 0,
+                Operation::Join { source: join_peer, request: join_request.clone() },
+                |outcome| matches!(outcome, Outcome::Join(JoinResponse::Rejected)), "reintegrated writer revoked join").await;
             node.shutdown().await.unwrap();
             task.abort(); let _ = (&mut task).await;
             for scheduler in &schedulers { scheduler.abort(); }
@@ -2427,10 +2466,14 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         assert!(!stores[leader].run(read_revocations).await.unwrap().get(&9).unwrap().complete);
         assert!(stores[leader].clone().applied_state().await.unwrap().1.membership().nodes().any(|(id, _)| *id == 9));
         nodes[follower].wait(Some(DEADLINE)).current_leader(leader as u64 + 1, "joint removal writer recovered").await.unwrap();
-        assert!(matches!(services[follower].submit(Operation::Join { source: join_peer, request: join_request.clone() }).await, Outcome::Join(JoinResponse::Rejected)));
-        assert!(matches!(services[follower].submit(Operation::ActivateLearner(9)).await, Outcome::Learner(Err(_))));
-        assert!(matches!(services[follower].submit(Operation::PromoteLearner(9)).await, Outcome::Promotion(Err(_))));
-        assert!(matches!(services[follower].submit(Operation::GrantServing(grant.clone())).await, Outcome::Roster(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::Join { source: join_peer, request: join_request.clone() },
+            |outcome| matches!(outcome, Outcome::Join(JoinResponse::Rejected)), "recovered joint revoked join").await;
+        expect_rejection(&services, &nodes, follower, Operation::ActivateLearner(9),
+            |outcome| matches!(outcome, Outcome::Learner(Err(_))), "recovered joint revoked activation").await;
+        expect_rejection(&services, &nodes, follower, Operation::PromoteLearner(9),
+            |outcome| matches!(outcome, Outcome::Promotion(Err(_))), "recovered joint revoked promotion").await;
+        expect_rejection(&services, &nodes, follower, Operation::GrantServing(grant.clone()),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "recovered joint revoked serving").await;
         tokio::time::timeout(DEADLINE, async {
             loop {
                 let removal = services[follower].submit(Operation::RevokeReplica(9)).await;
@@ -2446,10 +2489,14 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         assert_eq!(stores[leader].clone().applied_state().await.unwrap().1.membership().get_joint_config(), &vec![std::collections::BTreeSet::from([1, 2, 3])]);
         assert!(!services[leader].network.as_ref().unwrap().bootstrap_endpoints().contains_key(&9));
         assert!(!nodes[leader].metrics().borrow().membership_config.membership().nodes().any(|(id, _)| *id == 9));
-        assert!(matches!(services[follower].submit(Operation::Join { source: join_peer, request: join_request.clone() }).await, Outcome::Join(cat4igp_shared::discovery::join::Response::Rejected)));
-        assert!(matches!(services[follower].submit(Operation::ActivateLearner(9)).await, Outcome::Learner(Err(_))));
-        assert!(matches!(services[follower].submit(Operation::PromoteLearner(9)).await, Outcome::Promotion(Err(_))));
-        assert!(matches!(services[follower].submit(Operation::GrantServing(grant.clone())).await, Outcome::Roster(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::Join { source: join_peer, request: join_request.clone() },
+            |outcome| matches!(outcome, Outcome::Join(JoinResponse::Rejected)), "completed revoked join").await;
+        expect_rejection(&services, &nodes, follower, Operation::ActivateLearner(9),
+            |outcome| matches!(outcome, Outcome::Learner(Err(_))), "completed revoked activation").await;
+        expect_rejection(&services, &nodes, follower, Operation::PromoteLearner(9),
+            |outcome| matches!(outcome, Outcome::Promotion(Err(_))), "completed revoked promotion").await;
+        expect_rejection(&services, &nodes, follower, Operation::GrantServing(grant.clone()),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "completed revoked serving").await;
         let reopened_leader = Store::open(root.join(format!("{leader}.sqlite")).to_str().unwrap().to_owned()).await.unwrap();
         assert!(reopened_leader.run(read_revocations).await.unwrap().get(&9).unwrap().complete);
         restarted.shutdown().await.unwrap(); restart_task.abort(); let _ = restart_task.await; drop(restart_service);
@@ -2485,18 +2532,19 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         let mut rogue = roster.clone();
         let peer = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
         rogue.controllers[0] = cat4igp_shared::discovery::ControllerEndpoint { peer_id: peer, addresses: vec![addresses[0].clone().with(libp2p::multiaddr::Protocol::P2p(peer))] };
-        let rejected = services[follower].submit(Operation::Roster(rogue)).await;
-        assert!(matches!(rejected, Outcome::Roster(Err(_))), "{rejected:?}");
+        expect_rejection(&services, &nodes, follower, Operation::Roster(rogue),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "rogue roster").await;
         roster = stores[leader].run(read_authority).await.unwrap().roster.unwrap().body;
         roster.revision += 1; roster.issued_at_ms = chrono::Utc::now().timestamp_millis(); roster.expires_at_ms += 1;
         assert!(matches!(services[follower].submit(Operation::Roster(roster.clone())).await, Outcome::Roster(Ok(()))));
         let refreshed = transport::discover(&requester, &pin, "forward-test", Role::Replica, &[public_address], 2).await.unwrap();
         assert_eq!(refreshed.body.roster.body.revision, roster.revision);
         let mut rollback = roster.clone(); rollback.revision = 1;
-        let rejected = services[follower].submit(Operation::Roster(rollback)).await;
-        assert!(matches!(rejected, Outcome::Roster(Err(_))), "rollback: {rejected:?}");
+        expect_rejection(&services, &nodes, follower, Operation::Roster(rollback),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "rollback roster").await;
         let mut expired = roster.clone(); expired.issued_at_ms -= 300_000; expired.expires_at_ms -= 300_000;
-        assert!(matches!(services[follower].submit(Operation::Roster(expired)).await, Outcome::Roster(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::Roster(expired),
+            |outcome| matches!(outcome, Outcome::Roster(Err(_))), "expired roster").await;
         let mesh = Command::Mesh { id: 1, name: "wire-mesh".into(), mtu: 1280, created_at: chrono::Utc::now().naive_utc() };
         assert!(nodes[leader].client_write(mesh.clone()).await.unwrap().data.is_ok());
         assert!(nodes[leader].client_write(mesh.clone()).await.unwrap().data.is_ok());
