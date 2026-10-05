@@ -1,0 +1,21 @@
+name: Native HA tests
+
+on:
+  push: {}
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # Cargo uses the repository's pinned rust-toolchain.toml.
+      - run: python3 .github/ha-tests.py
+      - run: cargo test --locked -p cat4igp-client -p cat4igp-server -p cat4igp-shared

@@ -15,8 +15,9 @@ pub fn topology_topic(network_id: &str, node_id: i32) -> String {
     format!("/cat4igp/topology/v1/{network_id}/{node_id}")
 }
 
-/// Public data an operator gives a new client out of band.
+/// Sensitive credentials an operator gives a new client over a trusted channel.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnrollmentBundle {
     pub version: u16,
     pub bootstrap_addresses: Vec<String>,
@@ -25,6 +26,8 @@ pub struct EnrollmentBundle {
     pub network_id: String,
     pub private_network_key: String,
     pub invitation_code: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovery_bootstrap_addresses: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,8 +55,11 @@ impl MessageMeta {
             return Err("invalid recipient");
         }
         if self.issued_at_ms > self.expires_at_ms
-            || self.expires_at_ms - self.issued_at_ms > 60_000
-            || self.issued_at_ms > now_ms + 30_000
+            || self
+                .expires_at_ms
+                .checked_sub(self.issued_at_ms)
+                .is_none_or(|age| age > 60_000)
+            || self.issued_at_ms > now_ms.saturating_add(30_000)
             || now_ms > self.expires_at_ms
         {
             return Err("expired message");
@@ -107,6 +113,37 @@ fn envelope_bytes(envelope: &EncryptedEnvelope) -> Result<Vec<u8>, &'static str>
         ciphertext: &envelope.ciphertext,
     })
     .map_err(|_| "failed to encode envelope")
+}
+
+/// Verify immutable recipient ciphertext without possessing the recipient's secret.
+pub fn verify_topology_relay(
+    signing: &identity::PublicKey,
+    network: &str,
+    now_ms: i64,
+    payload: &[u8],
+) -> Result<EncryptedEnvelope, &'static str> {
+    if payload.len() > 64 * 1024 {
+        return Err("relay payload exceeds limit");
+    }
+    let envelope: EncryptedEnvelope =
+        serde_json::from_slice(payload).map_err(|_| "invalid relay envelope")?;
+    envelope.meta.validate(now_ms)?;
+    if envelope.meta.network_id != network {
+        return Err("wrong relay network");
+    }
+    hex_decode(&envelope.ephemeral_public_key, 32)?;
+    hex_decode(&envelope.nonce, 12)?;
+    if envelope.ciphertext.len() < 32 {
+        return Err("invalid relay ciphertext");
+    }
+    hex_decode(&envelope.ciphertext, envelope.ciphertext.len() / 2)?;
+    if !signing.verify(
+        &envelope_bytes(&envelope)?,
+        &hex_decode(&envelope.signature, 64)?,
+    ) {
+        return Err("invalid relay signature");
+    }
+    Ok(envelope)
 }
 
 fn key(shared_secret: [u8; 32], purpose: &[u8]) -> Result<[u8; 32], &'static str> {
@@ -237,6 +274,9 @@ pub fn open_topology_snapshot(
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EnrollmentRequest {
+    /// Empty legacy IDs are durably scoped to the authenticated client identity.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_id: String,
     pub node_name: String,
     pub invitation_code: String,
     pub client_peer_id: String,
@@ -421,188 +461,5 @@ pub fn accept_revision(current: i64, received: i64) -> Result<bool, &'static str
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_expired_or_malformed_messages() {
-        let meta = MessageMeta {
-            message_id: "a".repeat(32),
-            network_id: "network".into(),
-            recipient_node_id: 1,
-            issued_at_ms: 10,
-            expires_at_ms: 20,
-            topology_revision: 0,
-        };
-        assert!(meta.validate(20).is_ok());
-        assert_eq!(meta.validate(21), Err("expired message"));
-
-        let mut malformed = meta.clone();
-        malformed.message_id = "not-an-id".into();
-        assert_eq!(malformed.validate(10), Err("invalid message id"));
-        let long_lived = MessageMeta {
-            expires_at_ms: 60_011,
-            ..meta.clone()
-        };
-        assert_eq!(long_lived.validate(10), Err("expired message"));
-        let uppercase = MessageMeta {
-            message_id: "A".repeat(32),
-            ..meta
-        };
-        assert_eq!(uppercase.validate(10), Err("invalid message id"));
-    }
-
-    #[test]
-    fn only_new_revisions_are_applied() {
-        assert_eq!(accept_revision(3, 4), Ok(true));
-        assert_eq!(accept_revision(3, 3), Ok(false));
-        assert_eq!(accept_revision(3, 2), Ok(false));
-        assert_eq!(accept_revision(3, -1), Err("invalid topology revision"));
-    }
-
-    #[test]
-    fn topology_topics_are_versioned_and_recipient_specific() {
-        assert_eq!(
-            topology_topic("private", 7),
-            "/cat4igp/topology/v1/private/7"
-        );
-    }
-
-    #[test]
-    fn encrypted_snapshot_rejects_tampering() {
-        let signing = identity::Keypair::generate_ed25519();
-        let private = x25519_dalek::StaticSecret::random_from_rng(rand08::rngs::OsRng);
-        let public = x25519_dalek::PublicKey::from(&private);
-        let snapshot = TopologySnapshot {
-            node_id: 7,
-            revision: 1,
-            tunnels: Vec::new(),
-        };
-        let envelope = seal_topology_snapshot(
-            &signing,
-            &hex_encode(public.as_bytes()),
-            MessageMeta {
-                message_id: "a".repeat(32),
-                network_id: "private".into(),
-                recipient_node_id: 7,
-                issued_at_ms: 10,
-                expires_at_ms: 20,
-                topology_revision: 1,
-            },
-            &snapshot,
-        )
-        .unwrap();
-        let signing_key = hex_encode(&signing.public().encode_protobuf());
-        assert_eq!(
-            open_topology_snapshot(
-                &signing_key,
-                &hex_encode(&private.to_bytes()),
-                "private",
-                7,
-                20,
-                &envelope,
-            )
-            .unwrap()
-            .revision,
-            1
-        );
-        let mut tampered = envelope;
-        tampered.meta.topology_revision = 2;
-        assert!(
-            open_topology_snapshot(
-                &signing_key,
-                &hex_encode(&private.to_bytes()),
-                "private",
-                7,
-                20,
-                &tampered,
-            )
-            .is_err()
-        );
-
-        let mismatched = seal_topology_snapshot(
-            &signing,
-            &hex_encode(public.as_bytes()),
-            MessageMeta {
-                message_id: "b".repeat(32),
-                network_id: "private".into(),
-                recipient_node_id: 7,
-                issued_at_ms: 10,
-                expires_at_ms: 20,
-                topology_revision: 2,
-            },
-            &snapshot,
-        )
-        .unwrap();
-        assert!(matches!(
-            open_topology_snapshot(
-                &signing_key,
-                &hex_encode(&private.to_bytes()),
-                "private",
-                7,
-                20,
-                &mismatched,
-            ),
-            Err("snapshot metadata mismatch")
-        ));
-    }
-
-    #[test]
-    fn encrypted_tunnel_answer_rejects_tampering() {
-        let signing = identity::Keypair::generate_ed25519();
-        let private = x25519_dalek::StaticSecret::random_from_rng(rand08::rngs::OsRng);
-        let answer = TunnelAnswer {
-            tunnel_id: 7,
-            decline_type: None,
-            endpoint: Some("127.0.0.1:51820".into()),
-        };
-        let envelope = seal_tunnel_answer(
-            &signing,
-            &hex_encode(x25519_dalek::PublicKey::from(&private).as_bytes()),
-            MessageMeta {
-                message_id: "c".repeat(32),
-                network_id: "private".into(),
-                recipient_node_id: 1,
-                issued_at_ms: 10,
-                expires_at_ms: 20,
-                topology_revision: 0,
-            },
-            &answer,
-        )
-        .unwrap();
-        let signing_key = hex_encode(&signing.public().encode_protobuf());
-        assert_eq!(
-            open_tunnel_answer(
-                &signing_key,
-                &hex_encode(&private.to_bytes()),
-                "private",
-                1,
-                20,
-                &envelope,
-            )
-            .unwrap()
-            .tunnel_id,
-            7
-        );
-        let mut tampered = envelope;
-        tampered.ciphertext.replace_range(
-            0..1,
-            if tampered.ciphertext.starts_with('0') {
-                "1"
-            } else {
-                "0"
-            },
-        );
-        assert!(
-            open_tunnel_answer(
-                &signing_key,
-                &hex_encode(&private.to_bytes()),
-                "private",
-                1,
-                20,
-                &tampered,
-            )
-            .is_err()
-        );
-    }
-}
+#[path = "control_test.rs"]
+mod tests;

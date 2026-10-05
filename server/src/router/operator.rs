@@ -3,15 +3,30 @@ use cat4igp_shared::rest::StandardResponse;
 use cat4igp_shared::rest::operator as REST;
 
 pub async fn create_invite(
+    axum::extract::State(jobs): axum::extract::State<crate::DatabaseSender>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<REST::CreateInvitePayload>,
 ) -> Result<Json<REST::CreateInviteResponse>, (axum::http::StatusCode, Json<StandardResponse>)> {
-    let mut conn = crate::db::establish_connection();
-
+    // ponytail: legacy calls are unique attempts; use a stable Idempotency-Key for durable retries.
+    let request_id = match headers.get("Idempotency-Key") {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .filter(|s| !s.is_empty() && s.len() <= 128)
+            .ok_or_else(|| {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(StandardResponse {
+                        success: false,
+                        message: Some("Idempotency-Key must contain 1..128 ASCII bytes".into()),
+                    }),
+                )
+            })?
+            .to_owned(),
+        None => uuid::Uuid::new_v4().to_string(),
+    };
     let expires_at = if let Some(ts) = payload.expires_at {
-        let o = chrono::DateTime::<chrono::Utc>::from_timestamp(
-            ts / 1000,
-            (ts % 1000) as u32 * 1_000_000,
-        );
+        let o = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts);
 
         if let Some(x) = o {
             Some(x.naive_utc())
@@ -28,17 +43,37 @@ pub async fn create_invite(
         None
     };
 
-    let invite_code =
-        crate::db::create_invite_key(&mut conn, expires_at, payload.max_uses, payload.join_mesh)
-            .map_err(|e| {
-                (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    Json(StandardResponse {
-                        success: false,
-                        message: Some(format!("Failed to create invite: {}", e)),
-                    }),
-                )
-            })?;
+    let unavailable = || {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(StandardResponse {
+                success: false,
+                message: Some("database submission unavailable; outcome may be unknown".into()),
+            }),
+        )
+    };
+    let (reply, result) = tokio::sync::oneshot::channel();
+    jobs.try_send(crate::DatabaseJob::Invite {
+        request_id,
+        expires_at,
+        max_uses: payload.max_uses,
+        join_mesh: payload.join_mesh,
+        reply,
+    })
+    .map_err(|_| unavailable())?;
+    let invite_code = result
+        .await
+        .map_err(|_| unavailable())?
+        .map_err(|_| unavailable())?
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::CONFLICT,
+                Json(StandardResponse {
+                    success: false,
+                    message: Some(format!("Failed to create invite: {}", e)),
+                }),
+            )
+        })?;
 
     Ok(Json(REST::CreateInviteResponse {
         success: true,

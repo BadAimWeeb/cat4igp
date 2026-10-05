@@ -1,0 +1,1 @@
+DROP TABLE control_enrollment_results;

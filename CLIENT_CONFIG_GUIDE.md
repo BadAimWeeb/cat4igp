@@ -1,3 +1,25 @@
+# Trusted enrollment bundle
+
+Use `cat4igp-client register-bundle --bundle /secure/enrollment.json` with the daemon running.
+Receive this JSON file from a trusted operator channel; protect it like a password and delete it after registration.
+It uses the existing `EnrollmentBundle` fields: `version` (1), `bootstrap_addresses`,
+`controller_peer_id`, `controller_signing_key` (hex-encoded protobuf public key),
+`network_id`, `private_network_key` (libp2p PSK key-file contents), and `invitation_code`.
+Optional `discovery_bootstrap_addresses` enables verified public discovery before private enrollment.
+Public discovery addresses and private control addresses are separate listeners.
+
+Import is limited to 16 KiB and 16 addresses per list. Addresses must be IP/TCP/p2p;
+all private addresses must name the pinned singleton controller. The supplied full public key
+is the out-of-band trust anchor (not TOFU); a separate fingerprint-only exchange is not implemented.
+Unknown fields, invalid keys/PSKs, identity mismatches and returned network/key substitutions fail closed.
+Pins and discovery proof are automatically saved to mode-0600 `server.json` using atomic replacement.
+The pending client identity is saved before sending enrollment, reused when the same bundle is retried,
+and the invite is removed from the completed config. Completed enrollment cannot be overwritten by registration.
+Legacy `register --server ... --invite ...` and existing configs remain supported.
+
+This is singleton trusted enrollment, not consensus, replica admission, or any-replica routing.
+Discovery still requires an externally signed, unexpired roster; startup roster refresh is not persisted yet.
+
 # Packaged installations
 
 For distro packages, use `/etc/cat4igp/client.toml` and the packaged service.
@@ -240,6 +262,34 @@ cargo test --package client public_ip::tests
 ```
 
 ## Future Enhancements
+
+With public discovery configured, enrolled clients refresh the signed roster at
+startup and on snapshot sync (normally every 30 seconds). The verified proof and
+highest revision are atomically saved before control requests resume. Rollback,
+same-revision roster substitution, wrong pin/source/recipient and expired proofs
+fail closed; expired roster authority also blocks requests, responses and pushes.
+Discovery outages retry on the next sync; existing WireGuard tunnels continue.
+Unset discovery fields retain legacy singleton behavior.
+
+The bundle controller PeerId remains the logical signing authority. With public
+discovery enabled, private bootstrap addresses may use distinct replica PeerIds;
+every configured private PeerId must be authorized by the current signed roster
+before any invite is sent. Public roster addresses are never substituted for
+private control addresses (the listeners can have different ports).
+
+Registration persists the verified roster and pending identity before sending.
+Lost completion retries reuse that identity/request ID. Post-enrollment requests
+rotate configured authorized targets; responses match the expected Noise peer and
+request ID, and topology envelopes still verify the logical signing key. At most
+16 addresses are attempted, ten seconds each. Application rejections and observed
+authentication/protocol errors are terminal; only timeouts, closed connections
+and refused TCP dials advance. Ambiguous dial errors fail closed.
+
+The live client harness covers two Noise replicas and restart from pending config,
+not a combined client/three-node Raft process-failure test. Production HA remains
+opt-in: committed push fanout, dynamic admission, rolling replica codes and
+maintenance migration remain unfinished. Private endpoints require explicit
+configuration and signed roster renewal; no untrusted discovery fallback.
 
 - Full TLS certificate verification with rustls
 - Caching of detected public IPs

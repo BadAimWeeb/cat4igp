@@ -9,7 +9,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, io::Error> {
-    if !value.len().is_multiple_of(2) {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid hex key",
@@ -32,6 +32,18 @@ pub struct ServerConfig {
 
     /// Invite code for server registration
     pub invite_code: String,
+
+    /// Original registration seeds; verified discovery may replace the dial candidates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enrollment_bootstrap_addresses: Vec<String>,
+
+    /// Original bundle discovery seeds, independent of learned public dial candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_discovery_bootstrap_addresses: Option<Vec<String>>,
+
+    /// Stable enrollment fingerprint input, independent of HOSTNAME after restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_node_name: Option<String>,
 
     /// Local WireGuard private key used to create tunnels.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,6 +75,14 @@ pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub control_bootstrap_addresses: Vec<String>,
 
+    /// Optional public discovery seeds, trusted out of band; never private PSK endpoints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovery_bootstrap_addresses: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_proof:
+        Option<cat4igp_shared::discovery::Signed<cat4igp_shared::discovery::ControllerAvailable>>,
+
     /// libp2p PSK key-file content for the private control network.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_private_network_key: Option<String>,
@@ -80,11 +100,233 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub fn accept_discovery_proof(
+        &mut self,
+        proof: cat4igp_shared::discovery::Signed<cat4igp_shared::discovery::ControllerAvailable>,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        use cat4igp_shared::discovery::{FindControllers, Role, VERSION};
+        let pin = libp2p::identity::PublicKey::try_decode_protobuf(
+            &hex_decode(
+                self.controller_signing_key
+                    .as_deref()
+                    .ok_or("missing signing pin")?,
+            )
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|_| "invalid signing pin")?;
+        let requester = self
+            .ensure_control_keypair()
+            .map_err(|error| error.to_string())?
+            .public()
+            .to_peer_id();
+        let query = FindControllers {
+            version: VERSION,
+            cluster_id: self.control_network_id.clone(),
+            role: Role::Client,
+            requester,
+            nonce: proof.body.nonce,
+            issued_at_ms: proof.body.issued_at_ms,
+            expires_at_ms: proof.body.expires_at_ms,
+        };
+        let minimum = self
+            .discovery_proof
+            .as_ref()
+            .map_or(0, |old| old.body.roster.body.revision);
+        proof.validate(&pin, &query, proof.body.endpoint.peer_id, minimum, now_ms)?;
+        if self.controller_peer_id.as_deref() != Some(&pin.to_peer_id().to_string()) {
+            return Err("logical controller identity does not match signing pin".into());
+        }
+        if let Some(old) = &self.discovery_proof {
+            if old.body.roster.body.revision == proof.body.roster.body.revision
+                && cat4igp_shared::discovery::encode(&old.body.roster)?
+                    != cat4igp_shared::discovery::encode(&proof.body.roster)?
+            {
+                return Err("roster changed without revision advancement".into());
+            }
+        }
+        // Only a verified logical-controller signature may replace legacy transport seeds.
+        self.control_bootstrap_addresses = proof
+            .body
+            .roster
+            .body
+            .controllers
+            .iter()
+            .flat_map(|endpoint| endpoint.addresses.iter().map(ToString::to_string))
+            // ponytail: private RPCs accept 16 seeds; widen both bounds for larger rosters.
+            .take(16)
+            .collect();
+        // Drop previously learned seeds when authority withdraws them. Explicit bundle seeds
+        // remain fallback hints; only the separately signed PUBLIC field supplies new seeds.
+        let old_learned: Vec<String> = self
+            .discovery_proof
+            .iter()
+            .flat_map(|old| &old.body.roster.body.discovery_endpoints)
+            .flat_map(|endpoint| endpoint.addresses.iter().map(ToString::to_string))
+            .collect();
+        let mut seeds = Vec::new();
+        for address in proof
+            .body
+            .roster
+            .body
+            .discovery_endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.addresses.iter().map(ToString::to_string))
+            .chain(
+                self.discovery_bootstrap_addresses
+                    .iter()
+                    .filter(|address| !old_learned.contains(address))
+                    .cloned(),
+            )
+        {
+            // ponytail: 16 discovery seeds, matching the native dial bound; learned seeds
+            // take priority over stale explicit seeds. Add seed scheduling for larger fleets.
+            if seeds.len() == 16 {
+                break;
+            }
+            if !seeds.contains(&address) {
+                seeds.push(address);
+            }
+        }
+        self.discovery_bootstrap_addresses = seeds;
+        self.discovery_proof = Some(proof);
+        Ok(())
+    }
+
+    pub fn discovery_authorized(&self, now_ms: i64) -> bool {
+        self.discovery_bootstrap_addresses.is_empty()
+            || self.discovery_proof.as_ref().is_some_and(|proof| {
+                proof.body.roster.body.issued_at_ms <= now_ms
+                    && now_ms < proof.body.roster.body.expires_at_ms
+            })
+    }
+
+    pub fn control_peer_authorized(&self, peer: libp2p::PeerId, now_ms: i64) -> bool {
+        let Some(encoded) = &self.controller_signing_key else {
+            return false;
+        };
+        let Ok(bytes) = hex_decode(encoded) else {
+            return false;
+        };
+        let Ok(pin) = libp2p::identity::PublicKey::try_decode_protobuf(&bytes) else {
+            return false;
+        };
+        if self.controller_peer_id.as_deref() != Some(&pin.to_peer_id().to_string()) {
+            return false;
+        }
+        match &self.discovery_proof {
+            Some(proof) => {
+                proof
+                    .body
+                    .roster
+                    .validate(
+                        &pin,
+                        &self.control_network_id,
+                        proof.body.roster.body.revision,
+                        now_ms,
+                    )
+                    .is_ok()
+                    && proof
+                        .body
+                        .roster
+                        .body
+                        .controllers
+                        .iter()
+                        .any(|endpoint| endpoint.peer_id == peer)
+            }
+            None => self.discovery_bootstrap_addresses.is_empty() && peer == pin.to_peer_id(),
+        }
+    }
+
+    pub fn from_bundle(json: &str) -> Result<Self, String> {
+        if json.len() > 16 * 1024 {
+            return Err("enrollment bundle exceeds 16 KiB".into());
+        }
+        let bundle: cat4igp_shared::control::EnrollmentBundle =
+            serde_json::from_str(json).map_err(|_| "invalid enrollment bundle")?;
+        if bundle.version != cat4igp_shared::control::CONTROL_PROTOCOL_VERSION
+            || bundle.invitation_code.is_empty()
+            || bundle.invitation_code.len() > 256
+            || bundle.bootstrap_addresses.is_empty()
+            || bundle.bootstrap_addresses.len() > 16
+            || bundle.discovery_bootstrap_addresses.len() > 16
+        {
+            return Err("invalid enrollment bundle fields".into());
+        }
+        cat4igp_shared::discovery::topic(
+            &bundle.network_id,
+            cat4igp_shared::discovery::Role::Client,
+        )?;
+        let peer: libp2p::PeerId = bundle
+            .controller_peer_id
+            .parse()
+            .map_err(|_| "invalid bundle controller PeerId")?;
+        if bundle.controller_signing_key.len() > 256 {
+            return Err("invalid bundle signing key".into());
+        }
+        let pin = libp2p::identity::PublicKey::try_decode_protobuf(
+            &hex_decode(&bundle.controller_signing_key)
+                .map_err(|_| "invalid bundle signing key")?,
+        )
+        .map_err(|_| "invalid bundle signing key")?;
+        // The bundle PeerId is the stable logical authority, not a replica transport identity.
+        if pin.to_peer_id() != peer {
+            return Err("bundle signing key does not match controller PeerId".into());
+        }
+        bundle
+            .private_network_key
+            .parse::<libp2p::pnet::PreSharedKey>()
+            .map_err(|_| "invalid bundle private network key")?;
+        for (addresses, singleton) in [
+            (&bundle.bootstrap_addresses, true),
+            (&bundle.discovery_bootstrap_addresses, false),
+        ] {
+            for address in addresses {
+                if address.len() > 256 {
+                    return Err("invalid bundle address".into());
+                }
+                let address: libp2p::Multiaddr =
+                    address.parse().map_err(|_| "invalid bundle address")?;
+                let Some(libp2p::multiaddr::Protocol::P2p(endpoint_peer)) = address.iter().last()
+                else {
+                    return Err("bundle address must end in PeerId".into());
+                };
+                cat4igp_shared::discovery::ControllerEndpoint {
+                    peer_id: endpoint_peer,
+                    addresses: vec![address],
+                }
+                .validate()?;
+                if singleton
+                    && endpoint_peer != peer
+                    && bundle.discovery_bootstrap_addresses.is_empty()
+                {
+                    return Err(
+                        "bundle control addresses must use singleton controller PeerId".into(),
+                    );
+                }
+            }
+        }
+        let mut config = Self::new(
+            bundle.bootstrap_addresses[0].clone(),
+            bundle.invitation_code,
+        );
+        config.controller_peer_id = Some(peer.to_string());
+        config.controller_signing_key = Some(bundle.controller_signing_key);
+        config.control_network_id = bundle.network_id;
+        config.control_private_network_key = Some(bundle.private_network_key);
+        config.control_bootstrap_addresses = bundle.bootstrap_addresses;
+        config.discovery_bootstrap_addresses = bundle.discovery_bootstrap_addresses;
+        Ok(config)
+    }
+
     /// Create a new server configuration
     pub fn new(address: String, invite_code: String) -> Self {
         Self {
             address,
             invite_code,
+            enrollment_bootstrap_addresses: Vec::new(),
+            enrollment_discovery_bootstrap_addresses: None,
+            enrollment_node_name: None,
             wg_private_key: None,
             wg_public_key: None,
             control_private_key: None,
@@ -93,6 +335,8 @@ impl ServerConfig {
             controller_signing_key: None,
             controller_encryption_key: None,
             control_bootstrap_addresses: Vec::new(),
+            discovery_bootstrap_addresses: Vec::new(),
+            discovery_proof: None,
             control_private_network_key: None,
             topology_revision: 0,
             control_node_id: None,
@@ -172,16 +416,61 @@ impl ServerConfig {
 
     /// Save server configuration to file
     pub fn save(&self, data_dir: &Path) -> io::Result<()> {
+        self.save_inner(
+            data_dir,
+            #[cfg(test)]
+            |_| Ok(()),
+        )
+    }
+
+    fn save_inner(
+        &self,
+        data_dir: &Path,
+        #[cfg(test)] mut fault: impl FnMut(&str) -> io::Result<()>,
+    ) -> io::Result<()> {
         fs::create_dir_all(data_dir)?;
+        // Fail before publication if the directory cannot be opened for its durability barrier.
+        let directory = fs::File::open(data_dir)?;
         let config_path = data_dir.join("server.json");
         let content = serde_json::to_string_pretty(&self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        fs::write(&config_path, content)?;
+        use std::io::Write;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let temporary = data_dir.join(format!(".server-{:032x}.tmp", rand::random::<u128>()));
+        // Cleanup only a temporary file this call actually created.
+        let mut file = options.open(&temporary)?;
+        let result = (|| -> io::Result<()> {
+            #[cfg(test)]
+            {
+                file.write_all(&content.as_bytes()[..content.len() / 2])?;
+                fault("partial_write")?;
+                file.write_all(&content.as_bytes()[content.len() / 2..])?;
+            }
+            #[cfg(not(test))]
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            #[cfg(test)]
+            fault("publish")?;
+            fs::rename(&temporary, &config_path)?;
+            #[cfg(test)]
+            fault("parent_sync")?;
+            // A failure here is an uncertain durability outcome, not grounds to roll back
+            // a complete published identity or report success.
+            directory.sync_all()?;
+            #[cfg(test)]
+            fault("durable")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        result?;
         Ok(())
     }
 
@@ -205,55 +494,5 @@ fn default_control_network_id() -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_server_config_creation() {
-        let config = ServerConfig::new(
-            "https://example.com:8443".to_string(),
-            "invite123".to_string(),
-        );
-        assert_eq!(config.address, "https://example.com:8443");
-        assert_eq!(config.invite_code, "invite123");
-    }
-
-    #[test]
-    fn test_server_config_save_load() {
-        let temp_dir = TempDir::new().unwrap();
-        let config =
-            ServerConfig::new("https://example.com".to_string(), "test-invite".to_string());
-
-        config.save(temp_dir.path()).unwrap();
-        let loaded = ServerConfig::load(temp_dir.path()).unwrap();
-
-        assert_eq!(loaded.address, config.address);
-        assert_eq!(loaded.invite_code, config.invite_code);
-    }
-
-    #[test]
-    fn control_identity_is_persistent() {
-        let mut config = ServerConfig::new("control".to_string(), "invite".to_string());
-        let first = config
-            .ensure_control_keypair()
-            .unwrap()
-            .public()
-            .to_peer_id();
-        let second = config
-            .ensure_control_keypair()
-            .unwrap()
-            .public()
-            .to_peer_id();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn control_encryption_identity_is_persistent() {
-        let mut config = ServerConfig::new("control".to_string(), "invite".to_string());
-        assert_eq!(
-            config.ensure_control_encryption_key().unwrap(),
-            config.ensure_control_encryption_key().unwrap()
-        );
-    }
-}
+#[path = "server_test.rs"]
+mod tests;

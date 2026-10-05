@@ -12,7 +12,7 @@ use libp2p::{
     swarm::{Config as SwarmConfig, NetworkBehaviour, Swarm},
     tcp, yamux,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use tokio::sync::{mpsc, oneshot};
 
 const CONTROL_PROTOCOL: &str = "/cat4igp/control/1";
@@ -54,7 +54,15 @@ fn remember_message_id(
 }
 
 #[derive(Clone)]
-pub struct ControlPlane(mpsc::Sender<Command>);
+pub struct ControlPlane(mpsc::Sender<Command>, std::sync::Arc<Worker>);
+
+struct Worker(tokio::task::JoinHandle<()>);
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 enum Command {
     Request(
@@ -64,6 +72,10 @@ enum Command {
 }
 
 impl ControlPlane {
+    pub fn stop(&self) {
+        self.1.0.abort();
+    }
+
     pub async fn request(&self, request: ControlRequest) -> Result<ControlResponse, String> {
         let (reply, response) = oneshot::channel();
         self.0
@@ -80,6 +92,7 @@ impl ControlPlane {
 pub fn start(
     mut config: crate::config::ServerConfig,
     updates: mpsc::Sender<TopologySnapshot>,
+    current: std::sync::Arc<tokio::sync::Mutex<Option<crate::config::ServerConfig>>>,
 ) -> Result<ControlPlane, String> {
     let controller: libp2p::PeerId = config
         .controller_peer_id
@@ -94,6 +107,13 @@ pub fn start(
         .controller_signing_key
         .clone()
         .ok_or_else(|| "controller signing key is not enrolled".to_string())?;
+    let pin = libp2p::identity::PublicKey::try_decode_protobuf(
+        &hex_decode(&controller_signing_key).map_err(|e| e.to_string())?,
+    )
+    .map_err(|_| "invalid controller signing key")?;
+    if pin.to_peer_id() != controller {
+        return Err("logical controller identity does not match signing pin".into());
+    }
     let encryption_key = config
         .control_encryption_private_key
         .clone()
@@ -134,24 +154,44 @@ pub fn start(
         .gossipsub
         .subscribe(&topic)
         .map_err(|error| error.to_string())?;
-    let bootstraps = config.control_bootstrap_addresses.clone();
     let network_id = config.control_network_id.clone();
     let (commands, mut receiver) = mpsc::channel(16);
-    tokio::spawn(async move {
-        let mut pending = HashMap::new();
+    let worker = tokio::spawn(async move {
         let mut seen = HashSet::new();
         let mut order = VecDeque::new();
+        let mut next_replica = 0;
         let mut reconnect = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             tokio::select! {
-                Some(Command::Request(request, reply)) = receiver.recv() => {
-                    let request_id = swarm.behaviour_mut().request_response.send_request(&controller, request);
-                    pending.insert(request_id, reply);
+                command = receiver.recv() => {
+                    let Some(Command::Request(request, reply)) = command else { break; };
+                    if !authorized(&current).await {
+                        let _ = reply.send(Err("discovery roster expired or unavailable".into()));
+                        continue;
+                    }
+                    let Some(mut config) = current.lock().await.clone() else {
+                        let _ = reply.send(Err("control configuration unavailable".into()));
+                        continue;
+                    };
+                    let mut bootstraps = config.control_bootstrap_addresses.clone();
+                    if !bootstraps.is_empty() {
+                        let count = bootstraps.len();
+                        bootstraps.rotate_left(next_replica % count);
+                        next_replica = (next_replica + 1) % count;
+                    }
+                    // ponytail: serial bounded one-shot RPCs; reuse connected streams when polling load warrants it.
+                    let result = request_to_bootstraps(&mut config, &bootstraps, request).await;
+                    let _ = reply.send(result);
                 }
                 _ = reconnect.tick() => {
-                    for bootstrap in &bootstraps {
-                        if let Ok(address) = bootstrap.parse::<libp2p::Multiaddr>() {
+                    if !authorized(&current).await { continue; }
+                    let guard = current.lock().await;
+                    let Some(config) = guard.as_ref() else { continue };
+                    for bootstrap in &config.control_bootstrap_addresses {
+                        if bootstrap_peer_id(bootstrap).is_ok_and(|peer| config.control_peer_authorized(peer, now_ms().unwrap_or(i64::MAX))) {
+                          if let Ok(address) = bootstrap.parse::<libp2p::Multiaddr>() {
                             let _ = swarm.dial(address);
+                          }
                         }
                     }
                 }
@@ -162,21 +202,12 @@ pub fn start(
                             message: request_response::Message::Response { request_id, response },
                             ..
                         },
-                    )) if peer == controller => {
-                        if let Some(reply) = pending.remove(&request_id) {
-                            let _ = reply.send(Ok(response));
-                        }
-                    }
-                    libp2p::swarm::SwarmEvent::Behaviour(ControlBehaviourEvent::RequestResponse(
-                        request_response::Event::OutboundFailure { request_id, error, .. },
-                    )) => {
-                        if let Some(reply) = pending.remove(&request_id) {
-                            let _ = reply.send(Err(error.to_string()));
-                        }
-                    }
+                    )) => { let _ = (peer, request_id, response); }
                     libp2p::swarm::SwarmEvent::Behaviour(ControlBehaviourEvent::Gossipsub(
                         gossipsub::Event::Message { message, .. },
-                    )) if message.source == Some(controller) && message.data.len() <= 64 * 1024 => {
+                    )) if message.data.len() <= 64 * 1024 => {
+                        if !authorized(&current).await { continue; }
+                        if !message.source.is_some_and(|peer| current.try_lock().ok().and_then(|guard| guard.as_ref().map(|config| config.control_peer_authorized(peer, now_ms().unwrap_or(i64::MAX)))).unwrap_or(false)) { continue; }
                         let Ok(envelope) = serde_json::from_slice::<EncryptedEnvelope>(&message.data) else { continue };
                         let Ok(now) = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -194,7 +225,7 @@ pub fn start(
             }
         }
     });
-    Ok(ControlPlane(commands))
+    Ok(ControlPlane(commands, std::sync::Arc::new(Worker(worker))))
 }
 
 /// Enrollment uses a one-shot swarm because no controller identity is pinned yet.
@@ -208,9 +239,20 @@ pub async fn enroll(
             .first()
             .ok_or_else(|| "at least one controller bootstrap address is required".to_string())?,
     )?;
-    if bootstraps
-        .iter()
-        .any(|bootstrap| bootstrap_peer_id(bootstrap).as_ref() != Ok(&controller))
+    if config.discovery_bootstrap_addresses.is_empty()
+        && config.discovery_proof.is_none()
+        && config
+            .controller_peer_id
+            .as_deref()
+            .is_some_and(|pin| pin != controller.to_string())
+    {
+        return Err("bootstrap does not match pinned controller".into());
+    }
+    if config.discovery_bootstrap_addresses.is_empty()
+        && config.discovery_proof.is_none()
+        && bootstraps
+            .iter()
+            .any(|bootstrap| bootstrap_peer_id(bootstrap).as_ref() != Ok(&controller))
     {
         return Err("all controller bootstrap addresses must use the same peer id".to_string());
     }
@@ -218,6 +260,8 @@ pub async fn enroll(
         .ensure_control_keypair()
         .map_err(|error| error.to_string())?;
     let request = ControlRequest::Enroll(cat4igp_shared::control::EnrollmentRequest {
+        // The pending transport identity is saved before sending and survives restart.
+        request_id: keypair.public().to_peer_id().to_string(),
         node_name,
         invitation_code: config.invite_code.clone(),
         client_peer_id: keypair.public().to_peer_id().to_string(),
@@ -232,12 +276,59 @@ pub async fn enroll(
             .map_err(|error| error.to_string())?,
         wireguard_public_key: config.wg_public_key.clone().unwrap_or_default(),
     });
-    let response = request_to_bootstraps(config, controller, bootstraps, request).await?;
+    if !config.discovery_bootstrap_addresses.is_empty()
+        && !config.discovery_proof.as_ref().is_some_and(|proof| {
+            proof.body.roster.body.issued_at_ms <= now_ms().unwrap_or(i64::MAX)
+                && now_ms().unwrap_or(i64::MAX) < proof.body.roster.body.expires_at_ms
+        })
+    {
+        let pin = config
+            .controller_signing_key
+            .as_deref()
+            .ok_or("public discovery requires an out-of-band controller signing key pin")?;
+        let pin = libp2p::identity::PublicKey::try_decode_protobuf(&hex_decode(pin)?)
+            .map_err(|_| "invalid discovery signing key pin")?;
+        let seeds = config
+            .discovery_bootstrap_addresses
+            .iter()
+            .map(|address| {
+                address
+                    .parse()
+                    .map_err(|_| "invalid public discovery bootstrap".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let minimum_revision = config
+            .discovery_proof
+            .as_ref()
+            .map_or(0, |proof| proof.body.roster.body.revision);
+        let proof = cat4igp_shared::discovery::transport::discover(
+            &keypair,
+            &pin,
+            &config.control_network_id,
+            cat4igp_shared::discovery::Role::Client,
+            &seeds,
+            minimum_revision,
+        )
+        .await?;
+        config.accept_discovery_proof(proof, now_ms()?)?;
+    }
+    let response = request_to_bootstraps(config, bootstraps, request).await?;
     if let ControlResponse::Enrolled(enrollment) = &response {
+        if config.controller_signing_key.as_ref().is_some_and(|pin| {
+            hex_decode(pin).ok() != hex_decode(&enrollment.controller_signing_key).ok()
+        }) || (config.controller_signing_key.is_some()
+            && enrollment.network_id != config.control_network_id)
+        {
+            return Err("enrollment does not match trusted bundle".into());
+        }
         let signing = hex_decode(&enrollment.controller_signing_key)?;
         let signing = libp2p::identity::PublicKey::try_decode_protobuf(&signing)
             .map_err(|_| "invalid controller signing key".to_string())?;
-        if signing.to_peer_id() != controller
+        if (config
+            .controller_peer_id
+            .as_deref()
+            .is_some_and(|logical| logical != signing.to_peer_id().to_string())
+            || (config.controller_signing_key.is_none() && signing.to_peer_id() != controller))
             || enrollment.controller_encryption_key.len() != 64
             || !enrollment
                 .controller_encryption_key
@@ -246,7 +337,7 @@ pub async fn enroll(
         {
             return Err("invalid controller enrollment identity".to_string());
         }
-        config.controller_peer_id = Some(controller.to_string());
+        config.controller_peer_id = Some(signing.to_peer_id().to_string());
         config.control_bootstrap_addresses = bootstraps.to_vec();
         config.control_node_id = Some(enrollment.node_id);
         config.topology_revision = enrollment.topology_revision;
@@ -285,12 +376,29 @@ fn bootstrap_peer_id(bootstrap: &str) -> Result<libp2p::PeerId, String> {
 
 async fn request_to_bootstraps(
     config: &mut crate::config::ServerConfig,
-    controller: libp2p::PeerId,
     bootstraps: &[String],
     request: ControlRequest,
 ) -> Result<ControlResponse, String> {
     let mut errors = Vec::new();
+    // ponytail: at most 16 pinned addresses, ten seconds each; no automatic retry of application rejections.
+    if bootstraps.is_empty() || bootstraps.len() > 16 {
+        return Err("expected 1..16 private control bootstraps".into());
+    }
     for bootstrap in bootstraps {
+        let peer = bootstrap_peer_id(bootstrap)?;
+        if config.controller_signing_key.is_some()
+            && !config.control_peer_authorized(peer, now_ms()?)
+        {
+            return Err("private bootstrap is not authorized by current signed roster".into());
+        }
+    }
+    for bootstrap in bootstraps {
+        let controller = bootstrap_peer_id(bootstrap)?;
+        if config.controller_signing_key.is_some()
+            && !config.control_peer_authorized(controller, now_ms()?)
+        {
+            return Err("private bootstrap is not authorized by current signed roster".into());
+        }
         let Ok(address) = bootstrap.parse() else {
             errors.push(format!("{bootstrap}: invalid multiaddress"));
             continue;
@@ -301,8 +409,16 @@ async fn request_to_bootstraps(
         )
         .await
         {
-            Ok(Ok(response)) => return Ok(response),
-            Ok(Err(error)) => errors.push(format!("{bootstrap}: {error}")),
+            Ok(Ok(response)) => {
+                if config.controller_signing_key.is_some()
+                    && !config.control_peer_authorized(controller, now_ms()?)
+                {
+                    return Err("private replica authorization expired during request".into());
+                }
+                return Ok(response);
+            }
+            Ok(Err(error)) if error.starts_with("retryable:") => errors.push(error),
+            Ok(Err(error)) => return Err(error),
             Err(_) => errors.push(format!("{bootstrap}: timed out")),
         }
     }
@@ -349,31 +465,119 @@ async fn request_to(
         SwarmConfig::with_tokio_executor(),
     );
     swarm.dial(address).map_err(|error| error.to_string())?;
+    let mut pending = None;
     loop {
         match swarm.select_next_some().await {
             libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, .. }
-                if peer_id == controller =>
+                if peer_id == controller && pending.is_none() =>
             {
-                swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_request(&controller, request.clone());
+                pending = Some(
+                    swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_request(&controller, request.clone()),
+                );
             }
             libp2p::swarm::SwarmEvent::Behaviour(ControlBehaviourEvent::RequestResponse(
                 request_response::Event::Message {
                     peer,
-                    message: request_response::Message::Response { response, .. },
+                    message:
+                        request_response::Message::Response {
+                            request_id,
+                            response,
+                        },
                     ..
                 },
-            )) if peer == controller => return Ok(response),
+            )) if peer == controller && pending == Some(request_id) => return Ok(response),
+            libp2p::swarm::SwarmEvent::Behaviour(ControlBehaviourEvent::RequestResponse(
+                request_response::Event::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                },
+            )) if peer == controller && pending == Some(request_id) => {
+                return Err(match error {
+                    request_response::OutboundFailure::Timeout
+                    | request_response::OutboundFailure::ConnectionClosed => {
+                        format!("retryable: {error}")
+                    }
+                    _ => error.to_string(),
+                });
+            }
             libp2p::swarm::SwarmEvent::OutgoingConnectionError {
                 peer_id: Some(peer),
                 error,
                 ..
             } if peer == controller => {
-                return Err(format!("controller connection failed: {error}"));
+                // Authentication/protocol failures are terminal; only refused TCP dials may advance.
+                let text = error.to_string();
+                return Err(
+                    if text.contains("Connection refused") || text.contains("ConnectionRefused") {
+                        format!("retryable: {text}")
+                    } else {
+                        format!("controller connection failed: {text}")
+                    },
+                );
             }
             _ => {}
         }
     }
 }
+
+pub fn now_ms() -> Result<i64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before Unix epoch".to_string())?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "system clock out of range".to_string())
+}
+
+async fn authorized(current: &tokio::sync::Mutex<Option<crate::config::ServerConfig>>) -> bool {
+    let Ok(now) = now_ms() else { return false };
+    current
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|config| config.discovery_authorized(now))
+}
+
+pub async fn refresh_discovery(config: &mut crate::config::ServerConfig) -> Result<(), String> {
+    if config.discovery_bootstrap_addresses.is_empty() {
+        return Ok(());
+    }
+    let keypair = config
+        .ensure_control_keypair()
+        .map_err(|error| error.to_string())?;
+    let pin = libp2p::identity::PublicKey::try_decode_protobuf(&hex_decode(
+        config
+            .controller_signing_key
+            .as_deref()
+            .ok_or("missing discovery signing pin")?,
+    )?)
+    .map_err(|_| "invalid discovery signing pin")?;
+    let seeds = config
+        .discovery_bootstrap_addresses
+        .iter()
+        .map(|address| address.parse().map_err(|_| "invalid discovery bootstrap"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let minimum = config
+        .discovery_proof
+        .as_ref()
+        .map_or(0, |proof| proof.body.roster.body.revision);
+    let proof = cat4igp_shared::discovery::transport::discover(
+        &keypair,
+        &pin,
+        &config.control_network_id,
+        cat4igp_shared::discovery::Role::Client,
+        &seeds,
+        minimum,
+    )
+    .await?;
+    config.accept_discovery_proof(proof, now_ms()?)
+}
+
+#[cfg(test)]
+#[path = "control_test.rs"]
+pub(super) mod tests;

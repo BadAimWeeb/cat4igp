@@ -7,10 +7,12 @@ license = "MIT"
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
+futures-util = "0.3.31"
+tokio = { version = "1.48.0", features = ["macros", "rt", "time"] }
 chrono = { workspace = true }
 chacha20poly1305 = { version = "0.10", features = ["std"] }
 hkdf = "0.12"
-libp2p = { workspace = true }
+libp2p = { workspace = true, features = ["serde"] }
 rand08 = { package = "rand", version = "0.8" }
 sha2 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }

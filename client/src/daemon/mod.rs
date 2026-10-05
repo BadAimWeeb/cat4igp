@@ -29,7 +29,38 @@ pub struct Daemon {
     secret: SharedSecret,
     memory: Arc<daemon_memory::DaemonMemory>,
     control_sync: Arc<Mutex<()>>,
-    control_plane: Arc<Mutex<Option<control::ControlPlane>>>,
+    control_plane: Arc<std::sync::Mutex<Option<control::ControlPlane>>>,
+    tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+    stopping: Arc<tokio::sync::Notify>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+// ponytail: advisory lock coordinates shipped daemons; the socket directory must be trusted.
+struct RunGuard<'a> {
+    daemon: &'a Daemon,
+    _lock: std::fs::File,
+    socket: Option<(u64, u64)>,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        let mut tasks = self.daemon.tasks.lock().unwrap();
+        self.daemon
+            .stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tasks.abort_all();
+        if let Some(plane) = self.daemon.control_plane.lock().unwrap().take() {
+            plane.stop();
+        }
+        if let Some(identity) = self.socket {
+            if std::fs::symlink_metadata(self.daemon.get_socket_path())
+                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == identity)
+            {
+                let _ = std::fs::remove_file(self.daemon.get_socket_path());
+            }
+        }
+    }
 }
 
 /// IPC message envelope
@@ -54,7 +85,11 @@ impl Daemon {
         };
 
         // Load server configuration if it exists and ensure local WireGuard keypair is persisted.
-        let mut server_config = ServerConfig::load(&config.data_dir).ok();
+        let mut server_config = match ServerConfig::load(&config.data_dir) {
+            Ok(config) => Some(config),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         if let Some(cfg) = server_config.as_mut() {
             cfg.ensure_wireguard_keypair()?;
             cfg.ensure_control_keypair()?;
@@ -69,7 +104,10 @@ impl Daemon {
             secret,
             memory: Arc::new(daemon_memory::DaemonMemory::new(cfg_clone)),
             control_sync: Arc::new(Mutex::new(())),
-            control_plane: Arc::new(Mutex::new(None)),
+            control_plane: Arc::new(std::sync::Mutex::new(None)),
+            tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            stopping: Arc::new(tokio::sync::Notify::new()),
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -90,6 +128,10 @@ impl Daemon {
                 address,
                 invite_code,
             } => self.handle_register(address, invite_code).await,
+            DaemonRequest::RegisterBundle { bundle } => match ServerConfig::from_bundle(&bundle) {
+                Ok(config) => self.register_config(config).await,
+                Err(error) => DaemonResponse::Error(error),
+            },
             DaemonRequest::Restart => self.handle_restart().await,
             DaemonRequest::Shutdown => self.handle_shutdown().await,
             DaemonRequest::GetConfig => self.handle_get_config().await,
@@ -127,6 +169,9 @@ impl Daemon {
         let mut config = ServerConfig {
             address: address.clone(),
             invite_code,
+            enrollment_bootstrap_addresses: Vec::new(),
+            enrollment_discovery_bootstrap_addresses: None,
+            enrollment_node_name: None,
             wg_private_key: None,
             wg_public_key: None,
             control_private_key: None,
@@ -135,6 +180,8 @@ impl Daemon {
             controller_signing_key: None,
             controller_encryption_key: None,
             control_bootstrap_addresses: Vec::new(),
+            discovery_bootstrap_addresses: Vec::new(),
+            discovery_proof: None,
             control_private_network_key: self.config.control_private_network_key.clone(),
             topology_revision: 0,
             control_node_id: None,
@@ -166,6 +213,9 @@ impl Daemon {
         let mut config = ServerConfig {
             address: address.clone(),
             invite_code,
+            enrollment_bootstrap_addresses: Vec::new(),
+            enrollment_discovery_bootstrap_addresses: None,
+            enrollment_node_name: None,
             wg_private_key: None,
             wg_public_key: None,
             control_private_key: None,
@@ -174,11 +224,58 @@ impl Daemon {
             controller_signing_key: None,
             controller_encryption_key: None,
             control_bootstrap_addresses: Vec::new(),
+            discovery_bootstrap_addresses: Vec::new(),
+            discovery_proof: None,
             control_private_network_key: self.config.control_private_network_key.clone(),
             topology_revision: 0,
             control_node_id: None,
             control_network_id: self.config.control_network_id.clone(),
         };
+
+        config.control_bootstrap_addresses = self.config.control_bootstrap_addresses.clone();
+        if !config.control_bootstrap_addresses.contains(&address) {
+            config.control_bootstrap_addresses.insert(0, address);
+        }
+        self.register_config(config).await
+    }
+
+    async fn register_config(&self, mut config: ServerConfig) -> DaemonResponse {
+        let _registration = self.control_sync.lock().await;
+        if self
+            .server_config
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|config| config.control_node_id.is_some())
+        {
+            return DaemonResponse::Error(
+                "Server already configured; refusing to overwrite enrollment".into(),
+            );
+        }
+        if let Some(pending) = self.server_config.lock().await.as_ref() {
+            let original_seeds = if pending.enrollment_bootstrap_addresses.is_empty() {
+                &pending.control_bootstrap_addresses
+            } else {
+                &pending.enrollment_bootstrap_addresses
+            };
+            if pending.invite_code == config.invite_code
+                && original_seeds == &config.control_bootstrap_addresses
+                && pending.controller_signing_key == config.controller_signing_key
+                && pending.control_network_id == config.control_network_id
+                && pending.control_private_network_key == config.control_private_network_key
+                && pending
+                    .enrollment_discovery_bootstrap_addresses
+                    .as_ref()
+                    .unwrap_or(&pending.discovery_bootstrap_addresses)
+                    == &config.discovery_bootstrap_addresses
+            {
+                config = pending.clone();
+            } else {
+                return DaemonResponse::Error(
+                    "Pending registration differs; refusing to overwrite identity".into(),
+                );
+            }
+        }
 
         if let Err(e) = config.ensure_wireguard_keypair() {
             return DaemonResponse::Error(format!("Failed to generate WireGuard keypair: {}", e));
@@ -193,11 +290,34 @@ impl Daemon {
             ));
         }
 
-        let mut bootstrap_addresses = self.config.control_bootstrap_addresses.clone();
-        if !bootstrap_addresses.contains(&address) {
-            bootstrap_addresses.insert(0, address);
+        if config.enrollment_bootstrap_addresses.is_empty() {
+            config.enrollment_bootstrap_addresses = config.control_bootstrap_addresses.clone();
         }
-        let node_name = std::env::var("HOSTNAME").unwrap_or_else(|_| "cat4igp-client".to_string());
+        // ponytail: legacy pending files cannot reconstruct pre-discovery seeds; fail closed on mismatch.
+        config
+            .enrollment_discovery_bootstrap_addresses
+            .get_or_insert_with(|| config.discovery_bootstrap_addresses.clone());
+        let node_name = config
+            .enrollment_node_name
+            .get_or_insert_with(|| {
+                // ponytail: old pending files lack the original name; preserve it from this upgrade onward.
+                std::env::var("HOSTNAME").unwrap_or_else(|_| "cat4igp-client".to_string())
+            })
+            .clone();
+        // Keep the identity even if discovery fails before any enrollment is sent.
+        if let Err(error) = config.save(&self.config.data_dir) {
+            return DaemonResponse::Error(format!("Failed to save pending registration: {error}"));
+        }
+        *self.server_config.lock().await = Some(config.clone());
+        if let Err(error) = control::refresh_discovery(&mut config).await {
+            return DaemonResponse::Error(format!("Registration discovery failed: {error}"));
+        }
+        // Persist verified roster and stable enrollment identity before releasing the invite.
+        if let Err(error) = config.save(&self.config.data_dir) {
+            return DaemonResponse::Error(format!("Failed to save pending registration: {error}"));
+        }
+        *self.server_config.lock().await = Some(config.clone());
+        let bootstrap_addresses = config.control_bootstrap_addresses.clone();
         let registration = match control::enroll(&mut config, &bootstrap_addresses, node_name).await
         {
             Ok(response) => response,
@@ -212,6 +332,7 @@ impl Daemon {
             return DaemonResponse::Error("Registration rejected by controller".to_string());
         }
 
+        config.invite_code.clear();
         if let Err(e) = config.save(&self.config.data_dir) {
             return DaemonResponse::Error(format!("Failed to save server config: {}", e));
         }
@@ -233,7 +354,6 @@ impl Daemon {
     }
 
     async fn handle_shutdown(&self) -> DaemonResponse {
-        // In a real implementation, this would gracefully shutdown
         DaemonResponse::Ok(Some("Shutdown signal sent".to_string()))
     }
 
@@ -275,17 +395,56 @@ impl Daemon {
 
     /// Start the daemon's Unix socket server
     pub async fn run(&self) -> io::Result<()> {
-        // Remove existing socket file if it exists
-        if self.config.daemon_socket.exists() {
-            std::fs::remove_file(&self.config.daemon_socket)?;
-        }
-
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
         // Create parent directory if it doesn't exist
         if let Some(parent) = self.config.daemon_socket.parent() {
             std::fs::create_dir_all(parent)?;
         }
-
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(self.config.daemon_socket.with_extension("sock.lock"))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut guard = RunGuard {
+            daemon: self,
+            _lock: lock,
+            socket: None,
+        };
+        match std::fs::symlink_metadata(&self.config.daemon_socket) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_socket() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "socket path is not a socket",
+                    ));
+                }
+                match UnixStream::connect(&self.config.daemon_socket).await {
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AddrInUse,
+                            "daemon socket is active",
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                        std::fs::remove_file(&self.config.daemon_socket)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         let listener = UnixListener::bind(&self.config.daemon_socket)?;
+        let metadata = std::fs::symlink_metadata(&self.config.daemon_socket)?;
+        guard.socket = Some((metadata.dev(), metadata.ino()));
+        self.stopped
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         println!("✓ Listening on socket: {:?}", self.config.daemon_socket);
 
         if let Err(error) = self.start_control_plane().await {
@@ -293,32 +452,49 @@ impl Daemon {
             self.memory.set_last_poll_error(Some(error)).await;
         }
         let daemon_for_control = self.clone_for_handler();
-        tokio::spawn(async move {
+        self.tasks.lock().unwrap().spawn(async move {
             daemon_for_control.run_control_update_loop().await;
         });
         #[cfg(target_os = "linux")]
         {
             let daemon_for_network = self.clone_for_handler();
-            tokio::spawn(async move {
+            self.tasks.lock().unwrap().spawn(async move {
                 daemon_for_network.run_network_change_loop().await;
             });
         }
 
         loop {
-            match listener.accept().await {
+            let accepted = tokio::select! {
+                _ = self.stopping.notified() => break,
+                accepted = listener.accept() => accepted,
+            };
+            match accepted {
                 Ok((stream, _)) => {
                     let daemon = self.clone_for_handler();
-                    tokio::spawn(async move {
+                    let mut tasks = self.tasks.lock().unwrap();
+                    while tasks.try_join_next().is_some() {}
+                    tasks.spawn(async move {
                         if let Err(e) = handle_client(stream, daemon).await {
                             eprintln!("Error handling client: {}", e);
                         }
                     });
                 }
                 Err(e) => {
-                    eprintln!("Error accepting connection: {}", e);
+                    return Err(e);
                 }
             }
         }
+        let mut tasks = {
+            let mut tasks = self.tasks.lock().unwrap();
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            std::mem::take(&mut *tasks)
+        };
+        tasks.shutdown().await;
+        if let Some(plane) = self.control_plane.lock().unwrap().take() {
+            plane.stop();
+        }
+        Ok(())
     }
 
     /// Clone the necessary state for a handler task
@@ -335,24 +511,43 @@ impl Daemon {
             memory: Arc::clone(&self.memory),
             control_sync: Arc::clone(&self.control_sync),
             control_plane: Arc::clone(&self.control_plane),
+            tasks: Arc::clone(&self.tasks),
+            stopping: Arc::clone(&self.stopping),
+            stopped: Arc::clone(&self.stopped),
         })
     }
 
     async fn start_control_plane(&self) -> Result<(), String> {
-        if self.control_plane.lock().await.is_some() {
+        if self.control_plane.lock().unwrap().is_some() {
             return Ok(());
         }
-        let config = self
+        let mut config = self
             .server_config
             .lock()
             .await
             .clone()
             .ok_or_else(|| "control plane is not enrolled".to_string())?;
+        // Pending enrollment must not discover/save concurrently with RegisterBundle.
+        if config.control_node_id.is_none() {
+            return Err("control plane is not enrolled".to_string());
+        }
         let (updates, mut received) = mpsc::channel(8);
-        let plane = control::start(config, updates)?;
-        *self.control_plane.lock().await = Some(plane);
+        control::refresh_discovery(&mut config).await?;
+        config
+            .save(&self.config.data_dir)
+            .map_err(|error| error.to_string())?;
+        *self.server_config.lock().await = Some(config.clone());
+        let mut tasks = self.tasks.lock().unwrap();
+        if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("daemon stopped".into());
+        }
+        if self.control_plane.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let plane = control::start(config, updates, Arc::clone(&self.server_config))?;
+        *self.control_plane.lock().unwrap() = Some(plane);
         let daemon = self.clone_for_handler();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Some(snapshot) = received.recv().await {
                 if let Err(error) = daemon.apply_pushed_snapshot(snapshot).await {
                     eprintln!("[daemon] pushed topology apply failed: {error}");
@@ -389,8 +584,11 @@ impl Daemon {
                 return;
             }
         };
-        tokio::spawn(connection);
-        while messages.next().await.is_some() {
+        tokio::pin!(connection);
+        while tokio::select! {
+            _ = &mut connection => false,
+            message = messages.next() => message.is_some(),
+        } {
             // ponytail: track interface indexes to skip CAT interfaces if event volume becomes material.
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Err(error) = self.sync_control_snapshot().await {
@@ -437,6 +635,7 @@ impl Daemon {
     }
 
     async fn sync_control_snapshot(&self) -> Result<(), String> {
+        self.start_control_plane().await?;
         let _sync = self.control_sync.lock().await;
         let mut config = self
             .server_config
@@ -448,12 +647,19 @@ impl Daemon {
             return Err("control plane is not enrolled".to_string());
         }
 
-        let response = self
+        control::refresh_discovery(&mut config).await?;
+        config
+            .save(&self.config.data_dir)
+            .map_err(|error| error.to_string())?;
+        *self.server_config.lock().await = Some(config.clone());
+
+        let plane = self
             .control_plane
             .lock()
-            .await
+            .unwrap()
             .clone()
-            .ok_or_else(|| "control plane is not enrolled".to_string())?
+            .ok_or_else(|| "control plane is not enrolled".to_string())?;
+        let response = plane
             .request(cat4igp_shared::control::ControlRequest::Snapshot)
             .await?;
         config
@@ -585,12 +791,13 @@ impl Daemon {
                 endpoint,
                 decline_type,
             };
-            let response = self
+            let plane = self
                 .control_plane
                 .lock()
-                .await
+                .unwrap()
                 .clone()
-                .ok_or_else(|| "control plane is not enrolled".to_string())?
+                .ok_or_else(|| "control plane is not enrolled".to_string())?;
+            let response = plane
                 .request(ControlRequest::TunnelAnswerEnvelope(
                     cat4igp_shared::control::seal_tunnel_answer(
                         &signing_key,
@@ -700,6 +907,9 @@ async fn handle_client(mut stream: UnixStream, daemon: Arc<Daemon>) -> io::Resul
     let message: IpcMessage = serde_json::from_slice(&buffer)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid JSON: {}", e)))?;
 
+    // Stop only after replying, and only for an authenticated Shutdown.
+    let shutdown =
+        matches!(message.request, DaemonRequest::Shutdown) && daemon.secret.verify(&message.secret);
     // Handle the request
     let response = daemon
         .handle_request(message.request, &message.secret)
@@ -714,81 +924,18 @@ async fn handle_client(mut stream: UnixStream, daemon: Arc<Daemon>) -> io::Resul
     })?;
 
     let response_len = (response_bytes.len() as u32).to_be_bytes();
-    stream.write_all(&response_len).await?;
-    stream.write_all(&response_bytes).await?;
-    stream.flush().await?;
-
-    Ok(())
+    let sent = async {
+        stream.write_all(&response_len).await?;
+        stream.write_all(&response_bytes).await?;
+        stream.flush().await
+    }
+    .await;
+    if shutdown {
+        daemon.stopping.notify_one();
+    }
+    sent
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[tokio::test]
-    async fn test_daemon_creation() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = ClientConfig {
-            data_dir: temp_dir.path().to_path_buf(),
-            ..Default::default()
-        };
-
-        let daemon = Daemon::new(config).await.unwrap();
-        assert!(!daemon.is_server_configured().await);
-    }
-
-    #[tokio::test]
-    async fn test_set_server_config() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = ClientConfig {
-            data_dir: temp_dir.path().to_path_buf(),
-            ..Default::default()
-        };
-
-        let daemon = Daemon::new(config).await.unwrap();
-        let secret = daemon.get_secret().to_string();
-
-        let req = DaemonRequest::SetServer {
-            address: "/ip4/127.0.0.1/tcp/9000/p2p/12D3KooWExample".to_string(),
-            invite_code: "test-invite".to_string(),
-        };
-
-        let response = daemon.handle_request(req, &secret).await;
-        match response {
-            DaemonResponse::Ok(_) => {
-                assert!(daemon.is_server_configured().await);
-            }
-            _ => panic!("Unexpected response"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_auth_failure() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = ClientConfig {
-            data_dir: temp_dir.path().to_path_buf(),
-            ..Default::default()
-        };
-
-        let daemon = Daemon::new(config).await.unwrap();
-
-        let req = DaemonRequest::Status;
-        let response = daemon.handle_request(req, "wrong-secret").await;
-
-        match response {
-            DaemonResponse::Error(msg) => {
-                assert!(msg.contains("Authentication"));
-            }
-            _ => panic!("Expected error response"),
-        }
-    }
-
-    #[test]
-    fn rejects_unspecified_or_multicast_endpoint() {
-        for endpoint in ["0.0.0.0:1", "[::]:1", "224.0.0.1:1", "[ff02::1]:1"] {
-            let endpoint: SocketAddr = endpoint.parse().unwrap();
-            assert!(endpoint.ip().is_unspecified() || endpoint.ip().is_multicast());
-        }
-    }
-}
+#[path = "daemon_test.rs"]
+mod tests;

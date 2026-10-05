@@ -1,6 +1,28 @@
+mod cluster;
+
+#[cfg(test)]
+extern crate rand08 as rand;
+
+// Compile the shipped client paths unchanged for the real listener/Raft wire check.
+#[cfg(test)]
+#[path = "../../client/src/config/server.rs"]
+mod client_config;
+#[cfg(test)]
+#[path = "../../client/src/daemon/control.rs"]
+pub(crate) mod client_control;
+#[cfg(test)]
+mod config {
+    pub use crate::client_config::ServerConfig;
+}
+#[cfg(test)]
+mod daemon {
+    pub(crate) use crate::client_control as control;
+}
 pub mod db;
 pub mod ext;
 pub mod models;
+pub mod raft_network;
+pub mod raft_storage;
 pub mod router;
 pub mod schema;
 
@@ -16,30 +38,33 @@ use libp2p::{
     swarm::{Config as SwarmConfig, NetworkBehaviour, Swarm},
     tcp, yamux,
 };
-use std::{
-    collections::{HashSet, VecDeque},
-    env,
-};
+use std::env;
 
 const CONTROL_PROTOCOL: &str = "/cat4igp/control/1";
 
-fn remember_message_id(
-    seen: &mut HashSet<String>,
-    order: &mut VecDeque<String>,
-    message_id: String,
-) -> bool {
-    if !seen.insert(message_id.clone()) {
-        return false;
-    }
-    order.push_back(message_id);
-    // ponytail: retains 256 answers until controller restart; persist IDs for crash-safe deduplication.
-    if order.len() > 256 {
-        if let Some(oldest) = order.pop_front() {
-            seen.remove(&oldest);
-        }
-    }
-    true
+const DATABASE_QUEUE_CAPACITY: usize = 32;
+pub(crate) type DatabaseSender = tokio::sync::mpsc::Sender<DatabaseJob>;
+pub(crate) enum DatabaseJob {
+    Control(
+        libp2p::PeerId,
+        cat4igp_shared::control::ControlRequest,
+        request_response::ResponseChannel<cat4igp_shared::control::ControlResponse>,
+    ),
+    Invite {
+        request_id: String,
+        expires_at: Option<chrono::NaiveDateTime>,
+        max_uses: Option<i32>,
+        join_mesh: Option<i32>,
+        reply: tokio::sync::oneshot::Sender<Result<Result<String, String>, diesel::result::Error>>,
+    },
 }
+
+type ControlCompletion = (
+    libp2p::PeerId,
+    request_response::ResponseChannel<cat4igp_shared::control::ControlResponse>,
+    cat4igp_shared::control::ControlResponse,
+    Vec<(i32, Vec<u8>)>,
+);
 
 #[derive(NetworkBehaviour)]
 struct ControlBehaviour {
@@ -63,21 +88,25 @@ fn gossipsub(keypair: &identity::Keypair) -> Result<gossipsub::Behaviour, String
 }
 
 fn control_response(
+    conn: &mut diesel::SqliteConnection,
     peer_id: &libp2p::PeerId,
     controller_signing_key: &str,
     controller_keypair: &identity::Keypair,
     network_id: &str,
-    seen_message_ids: &mut HashSet<String>,
-    message_order: &mut VecDeque<String>,
     request: cat4igp_shared::control::ControlRequest,
 ) -> (
     cat4igp_shared::control::ControlResponse,
     Vec<cat4igp_shared::control::TopologySnapshot>,
 ) {
-    let mut conn = crate::db::establish_connection();
-
     if let cat4igp_shared::control::ControlRequest::Enroll(request) = request {
         if request.client_peer_id != peer_id.to_string()
+            || request.request_id.len() > 256
+            || request.client_encryption_key.len() != 64
+            || request.node_name.len() > 256
+            || request.invitation_code.is_empty()
+            || request.invitation_code.len() > 256
+            || request.wireguard_public_key.len() > 256
+            || request.client_signing_key.len() > 1024
             || request.node_name.is_empty()
             || request.wireguard_public_key.is_empty()
             || request.client_signing_key.is_empty()
@@ -91,11 +120,11 @@ fn control_response(
                 Vec::new(),
             );
         }
-        let signing_key = match hex_decode(&request.client_signing_key).and_then(|encoded| {
+        match hex_decode(&request.client_signing_key).and_then(|encoded| {
             identity::PublicKey::try_decode_protobuf(&encoded)
                 .map_err(|_| "invalid client signing key".to_string())
         }) {
-            Ok(key) if key.to_peer_id() == *peer_id => request.client_signing_key,
+            Ok(key) if key.to_peer_id() == *peer_id => (),
             _ => {
                 return (
                     cat4igp_shared::control::ControlResponse::Rejected(
@@ -116,70 +145,35 @@ fn control_response(
                 );
             }
         };
-        return match conn.transaction(|conn| {
-            let (node_id, _, join_mesh) =
-                crate::db::register_node(conn, &request.node_name, &request.invitation_code)?;
-            crate::db::register_control_identity(
-                conn,
+        use diesel::prelude::*;
+        // ponytail: local serialized submission only; replace with committed leader allocation before HA.
+        let node_id = crate::schema::nodes::table
+            .select(diesel::dsl::max(crate::schema::nodes::id))
+            .first::<Option<i32>>(conn)
+            .expect("cannot allocate enrollment node ID")
+            .unwrap_or(0)
+            .checked_add(1)
+            .expect("node IDs exhausted");
+        let command = crate::db::EnrollmentCommand {
+            allocation: crate::db::prepare_enrollment_allocation(conn, &request.invitation_code)
+                .expect("cannot allocate enrollment tunnels"),
+            request,
+            node_id,
+            auth_key: uuid::Uuid::new_v4().to_string(),
+            applied_at: chrono::Utc::now().naive_utc(),
+            response: cat4igp_shared::control::EnrollmentResponse {
                 node_id,
-                &request.client_peer_id,
-                &signing_key,
-                &request.client_encryption_key,
-            )?;
-            crate::db::update_wireguard_pubkey(conn, node_id, &request.wireguard_public_key)?;
-            if let Some(mesh_id) = join_mesh.filter(|id| *id != 0) {
-                crate::db::join_mesh(conn, node_id, mesh_id)?;
-            }
-            Ok::<_, diesel::result::Error>(node_id)
-        }) {
-            Ok(node_id) => {
-                let snapshots = crate::db::tunnel_node_ids_for_node(&mut conn, node_id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|affected_node_id| {
-                        let revision =
-                            crate::db::bump_control_revision(&mut conn, affected_node_id).ok()?;
-                        crate::db::topology_snapshot(&mut conn, affected_node_id, revision).ok()
-                    })
-                    .collect();
-                let revision = crate::db::control_identity_for_node(&mut conn, node_id)
-                    .map(|identity| identity.topology_revision)
-                    .unwrap_or_default();
-                (
-                    cat4igp_shared::control::ControlResponse::Enrolled(
-                        cat4igp_shared::control::EnrollmentResponse {
-                            node_id,
-                            topology_revision: revision,
-                            network_id: match control_network_id() {
-                                Ok(network_id) => network_id,
-                                Err(error) => {
-                                    return (
-                                        cat4igp_shared::control::ControlResponse::Rejected(
-                                            format!(
-                                                "control network identity unavailable: {error}"
-                                            ),
-                                        ),
-                                        Vec::new(),
-                                    );
-                                }
-                            },
-                            controller_signing_key: controller_signing_key.to_string(),
-                            controller_encryption_key,
-                        },
-                    ),
-                    snapshots,
-                )
-            }
-            Err(_) => (
-                cat4igp_shared::control::ControlResponse::Rejected(
-                    "enrollment rejected".to_string(),
-                ),
-                Vec::new(),
-            ),
+                topology_revision: 0,
+                network_id: network_id.to_string(),
+                controller_signing_key: controller_signing_key.to_string(),
+                controller_encryption_key,
+            },
         };
+        return crate::db::apply_enrollment(conn, &command)
+            .unwrap_or_else(|error| panic!("enrollment application storage failure: {error}"));
     }
 
-    let identity = match crate::db::control_identity_for_peer(&mut conn, &peer_id.to_string()) {
+    let identity = match crate::db::control_identity_for_peer(conn, &peer_id.to_string()) {
         Ok(identity) => identity,
         Err(_) => {
             return (
@@ -194,13 +188,12 @@ fn control_response(
         cat4igp_shared::control::ControlRequest::Snapshot => {
             let response = (|| {
                 let snapshot = crate::db::topology_snapshot(
-                    &mut conn,
+                    conn,
                     identity.node_id,
                     identity.topology_revision,
                 )?;
                 let encryption_key =
-                    crate::db::control_identity_for_node(&mut conn, identity.node_id)?
-                        .encryption_key;
+                    crate::db::control_identity_for_node(conn, identity.node_id)?.encryption_key;
                 let now = chrono::Utc::now().timestamp_millis();
                 cat4igp_shared::control::seal_topology_snapshot(
                     controller_keypair,
@@ -249,90 +242,42 @@ fn control_response(
                     );
                 }
             };
-            if !remember_message_id(seen_message_ids, message_order, envelope.meta.message_id) {
-                return (
-                    cat4igp_shared::control::ControlResponse::Rejected(
-                        "replayed tunnel answer".to_string(),
-                    ),
-                    Vec::new(),
-                );
-            }
-            if let Some(endpoint) = answer.endpoint.as_deref() {
-                let endpoint = match endpoint.parse::<std::net::SocketAddr>() {
-                    Ok(endpoint)
-                        if !endpoint.ip().is_unspecified() && !endpoint.ip().is_multicast() =>
-                    {
-                        endpoint
-                    }
-                    _ => {
-                        return (
-                            cat4igp_shared::control::ControlResponse::Rejected(
-                                "endpoint must be a routable socket address".to_string(),
-                            ),
+            let command = crate::db::AnswerCommand {
+                node_id: identity.node_id,
+                request_id: envelope.meta.message_id,
+                answer,
+                applied_at: chrono::Utc::now().naive_utc(),
+            };
+            match crate::db::apply_answer(conn, &command) {
+                Ok(result) if result == "accepted" => {
+                    match crate::db::tunnel_peer_node_ids(conn, command.answer.tunnel_id) {
+                        Ok((peer1, peer2)) => {
+                            let snapshots = [peer1, peer2]
+                                .into_iter()
+                                .filter_map(|node_id| {
+                                    let revision =
+                                        crate::db::control_identity_for_node(conn, node_id)
+                                            .ok()?
+                                            .topology_revision;
+                                    crate::db::topology_snapshot(conn, node_id, revision).ok()
+                                })
+                                .collect();
+                            (
+                                cat4igp_shared::control::ControlResponse::Accepted,
+                                snapshots,
+                            )
+                        }
+                        Err(error) => (
+                            cat4igp_shared::control::ControlResponse::Rejected(error.to_string()),
                             Vec::new(),
-                        );
-                    }
-                };
-                match crate::db::tunnel_endpoint_ipv6(&mut conn, answer.tunnel_id) {
-                    Ok(ipv6) if ipv6 == endpoint.is_ipv6() => {}
-                    Ok(_) => {
-                        return (
-                            cat4igp_shared::control::ControlResponse::Rejected(
-                                "endpoint address family does not match tunnel".to_string(),
-                            ),
-                            Vec::new(),
-                        );
-                    }
-                    Err(_) => {
-                        return (
-                            cat4igp_shared::control::ControlResponse::Rejected(
-                                "unknown tunnel".to_string(),
-                            ),
-                            Vec::new(),
-                        );
+                        ),
                     }
                 }
-            }
-            match crate::db::answer_wireguard_tunnel(
-                &mut conn,
-                answer.tunnel_id,
-                identity.node_id,
-                answer.endpoint,
-                answer.decline_type,
-            ) {
-                Ok(()) => match crate::db::tunnel_peer_node_ids(&mut conn, answer.tunnel_id)
-                    .and_then(|(peer1, peer2)| {
-                        crate::db::bump_control_revision(&mut conn, peer1)?;
-                        crate::db::bump_control_revision(&mut conn, peer2)?;
-                        Ok((peer1, peer2))
-                    }) {
-                    Ok((peer1, peer2)) => {
-                        let snapshots = [peer1, peer2]
-                            .into_iter()
-                            .filter_map(|node_id| {
-                                let revision =
-                                    crate::db::control_identity_for_node(&mut conn, node_id)
-                                        .ok()?
-                                        .topology_revision;
-                                crate::db::topology_snapshot(&mut conn, node_id, revision).ok()
-                            })
-                            .collect();
-                        (
-                            cat4igp_shared::control::ControlResponse::Accepted,
-                            snapshots,
-                        )
-                    }
-                    Err(error) => (
-                        cat4igp_shared::control::ControlResponse::Rejected(error.to_string()),
-                        Vec::new(),
-                    ),
-                },
-                Err(_) => (
-                    cat4igp_shared::control::ControlResponse::Rejected(
-                        "unknown tunnel or unauthorized peer".to_string(),
-                    ),
+                Ok(result) => (
+                    cat4igp_shared::control::ControlResponse::Rejected(result),
                     Vec::new(),
                 ),
+                Err(error) => panic!("answer application storage failure: {error}"),
             }
         }
         cat4igp_shared::control::ControlRequest::Enroll(_) => unreachable!(),
@@ -340,7 +285,7 @@ fn control_response(
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
-    if !value.len().is_multiple_of(2) {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("CONTROL_PRIVATE_KEY must be hexadecimal".to_string());
     }
     (0..value.len())
@@ -351,19 +296,25 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
 
 fn control_keypair() -> Result<identity::Keypair, String> {
     let mut conn = crate::db::establish_connection();
-    let encoded = match crate::db::get_setting(&mut conn, "control_private_key") {
-        Ok(encoded) => encoded,
-        Err(diesel::result::Error::NotFound) => {
-            let keypair = identity::Keypair::generate_ed25519();
-            let encoded = hex_encode(
-                &keypair
+    let candidate = identity::Keypair::generate_ed25519();
+    crate::db::apply_initialization(
+        &mut conn,
+        &crate::db::InitializeCommand {
+            signing_private_key: hex_encode(
+                &candidate
                     .to_protobuf_encoding()
                     .map_err(|_| "failed to encode controller identity")?,
-            );
-            crate::db::set_setting(&mut conn, "control_private_key", &encoded)
-                .map_err(|error| error.to_string())?;
-            return Ok(keypair);
-        }
+            ),
+            encryption_private_key: hex_encode(
+                &x25519_dalek::StaticSecret::random_from_rng(rand08::rngs::OsRng).to_bytes(),
+            ),
+            network_id: uuid::Uuid::new_v4().to_string(),
+            applied_at: chrono::Utc::now().naive_utc(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let encoded = match crate::db::get_setting(&mut conn, "control_private_key") {
+        Ok(encoded) => encoded,
         Err(error) => return Err(error.to_string()),
     };
     identity::Keypair::from_protobuf_encoding(&hex_decode(&encoded)?)
@@ -379,12 +330,6 @@ fn control_network_id() -> Result<String, String> {
     match crate::db::get_setting(&mut conn, "control_network_id") {
         Ok(value) if !value.is_empty() => Ok(value),
         Ok(_) => Err("stored control network id is empty".to_string()),
-        Err(diesel::result::Error::NotFound) => {
-            let value = uuid::Uuid::new_v4().to_string();
-            crate::db::set_setting(&mut conn, "control_network_id", &value)
-                .map_err(|error| error.to_string())?;
-            Ok(value)
-        }
         Err(error) => Err(error.to_string()),
     }
 }
@@ -404,19 +349,15 @@ fn control_encryption_private_key() -> Result<String, String> {
     Ok(
         match crate::db::get_setting(&mut conn, "control_encryption_private_key") {
             Ok(encoded) => encoded,
-            Err(diesel::result::Error::NotFound) => {
-                let private = x25519_dalek::StaticSecret::random_from_rng(rand08::rngs::OsRng);
-                let encoded = hex_encode(&private.to_bytes());
-                crate::db::set_setting(&mut conn, "control_encryption_private_key", &encoded)
-                    .map_err(|error| error.to_string())?;
-                encoded
-            }
             Err(error) => return Err(error.to_string()),
         },
     )
 }
 
-async fn run_control_plane() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_control_plane(
+    jobs: DatabaseSender,
+    work: tokio::sync::mpsc::Receiver<DatabaseJob>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_address = env::var("CONTROL_BIND_MULTIADDR")?;
     let keypair = control_keypair()?;
     let network_id = control_network_id()?;
@@ -449,12 +390,37 @@ async fn run_control_plane() -> Result<(), Box<dyn std::error::Error + Send + Sy
         keypair.public().to_peer_id(),
         SwarmConfig::with_tokio_executor(),
     );
-    let mut seen_message_ids = HashSet::new();
-    let mut message_order = VecDeque::new();
     swarm.listen_on(listen_address.parse()?)?;
 
+    // ponytail: serialized local SQL, not consensus; replace submission with OpenRaft
+    // commit/apply before HA. At most 32 queued + 1 active + 32 completed jobs.
+    let (completed, mut results) = tokio::sync::mpsc::channel(DATABASE_QUEUE_CAPACITY);
+    let worker_key = keypair.clone();
+    let worker_network = network_id.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        database_worker(
+            crate::db::establish_connection(),
+            work,
+            completed,
+            worker_key,
+            worker_network,
+        );
+    });
     loop {
-        match swarm.select_next_some().await {
+        tokio::select! {
+        stopped = &mut worker => return Err(format!("control database worker stopped: {stopped:?}").into()),
+        Some((peer, channel, response, pushes)) = results.recv() => {
+            if swarm.behaviour_mut().request_response.send_response(channel, response).is_err() {
+                eprintln!("[control] failed to respond to {peer}");
+            }
+            for (node_id, payload) in pushes {
+                let topic = gossipsub::Sha256Topic::new(cat4igp_shared::control::topology_topic(&network_id, node_id));
+                if let Err(error) = swarm.behaviour_mut().gossipsub.publish(topic, payload) {
+                    eprintln!("[control] failed to publish topology for {node_id}: {error}");
+                }
+            }
+        }
+        event = swarm.select_next_some() => match event {
             libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
                 eprintln!("[control] listening on {address}");
             }
@@ -468,60 +434,105 @@ async fn run_control_plane() -> Result<(), Box<dyn std::error::Error + Send + Sy
                     ..
                 },
             )) => {
-                let controller_signing_key = hex_encode(&keypair.public().encode_protobuf());
-                let (response, snapshots) = control_response(
-                    &peer,
-                    &controller_signing_key,
-                    &keypair,
-                    &network_id,
-                    &mut seen_message_ids,
-                    &mut message_order,
-                    request,
-                );
-                if let Err(error) = swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_response(channel, response)
-                {
-                    eprintln!("[control] failed to respond to {peer}: {error:?}");
-                }
-                for snapshot in snapshots {
-                    let topic = gossipsub::Sha256Topic::new(
-                        cat4igp_shared::control::topology_topic(&network_id, snapshot.node_id),
-                    );
-                    let identity = crate::db::control_identity_for_node(
-                        &mut crate::db::establish_connection(),
-                        snapshot.node_id,
-                    )?;
-                    let now = chrono::Utc::now().timestamp_millis();
-                    let envelope = cat4igp_shared::control::seal_topology_snapshot(
-                        &keypair,
-                        &identity.encryption_key,
-                        cat4igp_shared::control::MessageMeta {
-                            message_id: uuid::Uuid::new_v4().simple().to_string(),
-                            network_id: network_id.clone(),
-                            recipient_node_id: snapshot.node_id,
-                            issued_at_ms: now,
-                            expires_at_ms: now + 60_000,
-                            topology_revision: snapshot.revision,
-                        },
-                        &snapshot,
-                    )?;
-                    if let Err(error) = swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(topic, serde_json::to_vec(&envelope)?)
-                    {
-                        eprintln!(
-                            "[control] failed to publish topology for {}: {error}",
-                            snapshot.node_id
-                        );
-                    }
+                // Never await queue capacity here: network polling must continue during DB work.
+                if let Err(error) = jobs.try_send(DatabaseJob::Control(peer, request, channel)) {
+                    let DatabaseJob::Control(peer, _, channel) = error.into_inner() else { unreachable!() };
+                    let _ = swarm.behaviour_mut().request_response.send_response(channel,
+                        cat4igp_shared::control::ControlResponse::Rejected("control service busy; retry the same request".into()));
+                    eprintln!("[control] submission queue unavailable for {peer}");
                 }
             }
             _ => {}
         }
+        }
     }
+}
+
+fn database_worker(
+    mut conn: diesel::SqliteConnection,
+    mut work: tokio::sync::mpsc::Receiver<DatabaseJob>,
+    completed: tokio::sync::mpsc::Sender<ControlCompletion>,
+    worker_key: identity::Keypair,
+    worker_network: String,
+) -> diesel::SqliteConnection {
+    while let Some(job) = work.blocking_recv() {
+        let (peer, request, channel) = match job {
+            DatabaseJob::Control(peer, request, channel) => (peer, request, channel),
+            DatabaseJob::Invite {
+                request_id,
+                expires_at,
+                max_uses,
+                join_mesh,
+                reply,
+            } => {
+                // A disconnected caller must not cancel a potentially committed write.
+                // ponytail: singleton ordered allocation; submit this selected command through OpenRaft before HA.
+                let result = (|| {
+                    use diesel::prelude::*;
+                    let last = crate::schema::invites::table
+                        .select(diesel::dsl::max(crate::schema::invites::id))
+                        .first::<Option<i32>>(&mut conn)?
+                        .unwrap_or(0);
+                    let id = last
+                        .checked_add(1)
+                        .ok_or(diesel::result::Error::RollbackTransaction)?;
+                    crate::db::apply_invite(
+                        &mut conn,
+                        &crate::db::InviteCommand {
+                            request_id,
+                            id,
+                            code: uuid::Uuid::new_v4().to_string(),
+                            expires_at,
+                            max_uses,
+                            join_mesh,
+                            applied_at: chrono::Utc::now().naive_utc(),
+                        },
+                    )
+                })();
+                let _ = reply.send(result);
+                continue;
+            }
+        };
+        let (response, snapshots) = control_response(
+            &mut conn,
+            &peer,
+            &hex_encode(&worker_key.public().encode_protobuf()),
+            &worker_key,
+            &worker_network,
+            request,
+        );
+        let mut pushes = Vec::new();
+        for snapshot in snapshots {
+            let identity = crate::db::control_identity_for_node(&mut conn, snapshot.node_id)
+                .expect("cannot read committed topology recipient");
+            let now = chrono::Utc::now().timestamp_millis();
+            let envelope = cat4igp_shared::control::seal_topology_snapshot(
+                &worker_key,
+                &identity.encryption_key,
+                cat4igp_shared::control::MessageMeta {
+                    message_id: uuid::Uuid::new_v4().simple().to_string(),
+                    network_id: worker_network.clone(),
+                    recipient_node_id: snapshot.node_id,
+                    issued_at_ms: now,
+                    expires_at_ms: now + 60_000,
+                    topology_revision: snapshot.revision,
+                },
+                &snapshot,
+            )
+            .expect("cannot seal committed topology");
+            pushes.push((
+                snapshot.node_id,
+                serde_json::to_vec(&envelope).expect("cannot serialize topology"),
+            ));
+        }
+        if completed
+            .blocking_send((peer, channel, response, pushes))
+            .is_err()
+        {
+            break;
+        }
+    }
+    conn
 }
 
 #[tokio::main]
@@ -529,10 +540,113 @@ async fn main() -> Result<(), String> {
     dotenv().ok();
     tracing_subscriber::fmt::init();
     let args: Vec<_> = env::args_os().skip(1).collect();
+    if args.as_slice() == ["verify-recovery"] {
+        if env::var("CLUSTER_MAINTENANCE_STOPPED").as_deref() != Ok("true") {
+            return Err("offline verification requires CLUSTER_MAINTENANCE_STOPPED=true".into());
+        }
+        let required = |name| env::var(name).map_err(|_| format!("{name} required"));
+        let report = raft_storage::verify_recovery(
+            &required("RECOVERY_FILE")?, &required("RECOVERY_KIND")?,
+            &required("DISCOVERY_CLUSTER_ID")?, &required("DISCOVERY_SIGNING_KEY")?,
+            &required("RECOVERY_ENCRYPTION_KEY")?,
+        ).map_err(|_| "recovery verification rejected: schema, identity, snapshot or consensus inconsistency (no secrets reported)".to_string())?;
+        println!("{report}");
+        return Ok(());
+    }
+    if args.as_slice() == ["apply-transport-rotation"] {
+        return cluster::offline_transport();
+    }
+    if args.as_slice() == ["discover-replica"] || args.as_slice() == ["join-replica"] {
+        let pin = identity::PublicKey::try_decode_protobuf(&hex_decode(
+            &env::var("DISCOVERY_SIGNING_KEY").map_err(
+                |_| "DISCOVERY_SIGNING_KEY must be a trusted protobuf public key in hex",
+            )?,
+        )?)
+        .map_err(|e| e.to_string())?;
+        let bootstrap = env::var("DISCOVERY_BOOTSTRAP")
+            .map_err(|_| "DISCOVERY_BOOTSTRAP must be a trusted IP/TCP/p2p address")?
+            .parse()
+            .map_err(|_| "invalid discovery bootstrap")?;
+        let cluster =
+            env::var("DISCOVERY_CLUSTER_ID").map_err(|_| "DISCOVERY_CLUSTER_ID must be set")?;
+        let key = if args.as_slice() == ["join-replica"] {
+            let identity_path =
+                env::var("REPLICA_IDENTITY_FILE").map_err(|_| "REPLICA_IDENTITY_FILE required")?;
+            if !std::path::Path::new(&identity_path).is_file() {
+                return Err("join requires an existing distinct replica identity".into());
+            }
+            crate::raft_network::replica_identity(std::path::Path::new(
+                &env::var("REPLICA_IDENTITY_FILE").map_err(|_| "REPLICA_IDENTITY_FILE required")?,
+            ))
+            .map_err(|e| e.to_string())?
+        } else {
+            identity::Keypair::from_protobuf_encoding(&hex_decode(
+            &env::var("DISCOVERY_PRIVATE_KEY").map_err(|_| "DISCOVERY_PRIVATE_KEY must contain the persistent joining transport identity in hex")?,
+        )?).map_err(|e| e.to_string())?
+        };
+        let revision = env::var("DISCOVERY_MINIMUM_REVISION")
+            .map_err(|_| "DISCOVERY_MINIMUM_REVISION must be set")?
+            .parse()
+            .map_err(|_| "invalid discovery minimum revision")?;
+        if args.as_slice() == ["join-replica"] {
+            let request = cat4igp_shared::discovery::join::Request {
+                application_version: cat4igp_shared::discovery::join::APPLICATION_VERSION,
+                cluster_id: cluster,
+                request_id: env::var("REPLICA_JOIN_REQUEST_ID")
+                    .map_err(|_| "stable REPLICA_JOIN_REQUEST_ID required")?,
+                node_id: env::var("REPLICA_NODE_ID")
+                    .map_err(|_| "REPLICA_NODE_ID required")?
+                    .parse()
+                    .map_err(|_| "invalid replica NodeId")?,
+                address: env::var("REPLICA_ADDRESS")
+                    .map_err(|_| "REPLICA_ADDRESS required")?
+                    .parse()
+                    .map_err(|_| "invalid replica address")?,
+                code: env::var("REPLICA_JOIN_CODE").map_err(|_| "REPLICA_JOIN_CODE required")?,
+            };
+            let response = cat4igp_shared::discovery::join::request(
+                &key,
+                &pin,
+                &[bootstrap],
+                revision,
+                request.clone(),
+            )
+            .await?;
+            cluster::save_join(
+                &env::var("CLUSTER_CONFIG_FILE").map_err(|_| "CLUSTER_CONFIG_FILE required")?,
+                env::var("REPLICA_IDENTITY_FILE").map_err(|_| "REPLICA_IDENTITY_FILE required")?,
+                env::var("REPLICA_LISTEN_ADDRESS")
+                    .map_err(|_| "REPLICA_LISTEN_ADDRESS required")?
+                    .parse()
+                    .map_err(|_| "invalid learner listen address")?,
+                &request,
+                &response,
+            )?;
+            println!(
+                "Committed learner bootstrap saved; start server with CLUSTER_CONFIG_FILE, then explicitly activate learner."
+            );
+            return Ok(());
+        }
+        let proof = cat4igp_shared::discovery::transport::discover(
+            &key,
+            &pin,
+            &cluster,
+            cat4igp_shared::discovery::Role::Replica,
+            &[bootstrap],
+            revision,
+        )
+        .await?;
+        println!(
+            "{}",
+            String::from_utf8(cat4igp_shared::discovery::encode(&proof)?)
+                .map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
     let manual = match args.as_slice() {
         [] => false,
         [command] if command == "migrate" => true,
-        _ => return Err("usage: cat4igp-server [migrate]".into()),
+        _ => return Err("usage: cat4igp-server [migrate|discover-replica|join-replica]".into()),
     };
     let apply = if manual {
         true
@@ -546,14 +660,37 @@ async fn main() -> Result<(), String> {
     };
     let database_url =
         env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set".to_string())?;
+    if !manual {
+        if let Ok(path) = env::var("CLUSTER_CONFIG_FILE") {
+            return cluster::serve(&path, database_url, apply).await;
+        }
+        if env::var_os("CLUSTER_CONFIG_FILE").is_some() {
+            return Err("CLUSTER_CONFIG_FILE must be UTF-8".into());
+        }
+    }
     let mut conn = diesel::SqliteConnection::establish(&database_url)
         .map_err(|e| format!("Cannot open database: {e}"))?;
+    db::configure_connection(&mut conn).map_err(|e| format!("Cannot configure database: {e}"))?;
     db::migrate(&mut conn, apply).map_err(|e| format!("Database migration failed: {e}"))?;
     drop(conn);
     if manual {
         return Ok(());
     }
-    let app = router::make_router().await.unwrap();
+    let mut conn = diesel::SqliteConnection::establish(&database_url).map_err(|e| e.to_string())?;
+    use diesel::RunQueryDsl;
+    #[derive(diesel::QueryableByName)]
+    struct ClusterCount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    let cluster = diesel::sql_query("SELECT count(*) AS count FROM raft_meta WHERE key = 'replica_binding' OR key = 'vote' OR key = 'applied'")
+        .get_result::<ClusterCount>(&mut conn).map_err(|e| e.to_string())?;
+    if cluster.count != 0 {
+        return Err("cluster database cannot run standalone; configure explicit recovery".into());
+    }
+    drop(conn);
+    let (jobs, work) = tokio::sync::mpsc::channel(DATABASE_QUEUE_CAPACITY);
+    let app = router::make_router(jobs.clone()).await.unwrap();
     let listener = tokio::net::TcpListener::bind(
         env::var("BIND_HOST_PORT").expect("BIND_HOST_PORT must be set"),
     )
@@ -561,7 +698,44 @@ async fn main() -> Result<(), String> {
     .unwrap();
     tokio::select! {
         result = axum::serve(listener, app) => result.unwrap(),
-        result = run_control_plane() => panic!("control plane stopped: {result:?}"),
+        result = run_control_plane(jobs, work) => return Err(format!("control plane stopped: {result:?}")),
+        result = run_discovery() => return Err(format!("discovery stopped: {result}")),
     }
     Ok(())
 }
+
+async fn run_discovery() -> String {
+    async {
+        let path = match env::var("DISCOVERY_ROSTER_FILE") {
+            Err(env::VarError::NotPresent) => {
+                return std::future::pending::<Result<(), String>>().await;
+            }
+            Err(error) => return Err(error.to_string()),
+            Ok(path) => path,
+        };
+        // ponytail: operator-signed expiring roster only; replace with committed
+        // roster refresh when HA authority exists. No local membership fabrication.
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        file.take(cat4igp_shared::discovery::MAX_MESSAGE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        let roster = cat4igp_shared::discovery::decode(&bytes)?;
+        let key = control_keypair()?;
+        let mut swarm = cat4igp_shared::discovery::transport::swarm(&key)?;
+        let listen = env::var("DISCOVERY_LISTEN_ADDRESS")
+            .map_err(|_| "DISCOVERY_LISTEN_ADDRESS must be set")?
+            .parse()
+            .map_err(|_| "invalid discovery listen address")?;
+        swarm.listen_on(listen).map_err(|e| e.to_string())?;
+        cat4igp_shared::discovery::transport::serve(swarm, key, roster).await
+    }
+    .await
+    .err()
+    .unwrap_or_else(|| "unexpected completion".into())
+}
+
+#[cfg(test)]
+#[path = "main_test.rs"]
+mod submission_tests;

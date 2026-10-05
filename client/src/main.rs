@@ -41,8 +41,17 @@ enum Commands {
         invite: String,
     },
 
+    /// Register using a sensitive JSON bundle received over a trusted channel
+    RegisterBundle {
+        #[arg(long, value_name = "FILE")]
+        bundle: PathBuf,
+    },
+
     /// Daemon control commands
     Status,
+
+    /// Gracefully stop the daemon
+    Stop,
 
     /// Generate a default configuration file
     GenConfig {
@@ -99,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             start_daemon(client_config).await?;
         }
 
-        Some(Commands::Register { server, invite }) => {
+        Some(command @ (Commands::Register { .. } | Commands::RegisterBundle { .. })) => {
             let client_config = if config_path.exists() {
                 config::ClientConfig::from_file(&config_path)?
             } else {
@@ -108,9 +117,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let client = DaemonClient::new(&client_config.daemon_socket, &client_config.data_dir)?;
 
-            let request = DaemonRequest::Register {
-                address: server,
-                invite_code: invite,
+            let request = match command {
+                Commands::Register { server, invite } => DaemonRequest::Register {
+                    address: server,
+                    invite_code: invite,
+                },
+                Commands::RegisterBundle { bundle } => {
+                    use std::io::Read;
+                    let mut contents = String::new();
+                    std::fs::File::open(bundle)?
+                        .take(16 * 1024 + 1)
+                        .read_to_string(&mut contents)?;
+                    config::ServerConfig::from_bundle(&contents)?;
+                    DaemonRequest::RegisterBundle { bundle: contents }
+                }
+                _ => unreachable!(),
             };
 
             match client.send_request(request).await? {
@@ -128,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Some(Commands::Status) => {
+        Some(command @ (Commands::Status | Commands::Stop)) => {
             let client_config = if config_path.exists() {
                 config::ClientConfig::from_file(&config_path)?
             } else {
@@ -137,8 +158,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let client = DaemonClient::new(&client_config.daemon_socket, &client_config.data_dir)?;
 
-            let request = DaemonRequest::Status;
+            let request = if matches!(command, Commands::Stop) {
+                DaemonRequest::Shutdown
+            } else {
+                DaemonRequest::Status
+            };
             match client.send_request(request).await? {
+                daemon::protocol::DaemonResponse::Ok(message) => {
+                    println!("✓ {}", message.unwrap_or_default());
+                }
                 daemon::protocol::DaemonResponse::Status {
                     running,
                     server_configured,
@@ -314,7 +342,12 @@ async fn start_daemon(config: config::ClientConfig) -> Result<(), Box<dyn std::e
     println!("Daemon is running...");
 
     // Run the daemon's Unix socket server
-    daemon.run().await?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = daemon.run() => result?,
+        result = tokio::signal::ctrl_c() => result?,
+        _ = terminate.recv() => {},
+    }
 
     Ok(())
 }

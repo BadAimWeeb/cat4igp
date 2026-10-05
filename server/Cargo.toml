@@ -19,4 +19,11 @@ uuid = { version = "1.19.0", features = ["v4"] }
 cat4igp-shared = { workspace = true }
 libp2p = { workspace = true }
 rand08 = { package = "rand", version = "0.8" }
+subtle = "2"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# ponytail: SQLite storage-v2 adapter pinned; no HA runtime until transport/startup/write routing are wired.
+openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
+
+[dev-dependencies]
+wireguard-control = "1.7.1"
+tempfile = "3.8"
