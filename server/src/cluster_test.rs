@@ -1862,6 +1862,33 @@ async fn joint_removal_surviving_leader_authority() {
     follower_retry_rehearsal(true).await;
 }
 
+async fn expect_rejection(
+    services: &[Service],
+    nodes: &[Node],
+    source: usize,
+    operation: Operation,
+    rejected: fn(&Outcome) -> bool,
+    stage: &str,
+) {
+    // ponytail: quorum-ready negative checks retry only Unavailable under the
+    // existing deadline; successful unauthorized operations always fail.
+    let mut diagnostic = String::new();
+    let result = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let before: Vec<_> = nodes.iter().map(|n| n.metrics().borrow().clone()).collect();
+            let outcome = services[source].submit(operation.clone()).await;
+            let busy: Vec<_> = services.iter().map(|s| s.allocation.try_lock().is_err()).collect();
+            let ready = services[source].submit(Operation::Ready).await;
+            diagnostic = format!("{stage}: {outcome:?}; ready={ready:?}; allocation_busy={busy:?}; before={before:?}; after={:?}", nodes.iter().map(|n| n.metrics().borrow().clone()).collect::<Vec<_>>());
+            if rejected(&outcome) { return; }
+            assert!(matches!(outcome, Outcome::Unavailable), "{diagnostic}");
+            eprintln!("transient negative assertion: {diagnostic}");
+            tokio::task::yield_now().await;
+        }
+    }).await;
+    assert!(result.is_ok(), "rejection deadline: {diagnostic}");
+}
+
 async fn follower_retry_rehearsal(surviving_election: bool) {
     tokio::time::timeout(Duration::from_secs(90), async {
         let root = std::env::temp_dir().join(format!("cat4igp-forward-{}", uuid::Uuid::new_v4()));
@@ -2048,7 +2075,9 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         assert!(matches!(services[follower].submit(Operation::GrantServing(unknown_grant)).await, Outcome::Roster(Err(_))));
         assert!(matches!(services[follower].submit(Operation::PromoteLearner(9)).await, Outcome::Promotion(Err(_))));
         assert!(matches!(services[follower].submit(Operation::ActivateLearner(9)).await, Outcome::Learner(Ok(()))));
-        assert!(matches!(services[follower].submit(Operation::PromoteLearner(9)).await, Outcome::Promotion(Err(_))));
+        expect_rejection(&services, &nodes, follower, Operation::PromoteLearner(9),
+            |outcome| matches!(outcome, Outcome::Promotion(Err(error)) if error == "learner has not caught up"),
+            "unstarted learner promotion").await;
         assert!(matches!(services[follower].submit(Operation::GrantServing(grant.clone())).await, Outcome::Roster(Err(_))));
         let (fourth_node, fourth_store, fourth_task, fourth_service) = start(config, fourth_path.clone(), psk).await.unwrap();
         assert!(matches!(services[follower].submit(Operation::PromoteLearner(99)).await, Outcome::Promotion(Err(_))));
@@ -2245,7 +2274,9 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
             }
         }).await.unwrap();
         assert!(matches!(services[leader].submit(Operation::Join { source: join_peer, request: join_request.clone() }).await, Outcome::Join(JoinResponse::Rejected)));
-        assert!(matches!(services[leader].submit(Operation::ActivateLearner(9)).await, Outcome::Learner(Err(_))));
+        expect_rejection(&services, &nodes, leader, Operation::ActivateLearner(9),
+            |outcome| matches!(outcome, Outcome::Learner(Err(error)) if error == "no committed pending admission"),
+            "revoked learner activation").await;
         assert!(matches!(services[leader].submit(Operation::PromoteLearner(9)).await, Outcome::Promotion(Err(_))));
         assert!(matches!(services[leader].submit(Operation::GrantServing(grant.clone())).await, Outcome::Roster(Err(_))));
         assert!(matches!(services[leader].submit(Operation::Discovery { query: query.clone(), source: query.requester, serving: join_peer }).await, Outcome::Discovery(Err(_))));
