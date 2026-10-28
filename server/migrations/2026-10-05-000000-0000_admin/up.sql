@@ -1,0 +1,2 @@
+CREATE TABLE administrator (id INTEGER PRIMARY KEY CHECK(id = 1), username TEXT NOT NULL, password_hash TEXT NOT NULL);
+CREATE TABLE administrator_results (request_id TEXT PRIMARY KEY NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL);

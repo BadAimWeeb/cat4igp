@@ -649,6 +649,7 @@ pub(crate) fn apply_roster(
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum Operation {
+    Admin(crate::admin::Operation),
     AffectedSnapshots {
         principal: libp2p::PeerId,
         serving: libp2p::PeerId,
@@ -672,6 +673,9 @@ pub(crate) enum Operation {
     },
     // Admitted-only prerequisite, never an admission or membership grant.
     VerifyReplicaCode(String),
+    JoinBundle {
+        bootstrap: libp2p::Multiaddr,
+    },
     ActivateLearner(u64),
     PromoteLearner(u64),
     RevokeReplica(u64),
@@ -681,6 +685,11 @@ pub(crate) enum Operation {
     },
     Roster(ControllerRoster),
     GrantServing(ServingGrant),
+    BrowserGrant {
+        request_id: String,
+        expected_revision: u64,
+        grant: ServingGrant,
+    },
     RenewRoster,
     PrepareTransport(TransportCredential),
     CompleteTransport,
@@ -690,6 +699,14 @@ pub(crate) enum Operation {
         max_uses: Option<i32>,
         join_mesh: Option<i32>,
     },
+    // Rolling upgrade: open/close the compatibility window; feature conflicts
+    // are gated while any peer epoch is behind the leader's.
+    OpenEpochWindow(u8),
+    CloseEpochWindow,
+    WindowStatus,
+    // Rolling upgrade: any bound peer's answer to the leader's automatic epoch
+    // probe. No state mutation, just the peer's binary epoch.
+    ProbeEpoch,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -710,6 +727,7 @@ impl std::fmt::Debug for Operation {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Outcome {
+    Admin(Result<serde_json::Value, String>),
     AffectedSnapshots(Vec<cat4igp_shared::control::EncryptedEnvelope>),
     Client(cat4igp_shared::control::ControlResponse),
     Ready,
@@ -718,6 +736,7 @@ pub(crate) enum Outcome {
     Roster(Result<(), String>),
     ReplicaCode(Result<ReplicaCode, String>),
     VerifiedReplicaCode(bool),
+    JoinBundle(Result<cat4igp_shared::discovery::join::Bundle, String>),
     Learner(Result<(), String>),
     Promotion(Result<(), String>),
     Revocation(Result<(), String>),
@@ -726,6 +745,9 @@ pub(crate) enum Outcome {
     Redirect(u64),
     Unavailable,
     Transport(Result<TransportRotation, String>),
+    EpochWindow(Result<crate::raft_storage::EpochWindow, String>),
+    WindowOpen(bool),
+    EpochProbe(Result<u8, String>),
 }
 
 #[derive(Clone)]
@@ -739,16 +761,165 @@ pub(crate) struct Service {
     allocation: Arc<tokio::sync::Mutex<()>>,
     cluster_psk: libp2p::pnet::PreSharedKey,
     transport_credential: TransportCredential,
+    // Reports this binary's application epoch to the leader's automatic probes.
+    // Only test fixtures ever override it; normal startup pins the binary epoch.
+    epoch_report: std::sync::Arc<std::sync::atomic::AtomicU8>,
     #[cfg(test)]
     interrupt_revocation: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Service {
+    async fn committed_window(
+        &self,
+    ) -> Option<crate::raft_storage::EpochWindow> {
+        self.store
+            .run(|conn| crate::raft_storage::get(conn, "epoch_window"))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    // Epoch-4-only actions must not be dispatched while a lagging peer epoch is
+    // in the quorum because an older follower cannot decode them and stalls.
+    fn epoch_feature_available(&self, action: &crate::admin::Action, window_open: bool) -> bool {
+        let epoch_gated = matches!(
+            action,
+            crate::admin::Action::SetMeshFec { .. }
+                | crate::admin::Action::CreateMesh { fec: true, .. }
+        );
+        !epoch_gated || !window_open
+    }
+
+    // Leader-side rolling-upgrade reconciliation across all bound replicas.
+    // Pending learners are excluded: a not-yet-active learner is not a quorum
+    // member and reports through admission, not this loop.
+    async fn reconcile_epoch_window(&self) -> Outcome {
+        let metrics = self.node.metrics().borrow().clone();
+        let Some(network) = &self.network else {
+            return Outcome::Unavailable;
+        };
+        let mut minimum_peer = None;
+        for id in metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .filter(|id| *id != metrics.id)
+            .collect::<Vec<_>>()
+        {
+            match network.forward(id, Operation::ProbeEpoch).await {
+                Outcome::EpochProbe(Ok(epoch)) if epoch < cat4igp_shared::compat::APPLICATION_VERSION => {
+                    minimum_peer.get_or_insert(epoch);
+                }
+                Outcome::EpochProbe(_) => (),
+                // Unreachable peer keeps a stable fingerprint at the compat floor;
+                // using distinguishable values per-failure would churn the ledger.
+                _ => {
+                    let floor = cat4igp_shared::compat::MIN_SUPPORTED_VERSION;
+                    minimum_peer.get_or_insert(floor);
+                }
+            }
+        }
+        let Some(minimum_peer) = minimum_peer
+        else {
+            // No lagging peer observed: every bound voter answered at the current
+            // epoch, or the probes could not resolve a report (unavailable counts
+            // as lagging? no — fail-open would commit epoch-gated writes against a
+            // potentially stale peer; treat as lagging and retry next tick).
+            return Outcome::WindowOpen(false);
+        };
+        let desired = crate::raft_storage::EpochWindow::Mixed {
+            epoch: cat4igp_shared::compat::APPLICATION_VERSION,
+            minimum_peer,
+        };
+        if self.committed_window().await.as_ref() == Some(&desired) {
+            return Outcome::WindowOpen(true);
+        }
+        match self.node.client_write(Command::EpochWindow(desired.clone())).await {
+            Ok(reply) if reply.data.is_ok() => Outcome::EpochWindow(Ok(desired)),
+            _ => Outcome::Unavailable,
+        }
+    }
+
+    async fn commit_epoch_window_if_stable(&self) -> Outcome {
+        let metrics = self.node.metrics().borrow().clone();
+        let Some(network) = &self.network else {
+            return Outcome::Unavailable;
+        };
+        // A lagging peer keeps the window open; only a unanimous current-epoch
+        // report closes it. A single missing/stale probe defers, never closes.
+        let mut lagging = false;
+        for id in metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .filter(|id| *id != metrics.id)
+            .collect::<Vec<_>>()
+        {
+            if !matches!(
+                network.forward(id, Operation::ProbeEpoch).await,
+                Outcome::EpochProbe(Ok(epoch)) if epoch >= cat4igp_shared::compat::APPLICATION_VERSION
+            ) {
+                lagging = true;
+            }
+        }
+        if lagging {
+            return Outcome::WindowOpen(true);
+        }
+        let desired = crate::raft_storage::EpochWindow::Stable {
+            epoch: cat4igp_shared::compat::APPLICATION_VERSION,
+        };
+        if self.committed_window().await.as_ref() == Some(&desired) {
+            return Outcome::WindowOpen(false);
+        }
+        match self.node.client_write(Command::EpochWindow(desired.clone())).await {
+            Ok(reply) if reply.data.is_ok() => Outcome::EpochWindow(Ok(desired)),
+            _ => Outcome::Unavailable,
+        }
+    }
+
+    // A mixed window closes automatically only when the last upgrade in the previous
+    // check succeeded; the lagging check runs first so nothing spuriously closes.
+    async fn schedule_window(&self) {
+        let mut timer = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            timer.tick().await;
+            let metrics = self.node.metrics().borrow().clone();
+            if metrics.current_leader != Some(metrics.id) {
+                continue;
+            }
+            let window_open = self
+                .committed_window()
+                .await
+                .is_some_and(|window| window.window_open());
+            let outcome = if window_open {
+                self.commit_epoch_window_if_stable().await
+            } else {
+                self.reconcile_epoch_window().await
+            };
+            match outcome {
+                Outcome::WindowOpen(state) => {
+                    eprintln!("[cluster] rolling-upgrade window state: open={state}");
+                }
+                Outcome::EpochWindow(Ok(window)) => {
+                    eprintln!("[cluster] committed rolling-upgrade window: {window:?}");
+                }
+                _ => (),
+            }
+        }
+    }
+
     pub(crate) async fn local(&self, operation: Operation) -> Outcome {
         if let Operation::Invite { request_id, .. } = &operation {
             if request_id.is_empty() || request_id.len() > 128 || !request_id.is_ascii() {
                 return Outcome::Invite(Err("invalid request ID".into()));
             }
+        }
+        // Any bound replica answers the rolling-upgrade epoch probe about itself;
+        // it must not redirect, or the leader's probe would loop forever.
+        if matches!(operation, Operation::ProbeEpoch) {
+            return Outcome::EpochProbe(Ok(self.epoch_report.load(
+                std::sync::atomic::Ordering::SeqCst,
+            )));
         }
         let metrics = self.node.metrics().borrow().clone();
         if metrics.current_leader != Some(metrics.id) {
@@ -765,6 +936,34 @@ impl Service {
         // OpenRaft resolves them. Never reuse a locally selected ID while a write is pending.
         tokio::spawn(async move {
             let _guard = guard;
+            let mut receipt = None;
+            let operation = if let Operation::BrowserGrant { request_id, expected_revision, grant } = operation {
+                if request_id.is_empty() || request_id.len() > 100 || !request_id.is_ascii() || grant.node_id == 0 {
+                    return Outcome::Admin(Err("invalid serving grant".into()));
+                }
+                if service.node.ensure_linearizable().await.is_err() {
+                    return Outcome::Unavailable;
+                }
+                let key = format!("admin:1:grant_serving:{request_id}");
+                let fingerprint = serde_json::json!({"principal":"administrator:1", "action":"grant_serving", "expected_roster_revision":expected_revision,"grant":grant}).to_string();
+                let lookup_key = key.clone();
+                let lookup_fingerprint = fingerprint.clone();
+                match service.store.run(move |conn| {
+                    if let Some(result) = crate::admin::serving_receipt(conn, &lookup_key, &lookup_fingerprint)? {
+                        return Ok(Some(result));
+                    }
+                    if read_authority(conn)?.roster.as_ref().map(|r| r.body.revision) != Some(expected_revision) {
+                        return Ok(Some(Err("roster revision conflict".into())));
+                    }
+                    Ok(None)
+                }).await {
+                    Ok(Some(result)) => return Outcome::Admin(result.and_then(|v| serde_json::from_str(v.as_deref().unwrap_or("null")).map_err(|_| "unavailable".into()))),
+                    Ok(None) => (),
+                    Err(_) => return Outcome::Unavailable,
+                }
+                receipt = Some((key, fingerprint, expected_revision));
+                Operation::GrantServing(grant)
+            } else { operation };
             let operation = if let Operation::GrantServing(grant) = operation {
                 if service.node.ensure_linearizable().await.is_err() {
                     return Outcome::Unavailable;
@@ -944,6 +1143,7 @@ impl Service {
                     }
                 }
                 Operation::GrantServing(_) => unreachable!(),
+                Operation::BrowserGrant { .. } => unreachable!(),
                 Operation::RevokeReplica(id) => {
                     if service.node.ensure_linearizable().await.is_err() {
                         return Outcome::Unavailable;
@@ -1263,6 +1463,45 @@ impl Service {
                         Err(_) => Outcome::Unavailable,
                     }
                 }
+                Operation::JoinBundle { bootstrap } => {
+                    if service.node.ensure_linearizable().await.is_err() {
+                        return Outcome::Unavailable;
+                    }
+                    let admitted = service.admitted.clone();
+                    let cluster_id = service.cluster_id.clone();
+                    let bundle = match service
+                        .store
+                        .run(move |conn| {
+                            check_bindings(conn, &admitted)?;
+                            let authority = read_authority(conn)?;
+                            let code = read_code(conn)?.ok_or("no enrollment code")?;
+                            // Floor at the revision the operator's authority currently
+                            // serves; stale-roster substitution fails closed joiner-side.
+                            let minimum_revision =
+                                authority.roster.as_ref().map_or(1, |r| r.body.revision);
+                            Ok((authority.signing_key, code, minimum_revision))
+                        })
+                        .await
+                    {
+                        Ok((signing_key, code, minimum_revision)) => {
+                            cat4igp_shared::discovery::join::Bundle {
+                                application_version:
+                                    cat4igp_shared::discovery::join::APPLICATION_VERSION,
+                                cluster_id,
+                                signing_key,
+                                bootstrap,
+                                minimum_revision,
+                                code: code.code,
+                                node_id: None,
+                            }
+                        }
+                        Err(_) => return Outcome::Unavailable,
+                    };
+                    if bundle.validate().is_err() {
+                        return Outcome::Unavailable;
+                    }
+                    Outcome::JoinBundle(Ok(bundle))
+                }
                 Operation::AffectedSnapshots {
                     principal,
                     serving,
@@ -1462,11 +1701,67 @@ impl Service {
                     match signed {
                         Err(error) => Outcome::Roster(Err(error.to_string())),
                         Ok(roster) => {
-                            match service.node.client_write(Command::Roster(roster)).await {
+                            let browser = receipt.is_some();
+                            let command = match receipt {
+                                Some((request_id, fingerprint, expected_revision)) => Command::ServingGrant { request_id, fingerprint, expected_revision, roster },
+                                None => Command::Roster(roster),
+                            };
+                            match service.node.client_write(command).await {
+                                Ok(reply) if browser => Outcome::Admin(reply.data.and_then(|v| serde_json::from_str(v.as_deref().unwrap_or("null")).map_err(|_| "unavailable".into()))),
                                 Ok(reply) => Outcome::Roster(reply.data.map(|_| ())),
                                 Err(_) => Outcome::Unavailable,
                             }
                         }
+                    }
+                }
+                Operation::Admin(operation) => {
+                    if service.node.ensure_linearizable().await.is_err() {
+                        return Outcome::Unavailable;
+                    }
+                    match operation {
+                        crate::admin::Operation::Mutate(command) => {
+                            let window_open = service
+                                .committed_window()
+                                .await
+                                .is_some_and(|w| w.window_open());
+                            if !service.epoch_feature_available(&command.action, window_open)
+                            {
+                                return Outcome::Admin(Err(
+                                    "action requires a closed rolling-upgrade window"
+                                        .into(),
+                                ));
+                            }
+                            match service.node.client_write(Command::Admin(command)).await {
+                                Ok(reply) => Outcome::Admin(reply.data.and_then(|value| {
+                                    serde_json::from_str(value.as_deref().unwrap_or("null"))
+                                        .map_err(|_| "unavailable".into())
+                                })),
+                                Err(_) => Outcome::Unavailable,
+                            }
+                        }
+                        crate::admin::Operation::CodeRead => match service.store.run(read_code).await {
+                            Ok(Some(code)) => Outcome::Admin(serde_json::to_value(code).map_err(|_| "unavailable".into())),
+                            Ok(None) => Outcome::Admin(Err("no existing enrollment code; rotate generation 0 explicitly".into())),
+                            Err(_) => Outcome::Unavailable,
+                        },
+                        crate::admin::Operation::Replicas => {
+                            let metrics = service.node.metrics().borrow().clone();
+                            match service.store.run(|conn| crate::admin::read(conn, crate::admin::Operation::Replicas)).await {
+                                Ok(mut value) => {
+                                    value["membership_observation"] = serde_json::json!({"node_id":metrics.id,"leader_id":metrics.current_leader,"membership":metrics.membership_config.membership(),"last_applied":metrics.last_applied,"replication":metrics.replication,"scope":"leader local metrics; not reachability"});
+                                    Outcome::Admin(Ok(value))
+                                }
+                                Err(_) => Outcome::Unavailable,
+                            }
+                        },
+                        operation => match service
+                            .store
+                            .run(move |conn| crate::admin::read(conn, operation))
+                            .await
+                        {
+                            Ok(value) => Outcome::Admin(Ok(value)),
+                            Err(_) => Outcome::Unavailable,
+                        },
                     }
                 }
                 Operation::Invite {
@@ -1488,6 +1783,59 @@ impl Service {
                         Ok(result) => Outcome::Invite(result),
                         Err(_) => Outcome::Unavailable,
                     }
+                }
+                Operation::OpenEpochWindow(minimum_peer) => {
+                    if service.node.ensure_linearizable().await.is_err() {
+                        return Outcome::Unavailable;
+                    }
+                    // Only the exact previous cohort is a valid mixed window; the
+                    // same epoch means no window and anything else is unsupported.
+                    if minimum_peer != cat4igp_shared::compat::APPLICATION_VERSION - 1 {
+                        return Outcome::EpochWindow(Err(
+                            "window floor must be the previous epoch".into(),
+                        ));
+                    }
+                    let command = crate::raft_storage::EpochWindow::Mixed {
+                        epoch: cat4igp_shared::compat::APPLICATION_VERSION,
+                        minimum_peer,
+                    };
+                    match service.node.client_write(Command::EpochWindow(command.clone())).await {
+                        Ok(reply) if reply.data.is_ok() => Outcome::EpochWindow(Ok(command)),
+                        Ok(reply) => Outcome::EpochWindow(Err(
+                            reply.data.err().unwrap_or_else(|| "window rejected".into()),
+                        )),
+                        Err(_) => Outcome::Unavailable,
+                    }
+                }
+                Operation::CloseEpochWindow => {
+                    if service.node.ensure_linearizable().await.is_err() {
+                        return Outcome::Unavailable;
+                    }
+                    // Correctness depends on the operator: command succeeds only when
+                    // the last lagging peer has been upgraded and reproduced before this
+                    // leader's declared uniform-epoch state. The commit records intent.
+                    let command = crate::raft_storage::EpochWindow::Stable {
+                        epoch: cat4igp_shared::compat::APPLICATION_VERSION,
+                    };
+                    match service.node.client_write(Command::EpochWindow(command.clone())).await {
+                        Ok(reply) if reply.data.is_ok() => Outcome::EpochWindow(Ok(command)),
+                        Ok(reply) => Outcome::EpochWindow(Err(
+                            reply.data.err().unwrap_or_else(|| "window rejected".into()),
+                        )),
+                        Err(_) => Outcome::Unavailable,
+                    }
+                }
+                Operation::WindowStatus => {
+                    let window = service.committed_window().await;
+                    match window {
+                        Some(window) => Outcome::WindowOpen(window.window_open()),
+                        None => Outcome::WindowOpen(false),
+                    }
+                }
+                // ProbeEpoch is answered before the leader check in local(); it
+                // cannot reach this dispatched match.
+                Operation::ProbeEpoch => {
+                    Outcome::EpochProbe(Ok(cat4igp_shared::compat::APPLICATION_VERSION))
                 }
             }
         })
@@ -1626,6 +1974,65 @@ impl Service {
     }
 
     async fn submit(&self, operation: Operation) -> Outcome {
+        let operation = match operation {
+            Operation::Admin(crate::admin::Operation::Replica(action)) => {
+                if !self.admitted.contains_key(&self.node.metrics().borrow().id) {
+                    return Outcome::Admin(Err(
+                        "browser replica management requires a bootstrap gateway".into(),
+                    ));
+                }
+                let operation = match action {
+                    crate::admin::ReplicaAction::EnrollmentCode => {
+                        Operation::Admin(crate::admin::Operation::CodeRead)
+                    }
+                    crate::admin::ReplicaAction::JoinBundle { bootstrap } => {
+                        Operation::JoinBundle { bootstrap }
+                    }
+                    crate::admin::ReplicaAction::RotateEnrollmentCode {
+                        expected_generation,
+                    } => Operation::ReplicaCode {
+                        rotate_generation: Some(expected_generation),
+                    },
+                    crate::admin::ReplicaAction::ActivateLearner { node_id } => {
+                        Operation::ActivateLearner(node_id)
+                    }
+                    crate::admin::ReplicaAction::PromoteLearner { node_id } => {
+                        Operation::PromoteLearner(node_id)
+                    }
+                    crate::admin::ReplicaAction::RevokeReplica { node_id } => {
+                        Operation::RevokeReplica(node_id)
+                    }
+                    crate::admin::ReplicaAction::GrantServing {
+                        node_id,
+                        expected_roster_revision,
+                        public_address,
+                        control_address,
+                        request_id,
+                    } => Operation::BrowserGrant {
+                        request_id,
+                        expected_revision: expected_roster_revision,
+                        grant: ServingGrant {
+                            node_id,
+                            public_address,
+                            control_address,
+                        },
+                    },
+                };
+                return match self.submit_replica(operation).await {
+                    Outcome::Admin(result) => Outcome::Admin(result),
+                    Outcome::ReplicaCode(result) => Outcome::Admin(result.and_then(|v| serde_json::to_value(v).map_err(|_| "unavailable".into()))),
+                    Outcome::JoinBundle(result) => Outcome::Admin(result.and_then(|v| serde_json::to_value(v).map_err(|_| "unavailable".into()))),
+                    Outcome::Learner(result) | Outcome::Promotion(result) | Outcome::Revocation(result) => Outcome::Admin(result.map(|_| serde_json::json!({"reconciled":true,"semantics":"desired_state; no request receipt"}))),
+                    Outcome::Roster(Err(_)) => Outcome::Admin(Err("invalid serving grant".into())),
+                    _ => Outcome::Admin(Err("unavailable; outcome may be unknown".into())),
+                };
+            }
+            operation => operation,
+        };
+        self.submit_replica(operation).await
+    }
+
+    async fn submit_replica(&self, operation: Operation) -> Outcome {
         tokio::time::timeout(DEADLINE, async {
             let mut result = self.local(operation.clone()).await;
             // ponytail: two redirects, static admitted bindings; add discovery only with committed admission.
@@ -1767,12 +2174,7 @@ impl Service {
                         {
                             return Err("enrollment principal/key mismatch".into());
                         }
-                        let node_id = crate::schema::nodes::table
-                            .select(diesel::dsl::max(crate::schema::nodes::id))
-                            .first::<Option<i32>>(conn)?
-                            .unwrap_or(0)
-                            .checked_add(1)
-                            .ok_or("node IDs exhausted")?;
+                        let node_id = crate::db::next_management_id(conn, "node")?;
                         Ok(Ok(Command::Enrollment {
                             peer_id: principal.to_string(),
                             command: crate::db::EnrollmentCommand {
@@ -2141,6 +2543,9 @@ async fn start_inner(
         allocation: Arc::new(tokio::sync::Mutex::new(())),
         cluster_psk: psk,
         transport_credential,
+        epoch_report: Arc::new(std::sync::atomic::AtomicU8::new(
+            cat4igp_shared::compat::APPLICATION_VERSION,
+        )),
         #[cfg(test)]
         interrupt_revocation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
@@ -2691,6 +3096,7 @@ pub(crate) async fn serve(path: &str, database: String, apply: bool) -> Result<(
     if config.transport_generation > 0 {
         protected_read(path)?;
     }
+    crate::raft_storage::preflight_application_version(&database)?;
     if config.legacy_import.is_none() {
         let mut conn = diesel::SqliteConnection::establish(&database).map_err(|e| e.to_string())?;
         crate::db::configure_connection(&mut conn).map_err(|e| e.to_string())?;
@@ -2801,6 +3207,13 @@ pub(crate) async fn serve(path: &str, database: String, apply: bool) -> Result<(
                     };
                     let _ = reply.send(result);
                 }
+                crate::DatabaseJob::Admin { operation, reply } => {
+                    let result = match worker_service.submit(Operation::Admin(operation)).await {
+                        Outcome::Admin(result) => result,
+                        _ => Err("unavailable; outcome may be unknown".into()),
+                    };
+                    let _ = reply.send(result);
+                }
                 crate::DatabaseJob::Control(..) => unreachable!("cluster control is not enabled"),
             }
         }
@@ -2811,6 +3224,7 @@ pub(crate) async fn serve(path: &str, database: String, apply: bool) -> Result<(
     let authority_init = service.clone();
     let code_read = service.clone();
     let code_rotate = service.clone();
+    let bundle_read = service.clone();
     let learner = service.clone();
     let promotion = service.clone();
     let revocation = service.clone();
@@ -2935,6 +3349,29 @@ pub(crate) async fn serve(path: &str, database: String, apply: bool) -> Result<(
             }),
         )
         .route(
+            "/operator/replica_join_bundle",
+            axum::routing::get(move |axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| {
+                let service = bundle_read.clone();
+                async move {
+                    let Some(bootstrap) = query.get("bootstrap") else {
+                        return Err(axum::http::StatusCode::BAD_REQUEST);
+                    };
+                    let Ok(bootstrap) = bootstrap.parse::<libp2p::Multiaddr>() else {
+                        return Err(axum::http::StatusCode::BAD_REQUEST);
+                    };
+                    match service.submit(Operation::JoinBundle { bootstrap }).await {
+                        Outcome::JoinBundle(Ok(bundle)) => Ok((
+                            [(axum::http::header::CACHE_CONTROL, "no-store")],
+                            axum::Json(bundle),
+                        )),
+                        _ => Err(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+                    }
+                }
+            }),
+        )
+        .route(
             "/operator/controller_authority",
             axum::routing::get(move || {
                 let service = authority_read.clone();
@@ -2972,6 +3409,7 @@ pub(crate) async fn serve(path: &str, database: String, apply: bool) -> Result<(
             crate::router::auth_middleware_operator,
         ));
     let scheduler = service.clone();
+    let windows = service.clone();
     let readiness = service;
     let app = crate::router::make_router(jobs)
         .await
@@ -2996,6 +3434,7 @@ pub(crate) async fn serve(path: &str, database: String, apply: bool) -> Result<(
     eprintln!("[cluster] committed ingress and opt-in discovery/private control");
     tokio::select! {
         _ = scheduler.schedule_codes() => Err("code scheduler stopped".into()),
+        _ = windows.schedule_window() => Err("epoch window scheduler stopped".into()),
         result = control => Err(format!("private control stopped: {result:?}")),
         result = discovery => Err(format!("public discovery stopped: {result:?}")),
         _ = async {

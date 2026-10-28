@@ -1,0 +1,1 @@
+ALTER TABLE mesh_groups ADD COLUMN auto_wireguard_fec BOOLEAN NOT NULL DEFAULT 0;

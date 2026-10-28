@@ -80,6 +80,41 @@ pub fn authenticate(conn: &mut SqliteConnection, key: &str) -> Result<Node, dies
         .first(conn)
 }
 
+pub(crate) fn identity_revoked(
+    conn: &mut SqliteConnection,
+    peer: &str,
+) -> Result<bool, diesel::result::Error> {
+    #[derive(QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    Ok(
+        diesel::sql_query("SELECT COUNT(*) AS n FROM node_revocations WHERE peer_id=?")
+            .bind::<diesel::sql_types::Text, _>(peer)
+            .get_result::<Count>(conn)?
+            .n
+            != 0,
+    )
+}
+
+pub(crate) fn next_management_id(
+    conn: &mut SqliteConnection,
+    kind: &str,
+) -> Result<i32, diesel::result::Error> {
+    #[derive(QueryableByName)]
+    struct Id {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        id: i32,
+    }
+    diesel::sql_query(
+        "SELECT high_water+1 AS id FROM management_ids WHERE kind=? AND high_water<2147483647",
+    )
+    .bind::<diesel::sql_types::Text, _>(kind)
+    .get_result::<Id>(conn)
+    .map(|r| r.id)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InviteCommand {
     pub request_id: String,
@@ -229,7 +264,7 @@ pub fn register_node(
     };
 
     let node = diesel::insert_into(nodes::table)
-        .values(&new_node)
+        .values((&new_node, nodes::id.eq(next_management_id(conn, "node")?)))
         .get_result::<crate::models::Node>(conn)?;
 
     Ok((node.id, nauthk, inv.override_join_mesh))
@@ -261,6 +296,9 @@ pub fn control_identity_for_peer(
 ) -> Result<crate::models::NodeControlIdentity, diesel::result::Error> {
     use crate::schema::node_control_identities::dsl::*;
 
+    if identity_revoked(conn, peer_id_val)? {
+        return Err(diesel::result::Error::NotFound);
+    }
     node_control_identities
         .filter(peer_id.eq(peer_id_val))
         .select(crate::models::NodeControlIdentity::as_select())
@@ -286,7 +324,7 @@ pub fn bump_control_revision(
     bump_control_revision_at(conn, node_id_val, chrono::Utc::now().naive_utc())
 }
 
-fn bump_control_revision_at(
+pub(crate) fn bump_control_revision_at(
     conn: &mut SqliteConnection,
     node_id_val: i32,
     applied_at: chrono::NaiveDateTime,
@@ -403,7 +441,10 @@ pub fn create_wireguard_tunnel(
         mtu_val,
         endpoint_should_be_ipv6,
         chrono::Utc::now().naive_utc(),
-    )
+    )?;
+    diesel::sql_query("INSERT OR IGNORE INTO tunnel_intents(tunnel_id,kind,mesh_id) SELECT id,'manual',0 FROM wireguard_tunnels WHERE ((node_id_peer1=?1 AND node_id_peer2=?2) OR (node_id_peer1=?2 AND node_id_peer2=?1)) AND endpoint_ipv6=?3")
+        .bind::<diesel::sql_types::Integer,_>(peer1_id).bind::<diesel::sql_types::Integer,_>(peer2_id).bind::<diesel::sql_types::Bool,_>(endpoint_should_be_ipv6).execute(conn)?;
+    Ok(())
 }
 
 fn create_wireguard_tunnel_at(
@@ -448,6 +489,7 @@ fn create_wireguard_tunnel_at(
     diesel::insert_into(wireguard_tunnels::table)
         .values((
             &new_tunnel,
+            wireguard_tunnels::id.eq(next_management_id(conn, "tunnel")?),
             wgt_dsl::created_at.eq(applied_at),
             wgt_dsl::updated_at.eq(applied_at),
         ))
@@ -477,6 +519,16 @@ pub fn topology_snapshot(
     node_id_val: i32,
     revision: i64,
 ) -> Result<cat4igp_shared::control::TopologySnapshot, diesel::result::Error> {
+    use crate::schema::{mesh_groups as mg, tunnel_intents as ti};
+    // A shared tunnel uses FEC if any owning mesh requests it; keep its explicit flag intact.
+    let fec_tunnels = ti::table
+        .inner_join(mg::table.on(ti::mesh_id.eq(mg::id)))
+        .filter(ti::kind.eq("mesh"))
+        .filter(mg::auto_wireguard_fec.eq(true))
+        .select(ti::tunnel_id)
+        .load::<i32>(conn)?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
     let tunnels = get_wireguard_answers(conn, node_id_val)?;
     let tunnels = tunnels
         .into_iter()
@@ -517,7 +569,7 @@ pub fn topology_snapshot(
                 },
                 mtu: tunnel.mtu,
                 endpoint_ipv6: tunnel.endpoint_ipv6,
-                fec: tunnel.fec,
+                fec: tunnel.fec || fec_tunnels.contains(&tunnel.id),
                 faketcp: tunnel.faketcp,
                 created_at: tunnel.created_at.and_utc().timestamp_millis(),
                 updated_at: tunnel.updated_at.and_utc().timestamp_millis(),
@@ -609,7 +661,7 @@ pub fn prepare_enrollment_allocation(
     conn: &mut SqliteConnection,
     invitation: &str,
 ) -> Result<EnrollmentAllocation, diesel::result::Error> {
-    use crate::schema::{invites, mesh_group_memberships as mm, wireguard_tunnels as wt};
+    use crate::schema::{invites, mesh_group_memberships as mm};
     let mesh = invites::table
         .filter(invites::code.eq(invitation))
         .select(invites::override_join_mesh)
@@ -636,10 +688,7 @@ pub fn prepare_enrollment_allocation(
             .ok_or(diesel::result::Error::RollbackTransaction)?;
         allocation.membership = Some((membership, mesh.id));
         if mesh.auto_wireguard {
-            let mut id = wt::table
-                .select(diesel::dsl::max(wt::id))
-                .first::<Option<i32>>(conn)?
-                .unwrap_or(0);
+            let mut id = next_management_id(conn, "tunnel")? - 1;
             let mut peers = get_mesh_members(conn, mesh.id)?;
             peers.sort_by_key(|peer| peer.id);
             for peer in peers {
@@ -710,6 +759,9 @@ pub fn apply_enrollment(
     let fingerprint = serde_json::to_string(request).map_err(json_error)?;
     conn.transaction(|conn| {
         // ponytail: lifetime identity-scoped dedup, one enrollment per peer; add retention only with identity recovery.
+        if identity_revoked(conn, &request.client_peer_id)? {
+            return Ok((ControlResponse::Rejected("identity permanently revoked".into()), vec![]));
+        }
         if let Some(previous) = diesel::sql_query("SELECT peer_id, request_id, fingerprint, result FROM control_enrollment_results WHERE peer_id = ? OR (request_id = ? AND request_id <> '') ORDER BY peer_id LIMIT 1")
             .bind::<Text, _>(&request.client_peer_id)
             .bind::<Text, _>(&request.request_id)
@@ -739,10 +791,11 @@ pub fn apply_enrollment(
                 None => vec![],
             };
             let mut ids = std::collections::BTreeSet::new();
-            command.node_id > 0 && !command.auth_key.is_empty()
+            let next_tunnel = next_management_id(conn, "tunnel")?;
+            command.node_id >= next_management_id(conn, "node")? && !command.auth_key.is_empty()
                 && command.allocation.membership.map(|(id, mesh)| (id > 0, mesh)) == mesh.map(|mesh| (true, mesh))
                 && command.allocation.tunnels.iter().map(|&(_, peer, mtu, ipv6)| (peer, mtu, ipv6)).collect::<Vec<_>>() == expected
-                && command.allocation.tunnels.iter().all(|&(id, _, _, _)| id > 0 && ids.insert(id))
+                && command.allocation.tunnels.iter().all(|&(id, _, _, _)| id >= next_tunnel && ids.insert(id))
         } else { false };
         let mut allocation_available = nodes::table.find(command.node_id)
             .select(nodes::id).first::<i32>(conn).optional()?.is_none();
@@ -779,6 +832,10 @@ pub fn apply_enrollment(
                     wt::node_id_peer1.eq(command.node_id), wt::node_id_peer2.eq(peer),
                     wt::mtu.eq(mtu), wt::endpoint_ipv6.eq(ipv6),
                     wt::created_at.eq(command.applied_at), wt::updated_at.eq(command.applied_at))).execute(conn)?;
+                if let Some((_, mesh_id)) = command.allocation.membership {
+                    diesel::sql_query("INSERT INTO tunnel_intents(tunnel_id,kind,mesh_id) VALUES (?,'mesh',?)")
+                        .bind::<diesel::sql_types::Integer,_>(id).bind::<diesel::sql_types::Integer,_>(mesh_id).execute(conn)?;
+                }
             }
             for node_id in tunnel_node_ids_for_node(conn, command.node_id)? {
                 let revision = bump_control_revision_at(conn, node_id, command.applied_at)?;
@@ -1002,7 +1059,7 @@ pub fn join_mesh(
     )
 }
 
-fn join_mesh_at(
+pub(crate) fn join_mesh_at(
     conn: &mut SqliteConnection,
     node_id_val: i32,
     mesh_id_val: i32,
@@ -1061,6 +1118,8 @@ fn join_mesh_at(
                 )?;
             }
         }
+        diesel::sql_query("INSERT OR IGNORE INTO tunnel_intents(tunnel_id,kind,mesh_id) SELECT t.id,'mesh',? FROM wireguard_tunnels t JOIN mesh_group_memberships a ON a.node_id=t.node_id_peer1 AND a.mesh_group_id=? JOIN mesh_group_memberships b ON b.node_id=t.node_id_peer2 AND b.mesh_group_id=?")
+            .bind::<diesel::sql_types::Integer,_>(mesh_id_val).bind::<diesel::sql_types::Integer,_>(mesh_id_val).bind::<diesel::sql_types::Integer,_>(mesh_id_val).execute(conn)?;
     }
 
     Ok(())
@@ -1100,6 +1159,7 @@ pub fn create_mesh_group(
     let result = diesel::insert_into(mesh_groups::table)
         .values((
             &new_mesh,
+            mesh_groups::id.eq(next_management_id(conn, "mesh")?),
             mesh_groups::created_at.eq(chrono::Utc::now().naive_utc()),
         ))
         .get_result::<crate::models::MeshGroup>(conn)?;

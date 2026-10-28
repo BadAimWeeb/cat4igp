@@ -480,6 +480,69 @@ async fn test_set_server_config() {
 }
 
 #[tokio::test]
+async fn set_server_preserves_pending_and_completed_enrollment() {
+    let directory = TempDir::new().unwrap();
+    let config = ClientConfig {
+        data_dir: directory.path().to_owned(),
+        ..Default::default()
+    };
+    let daemon = Daemon::new(config).await.unwrap();
+    let request = || DaemonRequest::SetServer {
+        address: "original-controller".into(),
+        invite_code: "original-invite".into(),
+    };
+    assert!(matches!(
+        daemon.handle_request(request(), daemon.get_secret()).await,
+        DaemonResponse::Ok(_)
+    ));
+    let authority = libp2p::identity::Keypair::generate_ed25519();
+    for stage in 0..3 {
+        let mut saved = ServerConfig::load(directory.path()).unwrap();
+        if stage >= 1 {
+            saved.controller_peer_id = Some(authority.public().to_peer_id().to_string());
+            saved.controller_signing_key = Some(
+                authority
+                    .public()
+                    .encode_protobuf()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+            );
+            saved.enrollment_node_name = Some("original-node".into());
+        }
+        if stage == 2 {
+            saved.control_node_id = Some(42);
+            saved.topology_revision = 7;
+            saved.invite_code.clear();
+        }
+        saved.save(directory.path()).unwrap();
+        *daemon.server_config.lock().await = Some(saved);
+        let before = std::fs::read(directory.path().join("server.json")).unwrap();
+        let memory_before = serde_json::to_value(&*daemon.server_config.lock().await).unwrap();
+        for attempt in [
+            request(),
+            DaemonRequest::SetServer {
+                address: "replacement-controller".into(),
+                invite_code: "replacement-invite".into(),
+            },
+        ] {
+            assert!(matches!(
+                daemon.handle_request(attempt, daemon.get_secret()).await,
+                DaemonResponse::Error(error) if error.contains("refusing to overwrite enrollment")
+            ));
+            assert_eq!(
+                std::fs::read(directory.path().join("server.json")).unwrap(),
+                before
+            );
+            assert_eq!(
+                serde_json::to_value(&*daemon.server_config.lock().await).unwrap(),
+                memory_before
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_auth_failure() {
     let temp_dir = TempDir::new().unwrap();
     let config = ClientConfig {

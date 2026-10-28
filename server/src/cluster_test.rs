@@ -1,3 +1,117 @@
+#[tokio::test]
+async fn startup_epoch_preflight_precedes_migration_and_wal_configuration() {
+    use diesel::{Connection, connection::SimpleConnection};
+    let root = tempfile::tempdir().unwrap();
+    // URI-sensitive characters must remain literal filesystem path bytes.
+    let database = root.path().join("old ?#%.sqlite");
+    let config_path = root.path().join("cluster.json");
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let address = "/ip4/127.0.0.1/tcp/1".parse::<libp2p::Multiaddr>().unwrap();
+    let config = Config {
+        cluster_id: "epoch-preflight".into(),
+        node_id: 1,
+        mode: Mode::Recover,
+        identity_file: root
+            .path()
+            .join("must-not-create.key")
+            .to_str()
+            .unwrap()
+            .into(),
+        listen: address.clone(),
+        replicas: BTreeMap::from([(
+            1,
+            Replica {
+                peer_id: key.public().to_peer_id(),
+                address,
+            },
+        )]),
+        learner: None,
+        cluster_psk: None,
+        transport_generation: 0,
+        legacy_import: None,
+    };
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let mut conn = diesel::SqliteConnection::establish(database.to_str().unwrap()).unwrap();
+    // Deliberately pre-migration schema: startup must not add migration/application tables.
+    conn.batch_execute("CREATE TABLE raft_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE raft_logs (idx TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+    for sql in [
+        "DELETE FROM raft_meta; INSERT INTO raft_meta VALUES ('application_version', '1');",
+        "DELETE FROM raft_meta; INSERT INTO raft_meta VALUES ('application_version', '255');",
+        "DELETE FROM raft_meta; INSERT INTO raft_meta VALUES ('application_version', 'not-json');",
+        "DELETE FROM raft_meta; INSERT INTO raft_meta VALUES ('vote', '{}');",
+        "DELETE FROM raft_meta; INSERT INTO raft_logs VALUES ('0000000000000000', '{}');",
+        "DROP TABLE raft_meta;",
+    ] {
+        conn.batch_execute(sql).unwrap();
+        let before = std::fs::read(&database).unwrap();
+        let error = serve(
+            config_path.to_str().unwrap(),
+            database.to_str().unwrap().into(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("compatibility preflight"), "{error}");
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        assert!(!std::path::Path::new(&config.identity_file).exists());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!std::path::Path::new(&format!("{}{suffix}", database.display())).exists());
+        }
+    }
+    drop(conn);
+    std::fs::write(&database, b"corrupt SQLite file").unwrap();
+    let before = std::fs::read(&database).unwrap();
+    assert!(
+        serve(
+            config_path.to_str().unwrap(),
+            database.to_str().unwrap().into(),
+            true
+        )
+        .await
+        .unwrap_err()
+        .contains("compatibility preflight")
+    );
+    assert_eq!(std::fs::read(&database).unwrap(), before);
+}
+
+#[test]
+fn startup_epoch_preflight_accepts_fresh_legacy_and_current_without_writes() {
+    use diesel::{Connection, RunQueryDsl, connection::SimpleConnection};
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("fresh.sqlite");
+    let path = database.to_str().unwrap();
+    crate::raft_storage::preflight_application_version(path).unwrap();
+    assert!(!database.exists());
+    std::fs::File::create(&database).unwrap();
+    crate::raft_storage::preflight_application_version(path).unwrap();
+    assert_eq!(std::fs::metadata(&database).unwrap().len(), 0);
+    let mut conn = diesel::SqliteConnection::establish(path).unwrap();
+    conn.batch_execute("CREATE TABLE legacy_application (value TEXT);")
+        .unwrap();
+    let before = std::fs::read(&database).unwrap();
+    crate::raft_storage::preflight_application_version(path).unwrap();
+    assert_eq!(std::fs::read(&database).unwrap(), before);
+    conn.batch_execute("CREATE TABLE raft_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE raft_logs (idx TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+    crate::raft_storage::preflight_application_version(path).unwrap();
+    diesel::sql_query("INSERT INTO raft_meta VALUES ('application_version', ?)")
+        .bind::<diesel::sql_types::Text, _>(
+            cat4igp_shared::discovery::join::APPLICATION_VERSION.to_string(),
+        )
+        .execute(&mut conn)
+        .unwrap();
+    let before = std::fs::read(&database).unwrap();
+    crate::raft_storage::preflight_application_version(path).unwrap();
+    assert_eq!(std::fs::read(&database).unwrap(), before);
+    // A read-only connection must see committed metadata in WAL, not just the main file.
+    crate::db::configure_connection(&mut conn).unwrap();
+    conn.batch_execute("UPDATE raft_meta SET value = '1' WHERE key = 'application_version';")
+        .unwrap();
+    assert!(crate::raft_storage::preflight_application_version(path).is_err());
+    for path in [":memory:", "file:missing?mode=rwc", "sqlite://missing"] {
+        assert!(crate::raft_storage::preflight_application_version(path).is_err());
+    }
+}
+
 fn reserve_startup_listener() -> std::net::TcpListener {
     // ponytail: Linux fixed-roster fixtures need a close/rebind handoff;
     // use native port 0 if startup ever supports binding before roster persistence.
@@ -1964,6 +2078,59 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         assert!(matches!(services[follower].submit(Operation::VerifyReplicaCode(code.code.clone())).await, Outcome::VerifiedReplicaCode(true)));
         let retried = match services[follower].submit(Operation::ReplicaCode { rotate_generation: Some(code.generation) }).await { Outcome::ReplicaCode(Ok(c)) => c, _ => panic!("retry unavailable") };
         assert!(retried == rotated);
+        // Browser cookie minted at one gateway, authorized writes forwarded by another.
+        use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+        let hash = Argon2::default().hash_password(b"browser test password", &SaltString::generate(&mut rand08::rngs::OsRng)).unwrap().to_string();
+        assert!(matches!(services[follower].submit(Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation {
+            request_id: "browser-bootstrap".into(), applied_at: chrono::Utc::now().naive_utc(),
+            action: crate::admin::Action::Bootstrap { username: "admin".into(), password_hash: hash },
+        }))).await, Outcome::Admin(Ok(_))));
+        let mut browser_servers = Vec::new();
+        let mut browser_workers = Vec::new();
+        let mut browser_addresses = Vec::new();
+        for service in services.iter().cloned() {
+            let (jobs, mut work) = tokio::sync::mpsc::channel(8);
+            browser_workers.push(tokio::spawn(async move {
+                while let Some(crate::DatabaseJob::Admin { operation, reply }) = work.recv().await {
+                    let result = match service.submit(Operation::Admin(operation)).await {
+                        Outcome::Admin(result) => result,
+                        _ => Err("unavailable; outcome may be unknown".into()),
+                    };
+                    let _ = reply.send(result);
+                }
+            }));
+            let (address, server) = crate::admin::test_gateway(jobs).await;
+            browser_addresses.push(address); browser_servers.push(server);
+        }
+        let login = crate::admin::test_request(browser_addresses[leader], "login", "", Some(r#"{"username":"admin","password":"browser test password"}"#)).await;
+        assert_eq!(login.0, 200, "{login:?}");
+        let browser_cookie = login.1.lines().find_map(|l| l.strip_prefix("set-cookie: ")).unwrap().split(';').next().unwrap().to_owned();
+        assert_eq!(crate::admin::test_request(browser_addresses[follower], "replicas", "", None).await.0, 401);
+        let inventory = crate::admin::test_request(browser_addresses[follower], "replicas", &browser_cookie, None).await;
+        assert_eq!(inventory.0, 200, "{inventory:?}");
+        for secret in ["signing_key", "code", "password_hash", "private_key", "cluster_psk"] { assert!(!inventory.2.contains(secret), "{inventory:?}"); }
+        let browser_rotation = serde_json::json!({"action":"rotate_enrollment_code","expected_generation":rotated.generation}).to_string();
+        let first_rotation = crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(&browser_rotation)).await;
+        assert_eq!(first_rotation.0, 200, "{first_rotation:?}");
+        let retry_rotation = crate::admin::test_request(browser_addresses[leader], "replicas/reconcile", &browser_cookie, Some(&browser_rotation)).await;
+        assert_eq!(retry_rotation.0, 200);
+        assert_eq!(first_rotation.2, retry_rotation.2);
+        let browser_code: ReplicaCode = serde_json::from_str(&first_rotation.2).unwrap();
+        let read_code_response = crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(r#"{"action":"enrollment_code"}"#)).await;
+        assert_eq!(read_code_response.0, 200);
+        assert_eq!(read_code_response.2, first_rotation.2);
+        // Browser join bundle: same operation through the admin replica route;
+        // the JSON body legitimately carries the live code (only Debug output
+        // redacts it). Bootstrap must be a valid multiaddr.
+        let bundle_peer = keys[0].public().to_peer_id().to_string();
+        let browser_bundle = crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(&format!(r#"{{"action":"join_bundle","bootstrap":"/ip4/127.0.0.1/tcp/1/p2p/{bundle_peer}"}}"#))).await;
+        assert_eq!(browser_bundle.0, 200, "{browser_bundle:?}");
+        let parsed: serde_json::Value = serde_json::from_str(&browser_bundle.2).unwrap();
+        assert_eq!(parsed["cluster_id"], "forward-test");
+        assert_eq!(parsed["minimum_revision"], 1);
+        assert_eq!(crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(r#"{"action":"join_bundle"}"#)).await.0, 422);
+        // Keep the existing rehearsal's generation assumptions unchanged.
+        let rotated = browser_code;
         assert!(!keys.iter().any(|k| crate::hex_encode(&k.public().encode_protobuf()) == initial.signing_key));
         use futures_util::StreamExt;
         use cat4igp_shared::discovery::{transport, FindControllers, Role};
@@ -2020,7 +2187,7 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
             code: rotated.code.clone(),
         };
         let mut incompatible = join_request.clone();
-        incompatible.application_version = 2;
+        incompatible.application_version = cat4igp_shared::discovery::join::APPLICATION_VERSION + 1;
         let before = stores[leader].run(|conn| Ok(crate::db::get_setting(conn, "replica_pending_admissions").ok())).await.unwrap();
         expect_rejection(&services, &nodes, leader, Operation::Join { source: join_peer, request: incompatible },
             |outcome| matches!(outcome, Outcome::Join(JoinResponse::Rejected)), "incompatible join").await;
@@ -2081,6 +2248,47 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         let config_path = root.join("learner.json");
         let persist = || save_join(config_path.to_str().unwrap(), root.join("joining.key").to_str().unwrap().into(), format!("/ip4/127.0.0.1/tcp/{join_port}").parse().unwrap(), &join_request, &pending);
         persist().unwrap(); persist().unwrap();
+        // Join bundle: one operator read packages pin/bootstrap/code for a one-command join.
+        // Placed after the single-pending-admission assertions above: the bundle join
+        // below commits a second pending admission.
+        let bundle = match services[follower].submit(Operation::JoinBundle { bootstrap: public_address.clone() }).await {
+            Outcome::JoinBundle(Ok(bundle)) => bundle,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(bundle.cluster_id, "forward-test");
+        assert_eq!(bundle.signing_key, initial.signing_key);
+        assert_eq!(bundle.bootstrap, public_address);
+        assert_eq!(bundle.code, rotated.code);
+        assert_eq!(bundle.minimum_revision, 1);
+        assert_eq!(bundle.application_version, cat4igp_shared::discovery::join::APPLICATION_VERSION);
+        assert!(!format!("{bundle:?}").contains(&rotated.code[..16]));
+        assert!(cat4igp_shared::discovery::join::Bundle {
+            application_version: 0,
+            ..bundle.clone()
+        }.validate().is_err());
+        assert!(cat4igp_shared::discovery::join::Bundle {
+            code: "zz".repeat(32),
+            ..bundle.clone()
+        }.validate().is_err());
+        // The bundle is directly usable: a fresh joiner derives its request from it.
+        let bundle_joiner = crate::raft_network::replica_identity(&root.join("bundle-joiner.key")).unwrap();
+        let bundle_peer = bundle_joiner.public().to_peer_id();
+        let bundle_socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bundle_port = bundle_socket.local_addr().unwrap().port();
+        drop(bundle_socket);
+        let bundle_request = JoinRequest {
+            application_version: bundle.application_version,
+            cluster_id: bundle.cluster_id.clone(),
+            request_id: "bundle-join-1".into(),
+            node_id: 13,
+            address: format!("/ip4/127.0.0.1/tcp/{bundle_port}/p2p/{bundle_peer}").parse().unwrap(),
+            code: bundle.code.clone(),
+        };
+        let bundle_reply = join::request(&bundle_joiner, &pin, &[bundle.bootstrap.clone()], bundle.minimum_revision, bundle_request.clone()).await.unwrap();
+        assert!(matches!(&bundle_reply, JoinResponse::Bootstrap { node_id: 13, peer_id, .. } if *peer_id == bundle_peer));
+        // Later snapshot-replay assertions compare against the final pending set,
+        // which now includes the bundle joiner's committed admission.
+        let durable = stores[follower].run(|conn| Ok(crate::db::get_setting(conn, "replica_pending_admissions")?)).await.unwrap();
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&config_path).unwrap().permissions().mode() & 0o777, 0o600);
         let config: Config = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
@@ -2097,7 +2305,8 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
             |outcome| matches!(outcome, Outcome::Roster(Err(_))), "unknown serving voter").await;
         expect_rejection(&services, &nodes, follower, Operation::PromoteLearner(9),
             |outcome| matches!(outcome, Outcome::Promotion(Err(_))), "inactive learner promotion").await;
-        assert!(matches!(services[follower].submit(Operation::ActivateLearner(9)).await, Outcome::Learner(Ok(()))));
+        let activated = crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(r#"{"action":"activate_learner","node_id":9}"#)).await;
+        assert_eq!(activated.0, 200, "{activated:?}");
         expect_rejection(&services, &nodes, follower, Operation::PromoteLearner(9),
             |outcome| matches!(outcome, Outcome::Promotion(Err(error)) if error == "learner has not caught up"),
             "unstarted learner promotion").await;
@@ -2177,7 +2386,7 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         assert!(promoted.is_ok());
         for node in &nodes { node.runtime_config().elect(true); }
         fourth_node.runtime_config().elect(true);
-        assert!(matches!(services[follower].submit(Operation::PromoteLearner(9)).await, Outcome::Promotion(Ok(()))));
+        assert_eq!(crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(r#"{"action":"promote_learner","node_id":9}"#)).await.0, 200);
         let promotion_index = nodes[leader].metrics().borrow().last_applied.unwrap().index;
         fourth_node.wait(Some(DEADLINE)).applied_index(Some(promotion_index), "promotion committed on fourth voter").await.unwrap();
         for (node, store) in nodes.iter().zip(&stores).chain(std::iter::once((&fourth_node, &fourth_store))) {
@@ -2194,6 +2403,59 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         let mut private_grant = grant.clone(); private_grant.public_address = grant.control_address.clone();
         expect_rejection(&services, &nodes, follower, Operation::GrantServing(private_grant),
             |outcome| matches!(outcome, Outcome::Roster(Err(_))), "private serving address").await;
+        let expected_revision = stores[leader].run(read_authority).await.unwrap().roster.unwrap().body.revision;
+        let browser_grant = serde_json::json!({"action":"grant_serving","node_id":9,
+            "expected_roster_revision":expected_revision,"public_address":grant.public_address,
+            "control_address":grant.control_address,"request_id":"serving-nine"}).to_string();
+        let browser_result = tokio::time::timeout(DEADLINE, async {
+            loop {
+                let response = crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(&browser_grant)).await;
+                if response.0 == 200 { break response.2; }
+                assert!(response.0 == 503 || response.0 == 409, "{response:?}");
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let browser_value: serde_json::Value = serde_json::from_str(&browser_result).unwrap();
+        assert_eq!(browser_value["committed"], true);
+        let after_browser = stores[leader].run(read_authority).await.unwrap().roster.unwrap();
+        assert_eq!(after_browser.body.revision, expected_revision + 1);
+        // Lost response: replay on another gateway ignores the now-stale CAS, never renews.
+        let retry = tokio::time::timeout(DEADLINE, async {
+            loop {
+                let response = crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(&browser_grant)).await;
+                if response.0 != 503 { break response; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert_eq!(retry.0, 200);
+        assert_eq!(retry.2, browser_result);
+        assert_eq!(stores[leader].run(read_authority).await.unwrap().roster.unwrap().body.expires_at_ms, after_browser.body.expires_at_ms);
+        let mut changed: serde_json::Value = serde_json::from_str(&browser_grant).unwrap();
+        changed["request_id"] = serde_json::json!("different-serving-request");
+        assert_eq!(crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(&changed.to_string())).await.0, 409);
+        changed["request_id"] = serde_json::json!("serving-nine");
+        changed["expected_roster_revision"] = serde_json::json!(expected_revision + 1);
+        assert_eq!(crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(&changed.to_string())).await.0, 409);
+        let serving_inventory = crate::admin::test_request(browser_addresses[follower], "replicas", &browser_cookie, None).await;
+        assert_eq!(serving_inventory.0, 200);
+        assert!(serving_inventory.2.contains(&join_peer.to_string()));
+        assert!(serving_inventory.2.contains(&grant.public_address.to_string()));
+        assert!(matches!(fourth_service.submit(Operation::Admin(crate::admin::Operation::Replica(
+            serde_json::from_str(&browser_grant).unwrap()))).await, Outcome::Admin(Err(_))));
+        let (wrong_jobs, mut wrong_work) = tokio::sync::mpsc::channel(8);
+        let wrong_service = fourth_service.clone();
+        let wrong_worker = tokio::spawn(async move {
+            while let Some(crate::DatabaseJob::Admin { operation, reply }) = wrong_work.recv().await {
+                let result = match wrong_service.submit(Operation::Admin(operation)).await {
+                    Outcome::Admin(result) => result,
+                    _ => Err("unavailable".into()),
+                };
+                let _ = reply.send(result);
+            }
+        });
+        let (wrong_address, wrong_server) = crate::admin::test_gateway(wrong_jobs).await;
+        assert_eq!(crate::admin::test_request(wrong_address, "replicas/reconcile", &browser_cookie, Some(&browser_grant)).await.0, 409);
+        wrong_server.abort(); wrong_worker.abort();
         tokio::time::timeout(DEADLINE, async {
             loop {
                 if matches!(services[follower].submit(Operation::GrantServing(grant.clone())).await, Outcome::Roster(Ok(()))) { break; }
@@ -2214,6 +2476,28 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         let mut conflict_grant = grant.clone(); conflict_grant.control_address = format!("/ip4/127.0.0.1/tcp/19092/p2p/{join_peer}").parse().unwrap();
         expect_rejection(&services, &nodes, follower, Operation::GrantServing(conflict_grant),
             |outcome| matches!(outcome, Outcome::Roster(Err(_))), "conflicting serving grant").await;
+        // A concurrent independent roster commit does not rewrite the historical receipt.
+        let mut concurrent_roster = granted.body.clone();
+        concurrent_roster.revision += 1;
+        concurrent_roster.expires_at_ms += 1;
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                if matches!(services[follower].submit(Operation::Roster(concurrent_roster.clone())).await, Outcome::Roster(Ok(()))) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                let response = crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(&browser_grant)).await;
+                if response.0 == 503 { tokio::task::yield_now().await; continue; }
+                assert_eq!(response.0, 200);
+                assert_eq!(response.2, browser_result);
+                break;
+            }
+        }).await.unwrap();
+        let granted = stores[leader].run(read_authority).await.unwrap().roster.unwrap();
+        let granted_revision = granted.body.revision;
+        assert_eq!(granted.body.expires_at_ms, concurrent_roster.expires_at_ms);
         let query = FindControllers::new("forward-test".into(), Role::Client, requester.public().to_peer_id(), chrono::Utc::now().timestamp_millis()).unwrap();
         let authorized = match services[follower].submit(Operation::Discovery { query: query.clone(), source: query.requester, serving: join_peer }).await {
             Outcome::Discovery(Ok(proof)) => proof,
@@ -2484,7 +2768,7 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         }).await.unwrap();
         for node in &nodes { node.runtime_config().elect(true); }
         restarted.runtime_config().elect(true);
-        assert!(matches!(services[follower].submit(Operation::RevokeReplica(9)).await, Outcome::Revocation(Ok(()))));
+        assert_eq!(crate::admin::test_request(browser_addresses[follower], "replicas/reconcile", &browser_cookie, Some(r#"{"action":"revoke_replica","node_id":9}"#)).await.0, 200);
         assert_eq!(stores[leader].run(read_authority).await.unwrap().roster.unwrap().body.revision, granted_revision + 1);
         assert_eq!(stores[leader].clone().applied_state().await.unwrap().1.membership().get_joint_config(), &vec![std::collections::BTreeSet::from([1, 2, 3])]);
         assert!(!services[leader].network.as_ref().unwrap().bootstrap_endpoints().contains_key(&9));
@@ -2554,6 +2838,25 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         let mut invalid_mesh = mesh;
         if let Command::Mesh { id, mtu, .. } = &mut invalid_mesh { *id = 2; *mtu = 0; }
         assert!(nodes[leader].client_write(invalid_mesh).await.unwrap().data.is_err());
+        // Exercise bounded actions through the follower without advancing the mesh highwater.
+        let invite_operation = Operation::Invite { request_id: "bounded-invite".into(), expires_at: None, max_uses: None, join_mesh: Some(1) };
+        assert!(matches!(services[follower].submit(invite_operation.clone()).await, Outcome::Invite(Ok(_))));
+        let inventory = match services[follower].submit(Operation::Admin(crate::admin::Operation::Inventory)).await { Outcome::Admin(Ok(value)) => value, other => panic!("{other:?}") };
+        let invite_id = inventory["invites"].as_array().unwrap().iter().find(|i| i["mesh_id"] == 1).unwrap()["id"].as_i64().unwrap() as i32;
+        for (request_id, action) in [
+            ("bounded-rename", crate::admin::Action::RenameMesh { id: 1, name: "after".into() }),
+            ("bounded-mtu", crate::admin::Action::SetMeshMtu { id: 1, mtu: 1380 }),
+            ("bounded-invalidate", crate::admin::Action::InvalidateInvite { id: invite_id }),
+        ] {
+            let operation = Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation { request_id: request_id.into(), action, applied_at: chrono::Utc::now().naive_utc() }));
+            let first = match services[follower].submit(operation.clone()).await { Outcome::Admin(Ok(value)) => value, other => panic!("{other:?}") };
+            assert!(matches!(services[leader].submit(operation).await, Outcome::Admin(Ok(value)) if value == first));
+        }
+        assert!(matches!(services[follower].submit(invite_operation).await, Outcome::Invite(Err(message)) if message == "invite invalidated by administrator"));
+        let inventory = match services[follower].submit(Operation::Admin(crate::admin::Operation::Inventory)).await { Outcome::Admin(Ok(value)) => value, other => panic!("{other:?}") };
+        assert_eq!(inventory["meshes"].as_array().unwrap().iter().find(|m| m["id"] == 1).unwrap()["name"], "after");
+        assert_eq!(inventory["meshes"].as_array().unwrap().iter().find(|m| m["id"] == 1).unwrap()["mtu"], 1380);
+        assert!(!inventory["invites"].as_array().unwrap().iter().any(|i| i["id"] == invite_id));
         let operation = Operation::Invite { request_id: "lost-response".into(), expires_at: None, max_uses: Some(1), join_mesh: Some(1) };
         let code = match services[follower].submit(operation.clone()).await { Outcome::Invite(Ok(code)) => code, other => panic!("{other:?}") };
         assert!(matches!(services[follower].submit(Operation::Ready).await, Outcome::Ready));
@@ -2858,6 +3161,9 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         nodes[remaining_follower].wait(Some(DEADLINE)).current_leader(new_leader as u64 + 1, "failover").await.unwrap();
         let recovered = match services[remaining_follower].submit(Operation::ReplicaCode { rotate_generation: None }).await { Outcome::ReplicaCode(Ok(c)) => c, _ => panic!("failover code unavailable") };
         assert!(recovered == rotated);
+        let recovered_browser = crate::admin::test_request(browser_addresses[remaining_follower], "replicas/reconcile", &browser_cookie, Some(&browser_rotation)).await;
+        assert_eq!(recovered_browser.0, 200, "{recovered_browser:?}");
+        assert_eq!(recovered_browser.2, first_rotation.2);
         let failover_rotation = match services[remaining_follower].submit(Operation::ReplicaCode { rotate_generation: Some(rotated.generation) }).await { Outcome::ReplicaCode(Ok(c)) => c, _ => panic!("failover rotation unavailable") };
         assert_eq!(failover_rotation.generation, rotated.generation + 1);
         // Reload the pre-send identity/request, not the completed enrollment.
@@ -2972,6 +3278,10 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         assert!(!matches!(services[new_leader].submit(Operation::Ready).await, Outcome::Ready));
         assert!(!matches!(services[new_leader].submit(Operation::GrantServing(grant)).await, Outcome::Roster(Ok(()))));
         let minority = Operation::Invite { request_id: "minority-refused".into(), expires_at: None, max_uses: Some(1), join_mesh: None };
+        let minority_browser = crate::admin::test_request(browser_addresses[new_leader], "replicas/reconcile", &browser_cookie, Some(&serde_json::json!({"action":"rotate_enrollment_code","expected_generation":failover_rotation.generation}).to_string())).await;
+        assert_eq!(minority_browser.0, 503, "{minority_browser:?}");
+        for server in browser_servers { server.abort(); }
+        for worker in browser_workers { worker.abort(); }
         assert!(matches!(services[new_leader].submit(Operation::Join { source: join_peer, request: join_request }).await, Outcome::Unavailable));
         assert!(matches!(services[new_leader].submit(Operation::ReplicaCode { rotate_generation: Some(failover_rotation.generation) }).await, Outcome::Unavailable));
         assert!(matches!(services[new_leader].submit(Operation::VerifyReplicaCode(failover_rotation.code.clone())).await, Outcome::Unavailable));
@@ -3061,7 +3371,7 @@ async fn legacy_import_existing_client_cutover() {
         let encryption = config.ensure_control_encryption_key().unwrap();
         conn.batch_execute("INSERT INTO invites(id,code,max_uses,override_join_mesh,created_at) VALUES(1,'legacy-invite',1,1,'2026-01-01 00:00:00'); INSERT INTO mesh_groups(id,name,auto_wireguard,auto_wireguard_mtu,created_at) VALUES(1,'legacy-mesh',1,1280,'2026-01-01 00:00:00'); INSERT INTO nodes(id,name,auth_key,created_at) VALUES(1,'other','other-auth','2026-01-01 00:00:00'); INSERT INTO node_control_identities(node_id,peer_id,signing_key,encryption_key,created_at,updated_at) VALUES(1,'other-peer','other-signing','other-encryption','2026-01-01 00:00:00','2026-01-01 00:00:00'); INSERT INTO mesh_group_memberships(mesh_group_id,node_id,created_at) VALUES(1,1,'2026-01-01 00:00:00'); INSERT INTO wireguard_static_key(node_id,public_key) VALUES(1,'other-wg');").unwrap();
         let command = crate::db::EnrollmentCommand {
-            allocation: crate::db::prepare_enrollment_allocation(&mut conn, "legacy-invite").unwrap(),
+            allocation: crate::db::EnrollmentAllocation { membership: Some((2, 1)), tunnels: vec![(1, 1, 1280, false), (2, 1, 1280, true)] },
             request: EnrollmentRequest {
                 request_id: "old-enrollment".into(), node_name: "existing-client".into(), invitation_code: "legacy-invite".into(),
                 client_peer_id: client_key.public().to_peer_id().to_string(),
@@ -3072,13 +3382,26 @@ async fn legacy_import_existing_client_cutover() {
             node_id: 42, auth_key: "preserved-auth".into(), applied_at: chrono::Utc::now().naive_utc(),
             response: EnrollmentResponse { node_id: 42, topology_revision: 0, network_id: before.network_id.clone(), controller_signing_key: before.signing_key.clone(), controller_encryption_key: before.encryption_key.clone() },
         };
-        assert!(matches!(crate::db::apply_enrollment(&mut conn, &command).unwrap().0, ControlResponse::Enrolled(_)));
+        // Populate the old schema without calling application code that requires new tables.
+        diesel::sql_query("INSERT INTO nodes(id,name,auth_key) VALUES(42,'existing-client','preserved-auth')").execute(&mut conn).unwrap();
+        diesel::sql_query("INSERT INTO node_control_identities(node_id,peer_id,signing_key,encryption_key) VALUES(42,?,?,?)")
+            .bind::<diesel::sql_types::Text,_>(&command.request.client_peer_id)
+            .bind::<diesel::sql_types::Text,_>(&command.request.client_signing_key)
+            .bind::<diesel::sql_types::Text,_>(&command.request.client_encryption_key).execute(&mut conn).unwrap();
+        diesel::sql_query("INSERT INTO wireguard_static_key(node_id,public_key) VALUES(42,?)")
+            .bind::<diesel::sql_types::Text,_>(&command.request.wireguard_public_key).execute(&mut conn).unwrap();
+        conn.batch_execute("INSERT INTO mesh_group_memberships(id,mesh_group_id,node_id,created_at) VALUES(2,1,42,'2026-10-05 00:00:00'); INSERT INTO wireguard_tunnels(id,node_id_peer1,node_id_peer2,mtu,endpoint_ipv6) VALUES(1,42,1,1280,0),(2,42,1,1280,1); UPDATE invites SET used_count=1 WHERE id=1;").unwrap();
+        diesel::sql_query("INSERT INTO control_enrollment_results(peer_id,request_id,fingerprint,result) VALUES(?,?,?,?)")
+            .bind::<diesel::sql_types::Text,_>(&command.request.client_peer_id)
+            .bind::<diesel::sql_types::Text,_>(&command.request.request_id)
+            .bind::<diesel::sql_types::Text,_>(serde_json::to_string(&command.request).unwrap())
+            .bind::<diesel::sql_types::Text,_>(serde_json::to_string(&ControlResponse::Enrolled(command.response.clone())).unwrap()).execute(&mut conn).unwrap();
         conn.batch_execute("UPDATE node_control_identities SET topology_revision=73 WHERE node_id=42").unwrap();
         // Actual previous schema: enrolled identity, consumed invite and retry result survive upgrade.
         assert_eq!(conn.applied_migrations().unwrap().len(), 8);
         assert!(crate::db::migrate(&mut conn, false).is_err());
         crate::db::migrate(&mut conn, true).unwrap();
-        assert_eq!(conn.applied_migrations().unwrap().len(), 9);
+        assert_eq!(conn.applied_migrations().unwrap().len(), 12);
         assert_eq!(read_authority(&mut conn).unwrap().signing_key, before.signing_key);
         assert_eq!(read_authority(&mut conn).unwrap().encryption_key, before.encryption_key);
         assert_eq!(crate::db::control_identity_for_peer(&mut conn, &command.request.client_peer_id).unwrap().topology_revision, 73);
@@ -3849,5 +4172,174 @@ async fn committed_route_reopens_and_minority_refuses() {
     transport.abort();
     drop(node);
     drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+async fn rolling_window_cluster(#[allow(unused)] mode_recover: bool) -> (std::path::PathBuf, Vec<Node>, Vec<Store>, Vec<tokio::task::JoinHandle<()>>, Vec<Service>) {
+    let root = std::env::temp_dir().join(format!("cat4igp-rolling-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let listeners: Vec<_> = (0..3).map(|_| reserve_startup_listener()).collect();
+    let addresses: Vec<libp2p::Multiaddr> = listeners
+        .iter()
+        .map(|l| format!("/ip4/127.0.0.1/tcp/{}", l.local_addr().unwrap().port()).parse().unwrap())
+        .collect();
+    let identities: Vec<_> = (0..3).map(|i| root.join(format!("{i}.key"))).collect();
+    let keys: Vec<_> = identities
+        .iter()
+        .map(|p| crate::raft_network::replica_identity(p).unwrap())
+        .collect();
+    let mut nodes = Vec::new();
+    let mut stores = Vec::new();
+    let mut transports = Vec::new();
+    let mut services = Vec::new();
+    for (i, listener) in listeners.into_iter().enumerate() {
+        let database = root.join(format!("{i}.sqlite")).to_str().unwrap().to_owned();
+        let mut conn = diesel::SqliteConnection::establish(&database).unwrap();
+        crate::db::migrate(&mut conn, true).unwrap();
+        drop(conn);
+        let config = Config {
+            learner: None, cluster_psk: None, transport_generation: 0, legacy_import: None,
+            cluster_id: "rolling-window".into(), node_id: i as u64 + 1,
+            mode: if i == 2 { Mode::Initialize } else { Mode::Join },
+            identity_file: identities[i].to_str().unwrap().into(), listen: addresses[i].clone(),
+            replicas: (0..3).map(|j| (j as u64 + 1, Replica { peer_id: keys[j].public().to_peer_id(), address: addresses[j].clone() })).collect(),
+        };
+        let (node, store, task, service) = start_inner(config, database, libp2p::pnet::PreSharedKey::new([21; 32]), Some(listener)).await.unwrap();
+        nodes.push(node); stores.push(store); transports.push(task); services.push(service);
+    }
+    loop {
+        if let Some(_leader) = nodes.iter().find_map(|n| n.metrics().borrow().current_leader) { break; }
+        tokio::task::yield_now().await;
+    }
+    (root, nodes, stores, transports, services)
+}
+
+#[tokio::test]
+async fn rolling_window_gates_epoch_features_and_replicates_state() {
+    let (root, nodes, stores, transports, services) = rolling_window_cluster(false).await;
+    let leader = nodes.iter().find_map(|n| n.metrics().borrow().current_leader).unwrap() as usize - 1;
+    let follower = (leader + 1) % 3;
+    nodes[follower].wait(Some(DEADLINE)).current_leader(leader as u64 + 1, "follower learns leader").await.unwrap();
+    // An epoch-4-only action is available while no window is declared.
+    assert!(matches!(services[leader].submit(Operation::WindowStatus).await, Outcome::WindowOpen(false)));
+    // Declare a mixed window: a lagging epoch cohort remains in the quorum.
+    let opened = match services[leader].submit(Operation::OpenEpochWindow(3)).await {
+        Outcome::EpochWindow(result) => result,
+        other => panic!("{other:?}"),
+    };
+    assert!(opened.is_ok(), "{opened:?}");
+    // The window must be committed at the leader and replicated to a follower.
+    let learned = loop {
+        if let Some(window) = stores[follower].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap() {
+            if window.window_open() { break window.clone(); }
+        }
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(opened.unwrap(), learned);
+    // Read-only window status may be queried on any node.
+    assert!(matches!(services[follower].submit(Operation::WindowStatus).await, Outcome::WindowOpen(true)));
+    // An epoch-4-only action is refused while the window is open: replicating it to
+    // an epoch-3 peer would stall the log.
+    let rejected = services[leader].submit(Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation {
+        request_id: "rolling-window-fecline".into(), applied_at: chrono::Utc::now().naive_utc(),
+        action: crate::admin::Action::CreateMesh { name: "blocked".into(), auto_wireguard: true, mtu: 1400, fec: true },
+    }))).await;
+    assert!(matches!(rejected, Outcome::Admin(Err(ref e)) if e.contains("rolling-upgrade window")), "{rejected:?}");
+    // Close the window: the last lagging peer has been upgraded.
+    let closed = match services[leader].submit(Operation::CloseEpochWindow).await {
+        Outcome::EpochWindow(result) => result,
+        other => panic!("{other:?}"),
+    };
+    assert!(closed.is_ok(), "{closed:?}");
+    let learned = loop {
+        if let Some(window) = stores[follower].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap() {
+            if !window.window_open() { break window.clone(); }
+        }
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(closed.unwrap(), learned);
+    assert_eq!(learned, crate::raft_storage::EpochWindow::Stable { epoch: 4 });
+    // The exact action now applies (Bootstrap commit proves authoring; the gate released).
+    assert!(matches!(services[leader].submit(Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation {
+        request_id: "rolling-window-fecline".into(), applied_at: chrono::Utc::now().naive_utc(),
+        action: crate::admin::Action::CreateMesh { name: "after-close".into(), auto_wireguard: true, mtu: 1400, fec: true },
+    }))).await, Outcome::Admin(Ok(_))));
+    for node in &nodes { node.shutdown().await.unwrap(); }
+    for task in &transports { task.abort(); }
+    drop(stores); drop(services); drop(nodes); drop(transports);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn rolling_window_rejects_nonpreceding_epoch_floor() {
+    let (root, nodes, stores, transports, services) = rolling_window_cluster(true).await;
+    // Only the exact previous epoch (APPLICATION_VERSION - 1) opens a mixed window.
+    for floor in [0u8, 2u8, 4u8, 5u8, 255u8] {
+        let outcome = services[0].submit(Operation::OpenEpochWindow(floor)).await;
+        assert!(
+            matches!(outcome, Outcome::EpochWindow(Err(_))),
+            "{outcome:?}"
+        );
+        assert!(stores[0].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap().is_none());
+    }
+    for node in &nodes { node.shutdown().await.unwrap(); }
+    for task in &transports { task.abort(); }
+    drop(stores); drop(services); drop(nodes); drop(transports);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn rolling_window_auto_reconciles_by_binary_replacement() {
+    let (root, nodes, stores, transports, services) = rolling_window_cluster(false).await;
+    let leader = nodes.iter().find_map(|n| n.metrics().borrow().current_leader).unwrap() as usize - 1;
+    // The scheduler runs on the leader only; spawn it as serve() would.
+    let scheduler = tokio::spawn({
+        let leader_service = services[leader].clone();
+        async move { leader_service.schedule_window().await }
+    });
+    // Uniform current epoch: nothing opens and the ledger stays empty.
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    assert!(stores[leader].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap().is_none());
+    // Simulate a binary replacement finished on one replica only: it reports
+    // the previous epoch. The leader must commit a Mixed window within a tick.
+    services[(leader + 1) % 3].epoch_report.store(3, std::sync::atomic::Ordering::SeqCst);
+    let opened = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match stores[leader].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap() {
+                Some(window @ crate::raft_storage::EpochWindow::Mixed { .. }) => break window,
+                Some(other) => assert!(tokio::time::Instant::now() < deadline, "deadline: {other:?}"),
+                None => assert!(tokio::time::Instant::now() < deadline, "deadline: no window"),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    assert_eq!(opened, crate::raft_storage::EpochWindow::Mixed { epoch: 4, minimum_peer: 3 });
+    // Feature gating engages without any operator involvement.
+    let rejected = services[leader].submit(Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation {
+        request_id: "auto-window-gate".into(), applied_at: chrono::Utc::now().naive_utc(),
+        action: crate::admin::Action::SetMeshFec { id: 1, fec: true },
+    }))).await;
+    assert!(matches!(rejected, Outcome::Admin(Err(ref e)) if e.contains("rolling-upgrade window")), "{rejected:?}");
+    // The last binary is replaced; the window closes automatically and the
+    // same action now commits.
+    services[(leader + 1) % 3].epoch_report.store(4, std::sync::atomic::Ordering::SeqCst);
+    let closed = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match stores[leader].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap() {
+                Some(window @ crate::raft_storage::EpochWindow::Stable { .. }) => break window,
+                Some(other) => assert!(tokio::time::Instant::now() < deadline, "deadline: {other:?}"),
+                None => assert!(tokio::time::Instant::now() < deadline, "deadline: no window"),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    assert_eq!(closed, crate::raft_storage::EpochWindow::Stable { epoch: 4 });
+    assert!(matches!(services[leader].submit(Operation::WindowStatus).await, Outcome::WindowOpen(false)));
+    scheduler.abort();
+    for node in &nodes { node.shutdown().await.unwrap(); }
+    for task in &transports { task.abort(); }
+    drop(stores); drop(services); drop(nodes); drop(transports);
     std::fs::remove_dir_all(root).unwrap();
 }

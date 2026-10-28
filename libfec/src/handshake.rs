@@ -1,5 +1,6 @@
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -96,8 +97,8 @@ pub fn derive_shared_key(
 
     let mut hasher = Sha256::new();
     hasher.update(shared.as_bytes());
-    hasher.update(local_session.to_be_bytes());
-    hasher.update(remote_session.to_be_bytes());
+    hasher.update(local_session.min(remote_session).to_be_bytes());
+    hasher.update(local_session.max(remote_session).to_be_bytes());
     let out = hasher.finalize();
     let mut key = [0u8; 32];
     key.copy_from_slice(&out[..32]);
@@ -132,6 +133,37 @@ pub fn random_nonce() -> [u8; 12] {
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
     nonce
+}
+
+pub fn authenticate(psk: [u8; 32], payload: &[u8]) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&psk).expect("fixed size key");
+    mac.update(b"cat4igp-fec-control-v1");
+    mac.update(payload);
+    mac.finalize().into_bytes().into()
+}
+
+pub fn verify(psk: [u8; 32], payload: &[u8], tag: &[u8]) -> bool {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&psk).expect("fixed size key");
+    mac.update(b"cat4igp-fec-control-v1");
+    mac.update(payload);
+    mac.verify_slice(tag).is_ok()
+}
+
+/// Derive a per-tunnel PSK from the already provisioned random WireGuard keypairs.
+pub fn tunnel_psk(
+    local_private: [u8; 32],
+    remote_public: [u8; 32],
+    tunnel_id: i32,
+) -> Option<[u8; 32]> {
+    let shared = StaticSecret::from(local_private).diffie_hellman(&PublicKey::from(remote_public));
+    if shared.as_bytes() == &[0; 32] {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"cat4igp-fec-tunnel-psk-v1");
+    hash.update(tunnel_id.to_be_bytes());
+    hash.update(shared.as_bytes());
+    Some(hash.finalize().into())
 }
 
 pub fn encode_control_message(msg: &ControlMessage) -> Vec<u8> {

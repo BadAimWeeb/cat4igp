@@ -165,7 +165,13 @@ impl Daemon {
     }
 
     async fn handle_set_server(&self, address: String, invite_code: String) -> DaemonResponse {
+        let _registration = self.control_sync.lock().await;
         let mut server_config = self.server_config.lock().await;
+        if server_config.is_some() {
+            return DaemonResponse::Error(
+                "Server already configured; refusing to overwrite enrollment".into(),
+            );
+        }
         let mut config = ServerConfig {
             address: address.clone(),
             invite_code,

@@ -28,6 +28,7 @@ diesel::table! {
         auto_wireguard -> Bool,
         auto_wireguard_mtu -> Integer,
         created_at -> Timestamp,
+        auto_wireguard_fec -> Bool,
     }
 }
 
@@ -89,7 +90,73 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    administrator (id) {
+        id -> Integer,
+        username -> Text,
+        password_hash -> Text,
+    }
+}
+
+diesel::table! {
+    administrator_results (request_id) {
+        request_id -> Text,
+        fingerprint -> Text,
+        result -> Text,
+    }
+}
+
+diesel::table! {
+    operator_invite_results (request_id) {
+        request_id -> Text,
+        fingerprint -> Text,
+        result -> Text,
+    }
+}
+
+diesel::table! {
+    control_enrollment_results (peer_id) {
+        peer_id -> Text,
+        request_id -> Text,
+        fingerprint -> Text,
+        result -> Text,
+    }
+}
+
+diesel::table! {
+    control_answer_results (node_id, request_id) {
+        node_id -> Integer,
+        request_id -> Text,
+        fingerprint -> Text,
+        result -> Text,
+        expires_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    node_revocations (peer_id) {
+        peer_id -> Text,
+        node_id -> Integer,
+        revoked_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    tunnel_intents (tunnel_id, kind, mesh_id) {
+        tunnel_id -> Integer,
+        kind -> Text,
+        mesh_id -> Integer,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
+    administrator,
+    administrator_results,
+    operator_invite_results,
+    control_enrollment_results,
+    control_answer_results,
+    node_revocations,
+    tunnel_intents,
     invites,
     mesh_group_memberships,
     mesh_groups,

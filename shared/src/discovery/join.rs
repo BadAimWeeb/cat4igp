@@ -6,7 +6,49 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 // ponytail: exact application schema/protocol epoch; incompatible changes require stop-all upgrades.
-pub const APPLICATION_VERSION: u8 = 1;
+pub const APPLICATION_VERSION: u8 = 4;
+
+/// Operator-issued join parameters, packaged so a joining replica needs one
+/// command instead of ~11 environment variables. Contains a live enrollment
+/// code: treat like the code itself, short-lived, never log.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Bundle {
+    pub application_version: u8,
+    pub cluster_id: String,
+    /// Trusted protobuf public key in hex (the discovery authority pin).
+    pub signing_key: String,
+    pub bootstrap: Multiaddr,
+    pub minimum_revision: u64,
+    pub code: String,
+    /// Optional operator pre-assigned NodeId; joiner may override with --node-id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<u64>,
+}
+
+impl Bundle {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.application_version != APPLICATION_VERSION
+            || self.cluster_id.is_empty()
+            || self.cluster_id.len() > 64
+            || self.code.len() != 64
+            || !self
+                .code
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || self.node_id.is_some_and(|id| id == 0)
+        {
+            return Err("invalid replica join bundle".into());
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for Bundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReplicaJoinBundle([redacted])")
+    }
+}
 
 pub fn transport_fingerprint(psk: libp2p::pnet::PreSharedKey) -> String {
     use sha2::{Digest, Sha256};

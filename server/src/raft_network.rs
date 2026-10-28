@@ -341,7 +341,7 @@ impl Network {
             return Err(unavailable("unauthorized target"));
         }
         let request = Request {
-            application_version: cat4igp_shared::discovery::join::APPLICATION_VERSION,
+            application_version: cat4igp_shared::compat::APPLICATION_VERSION,
             cluster: self.cluster.clone(),
             source: self.id,
             target,
@@ -568,8 +568,15 @@ fn authorized(network: &Network, peer: PeerId, request: &Request) -> bool {
         Rpc::Append(r) => r.vote.leader_id.node_id,
         Rpc::Snapshot(r) => r.vote.leader_id.node_id,
     };
-    request.application_version == cat4igp_shared::discovery::join::APPLICATION_VERSION
+    // Rolling window: accept the local epoch or one below. Directional sync only,
+    // any wire_incompatible peer is rejected exactly as before.
+    cat4igp_shared::compat::wire_compatible(request.application_version)
         && request.cluster == network.cluster
+        // Snapshot install is persisted state; it stays epoch-exact. A lagging peer
+        // cannot consume an epoch-4 Image (unknown tables), so it must not be the
+        // snapshot target while the window is open.
+        && (cat4igp_shared::compat::APPLICATION_VERSION == request.application_version
+            || !matches!(request.rpc, Rpc::Snapshot(_)))
         && (!matches!(request.rpc, Rpc::Operator(_))
             || network.bootstrap.get(&request.source).map(|b| b.peer) == Some(peer)
             || (matches!(
@@ -578,6 +585,33 @@ fn authorized(network: &Network, peer: PeerId, request: &Request) -> bool {
                     crate::cluster::Operation::Discovery { .. }
                         | crate::cluster::Operation::Client { .. }
                         | crate::cluster::Operation::AffectedSnapshots { .. }
+                        | crate::cluster::Operation::Invite { .. }
+                        | crate::cluster::Operation::OpenEpochWindow(_)
+                        | crate::cluster::Operation::CloseEpochWindow
+                        | crate::cluster::Operation::WindowStatus
+                        | crate::cluster::Operation::ProbeEpoch
+                        | crate::cluster::Operation::Admin(
+                            crate::admin::Operation::Account
+                                | crate::admin::Operation::Inventory
+                                | crate::admin::Operation::Status
+                                | crate::admin::Operation::Replicas
+                        )
+                        | crate::cluster::Operation::Admin(crate::admin::Operation::Mutate(
+                            crate::admin::Mutation {
+                                action: crate::admin::Action::RenameNode { .. }
+                                    | crate::admin::Action::RenameMesh { .. }
+                                    | crate::admin::Action::InvalidateInvite { .. }
+                                    | crate::admin::Action::CreateMesh { .. }
+                                    | crate::admin::Action::SetMeshFec { .. }
+                                    | crate::admin::Action::SetMeshMtu { .. }
+                                    | crate::admin::Action::AddMembership { .. }
+                                    | crate::admin::Action::RemoveMembership { .. }
+                                    | crate::admin::Action::DeleteMesh { .. }
+                                    | crate::admin::Action::DeleteNode { .. }
+                                    | crate::admin::Action::RemoveTunnelIntent { .. },
+                                ..
+                            }
+                        ))
                 )
             ) && network
                 .relay_authority
@@ -775,7 +809,7 @@ async fn run(
                 let Some(binding) = network.bindings.borrow().get(&call.target).cloned() else {
                     let _ = call.reply.send(Err("authorization removed")); continue;
                 };
-                let request = Request { application_version: cat4igp_shared::discovery::join::APPLICATION_VERSION, cluster: call.cluster, source: network.id, target: call.target, rpc: call.rpc };
+                let request = Request { application_version: cat4igp_shared::compat::APPLICATION_VERSION, cluster: call.cluster, source: network.id, target: call.target, rpc: call.rpc };
                 let request_id = swarm.behaviour_mut().rpc.send_request_with_addresses(&binding.peer, request, vec![binding.address]);
                 pending.insert(request_id, (binding.peer, Instant::now() + DEADLINE, call.reply));
             }

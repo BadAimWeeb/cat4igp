@@ -16,6 +16,8 @@ pub struct Config {
     pub decode_fast_send: bool,
     pub replay_window_blocks: usize,
     pub initial_peer_addr: Option<SocketAddr>,
+    /// Shared random 32-byte key; None explicitly permits unauthenticated discovery.
+    pub handshake_psk: Option<[u8; 32]>,
     pub enforce_local_source: bool,
 }
 
@@ -34,6 +36,7 @@ impl Default for Config {
             decode_fast_send: true,
             replay_window_blocks: 1024,
             initial_peer_addr: None,
+            handshake_psk: None,
             enforce_local_source: true,
         }
     }

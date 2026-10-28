@@ -170,21 +170,34 @@ impl Tunnel for WireGuardTunnel {
     }
 
     async fn destroy(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        Device::get(
-            &InterfaceName::from_str(self.interface.as_str()).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "failed to parse interface name",
-                )
-            })?,
+        let ifname = InterfaceName::from_str(self.interface.as_str()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to parse interface name",
+            )
+        })?;
+        #[cfg(target_os = "linux")]
+        if !self.force_userspace {
+            let name = std::ffi::CString::new(self.interface.as_str())?;
+            // Kernel WireGuard may report ENODEV instead of ErrorKind::NotFound.
+            if unsafe { libc::if_nametoindex(name.as_ptr()) } == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENODEV) {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+        }
+        let result = Device::get(
+            &ifname,
             if self.force_userspace {
                 Backend::Userspace
             } else {
                 BACKEND
             },
-        )?
-        .delete()?;
-
+        )
+        .and_then(Device::delete);
+        cleanup_result(result)?;
         Ok(())
     }
 
@@ -211,5 +224,45 @@ impl Tunnel for WireGuardTunnel {
 
     fn get_interface_name(&self) -> &str {
         self.interface.as_str()
+    }
+}
+
+fn cleanup_result(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn teardown_absent_and_preserve_errors() {
+        assert!(cleanup_result(Ok(())).is_ok());
+        assert!(cleanup_result(Err(io::ErrorKind::NotFound.into())).is_ok());
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::Other,
+        ] {
+            assert_eq!(cleanup_result(Err(kind.into())).unwrap_err().kind(), kind);
+        }
+        let mut tunnel = WireGuardTunnel::new_userspace(
+            format!("t{:x}", std::process::id()),
+            String::new(),
+            String::new(),
+            None,
+            None,
+        );
+        tunnel.destroy().await.unwrap();
+        tunnel.destroy().await.unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            tunnel.force_userspace = false;
+            tunnel.destroy().await.unwrap();
+            tunnel.destroy().await.unwrap();
+        }
     }
 }

@@ -123,6 +123,42 @@ impl DaemonMemory {
             .collect();
         let memory_arc = Arc::new(self.clone());
 
+        // Removals run before fallible creations; failed teardown stays tracked for the next poll.
+        let stale_ids: Vec<i32> = active
+            .keys()
+            .copied()
+            .filter(|id| !desired_ids.contains(id))
+            .collect();
+        let mut removal_error = None;
+        for id in stale_ids {
+            if let Some(stale) = active.get_mut(&id) {
+                let teardown = stale.teardown().await.map_err(|error| error.to_string());
+                match teardown {
+                    Ok(()) => {
+                        active.remove(&id);
+                        self.release_tunnel_port(id).await;
+                        self.advertised_endpoints.lock().await.remove(&id);
+                    }
+                    Err(error) => {
+                        removal_error = Some(format!("failed to teardown tunnel {id}: {error}"))
+                    }
+                }
+            }
+        }
+        let snapshot_ids: HashSet<i32> = snapshot.tunnels.iter().map(|t| t.tunnel_id).collect();
+        let unused: Vec<i32> = self
+            .reserved_ports
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .filter(|id| !snapshot_ids.contains(id) && !active.contains_key(id))
+            .collect();
+        for id in unused {
+            self.release_tunnel_port(id).await;
+            self.advertised_endpoints.lock().await.remove(&id);
+        }
+
         for tunnel in &snapshot.tunnels {
             let is_ready = matches!(tunnel.local_answered, WireguardAnswered::Answered)
                 && matches!(tunnel.remote_response, WireguardAnswered::Answered);
@@ -166,7 +202,16 @@ impl DaemonMemory {
                 .await
                 .map_err(|error| error.to_string());
             if let Err(error) = activation_result {
-                self.release_tunnel_port(tunnel.tunnel_id).await;
+                // A partially created interface must remain tracked if cleanup fails.
+                if new_tunnel.teardown().await.is_err() {
+                    active.insert(tunnel.tunnel_id, new_tunnel);
+                } else {
+                    self.release_tunnel_port(tunnel.tunnel_id).await;
+                    self.advertised_endpoints
+                        .lock()
+                        .await
+                        .remove(&tunnel.tunnel_id);
+                }
                 return Err(format!(
                     "failed to setup tunnel {}: {error}",
                     tunnel.tunnel_id
@@ -175,25 +220,26 @@ impl DaemonMemory {
             active.insert(tunnel.tunnel_id, new_tunnel);
         }
 
-        let stale_ids: Vec<i32> = active
-            .keys()
-            .copied()
-            .filter(|id| !desired_ids.contains(id))
-            .collect();
-
-        for stale_id in stale_ids {
-            if let Some(mut stale) = active.remove(&stale_id) {
-                self.release_tunnel_port(stale_id).await;
-                self.advertised_endpoints.lock().await.remove(&stale_id);
-                if let Err(e) = stale.teardown().await {
-                    eprintln!(
-                        "[daemon] failed to teardown stale tunnel {}: {}",
-                        stale_id, e
-                    );
-                }
-            }
-        }
-
-        Ok(())
+        removal_error.map_or(Ok(()), Err)
     }
+}
+
+#[tokio::test]
+async fn empty_snapshot_releases_inactive_reservations() {
+    let memory = DaemonMemory::new(ClientConfig::default());
+    memory.reserve_tunnel_port(7).await.unwrap();
+    memory.remember_endpoint(7, "127.0.0.1:1234".into()).await;
+    memory
+        .reconcile_wireguard_tunnels(
+            &TopologySnapshot {
+                node_id: 1,
+                revision: 1,
+                tunnels: vec![],
+            },
+            "",
+        )
+        .await
+        .unwrap();
+    assert!(memory.reserved_ports.lock().await.is_empty());
+    assert!(memory.advertised_endpoints.lock().await.is_empty());
 }

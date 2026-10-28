@@ -21,10 +21,31 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 openraft::declare_raft_types!(pub TypeConfig: D = Command, R = Result<Option<String>, String>, SnapshotData = SnapshotData);
 
+/// Rolling-upgrade window state, committed through the replicated write path.
+/// An epoch-4 leader commits `Mixed(minimum_peer_epoch)` while any quorum replica
+/// still runs an older binary, and later closes the window with `Stable(4)` once
+/// every member is upgraded. Persisted state stays epoch-exact regardless.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "window", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum EpochWindow {
+    Stable { epoch: u8 },
+    Mixed { epoch: u8, minimum_peer: u8 },
+}
+
+impl EpochWindow {
+    pub(crate) fn window_open(&self) -> bool {
+        matches!(self, EpochWindow::Mixed { .. })
+    }
+    fn epoch_current(epoch: u8) -> bool {
+        epoch == cat4igp_shared::compat::APPLICATION_VERSION
+    }
+}
+
 // Authenticated principals are captured at ingress, never inferred from a forwarding replica.
 // ponytail: trusted callers only; authenticated cluster forwarding must preserve these bindings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
+    Admin(crate::admin::Mutation),
     Initialize(crate::db::InitializeCommand),
     LegacyImport(Vec<Vec<serde_json::Value>>),
     AuthorityInit(crate::cluster::AuthorityInit),
@@ -40,6 +61,12 @@ pub enum Command {
         complete: bool,
     },
     Roster(cat4igp_shared::discovery::Signed<cat4igp_shared::discovery::ControllerRoster>),
+    ServingGrant {
+        request_id: String,
+        fingerprint: String,
+        expected_revision: u64,
+        roster: cat4igp_shared::discovery::Signed<cat4igp_shared::discovery::ControllerRoster>,
+    },
     Invite(crate::db::InviteCommand),
     // ponytail: internal committed mesh setup only; operator mesh CRUD needs authenticated ingress.
     Mesh {
@@ -56,6 +83,7 @@ pub enum Command {
         peer_id: String,
         command: crate::db::AnswerCommand,
     },
+    EpochWindow(EpochWindow),
 }
 
 const SNAPSHOT_LIMIT: usize = 16 * 1024 * 1024;
@@ -102,6 +130,43 @@ fn put<T: Serialize>(conn: &mut SqliteConnection, key: &str, value: &T) -> Resul
     diesel::sql_query("INSERT INTO raft_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
         .bind::<Text, _>(key).bind::<Text, _>(serde_json::to_string(value)?).execute(conn)?;
     Ok(())
+}
+
+/// Inspect existing consensus state without configuring WAL, migrating, or creating a DB.
+pub(crate) fn preflight_application_version(path: &str) -> Result<(), String> {
+    let inspect = || -> Result<(), Error> {
+        // ponytail: clustered storage uses filesystem paths; add explicit URI parsing if needed.
+        if path.is_empty()
+            || path == ":memory:"
+            || path.starts_with("file:")
+            || path.starts_with("sqlite:")
+        {
+            return Err("cluster database must be a filesystem path".into());
+        }
+        let path = match std::fs::canonicalize(path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        use std::os::unix::ffi::OsStrExt;
+        let encoded: String = path
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("%{b:02X}"))
+            .collect();
+        let mut conn = SqliteConnection::establish(&format!("file:{encoded}?mode=ro"))?;
+        let tables = diesel::sql_query(
+            "SELECT name AS value FROM sqlite_schema WHERE name IN ('raft_meta', 'raft_logs')",
+        )
+        .load::<Row>(&mut conn)?;
+        match tables.len() {
+            0 => Ok(()), // Fresh or standalone legacy database; no consensus tables.
+            2 => check_application_version(&mut conn),
+            _ => Err("incomplete consensus metadata".into()),
+        }
+    };
+    inspect().map_err(|_| "cluster application compatibility preflight failed; incompatible or unreadable consensus state".into())
 }
 
 fn check_application_version(conn: &mut SqliteConnection) -> Result<(), Error> {
@@ -348,7 +413,7 @@ impl RaftStateMachine<TypeConfig> for Store {
                             let existing = application_tables(conn)?;
                             if existing == tables {
                                 Ok(None)
-                            } else if existing.iter().any(|rows| !rows.is_empty()) {
+                            } else if existing.iter().zip(TABLES).any(|(rows, (table, _))| if *table == "management_ids" { rows.iter().any(|row| row[1] != 0) } else { !rows.is_empty() }) {
                                 Err("legacy import requires empty application state".into())
                             } else {
                                 insert_tables(conn, &tables)?;
@@ -357,6 +422,7 @@ impl RaftStateMachine<TypeConfig> for Store {
                         }
                         EntryPayload::Normal(Command::AuthorityInit(command)) => crate::cluster::apply_authority_init(conn, &command)?,
                         EntryPayload::Normal(Command::Roster(roster)) => crate::cluster::apply_roster(conn, &roster)?,
+                        EntryPayload::Normal(Command::ServingGrant { request_id, fingerprint, expected_revision, roster }) => crate::admin::apply_serving_grant(conn, &request_id, &fingerprint, expected_revision, &roster)?,
                         EntryPayload::Normal(Command::ReplicaCode(command)) => crate::cluster::apply_code_rotation(conn, &command)?,
                         EntryPayload::Normal(Command::Transport { active, next, complete }) => crate::cluster::apply_transport(conn, &active, &next, complete)?,
                         EntryPayload::Normal(Command::Admission(command)) => crate::cluster::apply_admission(conn, &command)?,
@@ -371,6 +437,9 @@ impl RaftStateMachine<TypeConfig> for Store {
                         EntryPayload::Normal(Command::Invite(command)) => {
                             crate::db::apply_invite(conn, &command)?.map(Some)
                         }
+                        EntryPayload::Normal(Command::Admin(command)) => {
+                            crate::admin::apply(conn, &command)?
+                        }
                         EntryPayload::Normal(Command::Mesh { id, name, mtu, created_at }) => {
                             use crate::schema::mesh_groups::dsl;
                             if id <= 0 || name.is_empty() || name.len() > 128 || !(1280..=9000).contains(&mtu) {
@@ -381,6 +450,8 @@ impl RaftStateMachine<TypeConfig> for Store {
                                 } else {
                                     Err("mesh ID conflict".into())
                                 }
+                            } else if id < crate::db::next_management_id(conn, "mesh")? {
+                                Err("mesh ID retired".into())
                             } else {
                                 diesel::insert_into(dsl::mesh_groups).values((dsl::id.eq(id), dsl::name.eq(name), dsl::auto_wireguard.eq(true), dsl::auto_wireguard_mtu.eq(mtu), dsl::created_at.eq(created_at))).execute(conn)?;
                                 Ok(None)
@@ -410,6 +481,17 @@ impl RaftStateMachine<TypeConfig> for Store {
                                 let result = crate::db::apply_answer(conn, &command)?;
                                 if result == "accepted" { Ok(Some(result)) } else { Err(result) }
                             }
+                        }
+                        EntryPayload::Normal(Command::EpochWindow(window)) => {
+                            match &window {
+                                EpochWindow::Stable { epoch } if EpochWindow::epoch_current(*epoch) => (),
+                                EpochWindow::Mixed { epoch, minimum_peer }
+                                    if EpochWindow::epoch_current(*epoch)
+                                        && cat4igp_shared::compat::wire_compatible(*minimum_peer) => (),
+                                _ => return Err("invalid epoch window".into()),
+                            }
+                            put(conn, "epoch_window", &window)?;
+                            Ok(None)
                         }
                     };
                     put(conn, "applied", &Some(entry.log_id))?;
@@ -495,7 +577,7 @@ const TABLES: &[(&str, &str)] = &[
     ),
     (
         "mesh_groups",
-        "id,name,auto_wireguard,auto_wireguard_mtu,created_at",
+        "id,name,auto_wireguard,auto_wireguard_mtu,created_at,auto_wireguard_fec",
     ),
     (
         "mesh_group_memberships",
@@ -519,6 +601,11 @@ const TABLES: &[(&str, &str)] = &[
         "peer_id,request_id,fingerprint,result",
     ),
     ("operator_invite_results", "request_id,fingerprint,result"),
+    ("administrator", "id,username,password_hash"),
+    ("administrator_results", "request_id,fingerprint,result"),
+    ("management_ids", "kind,high_water"),
+    ("node_revocations", "peer_id,node_id,revoked_at"),
+    ("tunnel_intents", "tunnel_id,kind,mesh_id"),
 ];
 
 fn filter(table: &str) -> &'static str {
@@ -581,7 +668,12 @@ fn insert_tables(
             {
                 return Err("local setting in application import".into());
             }
-            diesel::sql_query(format!("WITH row(value) AS (VALUES (?)) INSERT INTO {table} ({columns}) SELECT {values} FROM row"))
+            let insert = if *table == "management_ids" {
+                "INSERT OR REPLACE"
+            } else {
+                "INSERT"
+            };
+            diesel::sql_query(format!("WITH row(value) AS (VALUES (?)) {insert} INTO {table} ({columns}) SELECT {values} FROM row"))
                 .bind::<Text, _>(serde_json::to_string(row)?).execute(conn)?;
         }
     }

@@ -118,6 +118,7 @@ pub struct MeshGroup {
     pub auto_wireguard: bool,
     pub auto_wireguard_mtu: i32,
     pub created_at: chrono::NaiveDateTime,
+    pub auto_wireguard_fec: bool,
 }
 
 #[derive(Insertable)]

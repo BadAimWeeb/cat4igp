@@ -27,6 +27,308 @@ impl Drop for Database {
     }
 }
 struct Builder;
+
+#[tokio::test]
+async fn mesh_fec_snapshot_round_trip() {
+    let db = Database::new();
+    let mut store = Store::open(db.0.clone()).await.unwrap();
+    let create = Command::Admin(crate::admin::Mutation {
+        request_id: "fec-mesh".into(),
+        action: crate::admin::Action::CreateMesh {
+            name: "fec".into(), auto_wireguard: true, mtu: 1420, fec: true,
+        },
+        applied_at: chrono::Utc::now().naive_utc(),
+    });
+    assert!(store.apply([entry(1, EntryPayload::Normal(create))]).await.unwrap()[0].is_ok());
+    let snapshot = store.build_snapshot().await.unwrap();
+    let target = Database::new();
+    let mut restored = Store::open(target.0.clone()).await.unwrap();
+    restored.install_snapshot(&snapshot.meta, snapshot.snapshot).await.unwrap();
+    restored.run(|conn| {
+        assert_eq!(crate::admin::read(conn, crate::admin::Operation::Inventory)?["meshes"][0]["fec"], true);
+        Ok(())
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_mesh_replay_and_deleted_highest_id_nonreuse() {
+    let db = Database::new();
+    let mut store = Store::open(db.0.clone()).await.unwrap();
+    let at = chrono::Utc::now().naive_utc();
+    let mesh = Command::Mesh {
+        id: 5,
+        name: "highest".into(),
+        mtu: 1280,
+        created_at: at,
+    };
+    for index in 1..=2 {
+        assert!(
+            store
+                .apply([entry(index, EntryPayload::Normal(mesh.clone()))])
+                .await
+                .unwrap()[0]
+                .is_ok()
+        );
+    }
+    assert!(
+        store
+            .apply([entry(
+                3,
+                EntryPayload::Normal(Command::Admin(crate::admin::Mutation {
+                    request_id: "delete-highest".into(),
+                    action: crate::admin::Action::DeleteMesh { id: 5 },
+                    applied_at: at,
+                }))
+            )])
+            .await
+            .unwrap()[0]
+            .is_ok()
+    );
+    for (index, id) in [(4, 5), (5, 4), (6, 6)] {
+        let result = store
+            .apply([entry(
+                index,
+                EntryPayload::Normal(Command::Mesh {
+                    id,
+                    name: "replacement".into(),
+                    mtu: 1280,
+                    created_at: at,
+                }),
+            )])
+            .await
+            .unwrap();
+        assert_eq!(result[0].is_ok(), id == 6);
+    }
+    store
+        .run(|conn| {
+            assert_eq!(
+                crate::schema::mesh_groups::table
+                    .select(crate::schema::mesh_groups::id)
+                    .load::<i32>(conn)?,
+                vec![6]
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn management_overlap_revocation_replay_snapshot_and_rollback() {
+    use crate::admin::{Action, IntentKind, Mutation};
+    let db = Database::new();
+    let mut store = Store::open(db.0.clone()).await.unwrap();
+    store.run(|conn| {
+        conn.batch_execute("INSERT INTO nodes(id,name,auth_key) VALUES(1,'one','one'),(2,'two','two');
+            INSERT INTO node_control_identities(node_id,peer_id,signing_key,encryption_key) VALUES(1,'peer1','key','key'),(2,'peer2','key','key');
+            INSERT INTO wireguard_static_key(node_id,public_key) VALUES(1,'key'),(2,'key');
+            INSERT INTO mesh_groups(id,name,auto_wireguard,auto_wireguard_mtu,created_at) VALUES(1,'a',1,1280,'2026-10-05 00:00:00'),(2,'b',1,1420,'2026-10-05 00:00:00');
+            INSERT INTO invites(code,override_join_mesh) VALUES('mesh-a',1);
+            INSERT INTO control_enrollment_results(peer_id,request_id,fingerprint,result) VALUES('peer2','old','{}','{\"Enrolled\":{\"node_id\":2}}');")?;
+        Ok(())
+    }).await.unwrap();
+    let at = chrono::DateTime::from_timestamp(1_790_812_800, 0)
+        .unwrap()
+        .naive_utc();
+    let command = |key: &str, action| {
+        Command::Admin(Mutation {
+            request_id: key.into(),
+            action,
+            applied_at: at,
+        })
+    };
+    let mut index = 0;
+    for (key, action) in [
+        (
+            "a1",
+            Action::AddMembership {
+                mesh_id: 1,
+                node_id: 1,
+            },
+        ),
+        (
+            "a2",
+            Action::AddMembership {
+                mesh_id: 1,
+                node_id: 2,
+            },
+        ),
+        (
+            "b1",
+            Action::AddMembership {
+                mesh_id: 2,
+                node_id: 1,
+            },
+        ),
+        (
+            "b2",
+            Action::AddMembership {
+                mesh_id: 2,
+                node_id: 2,
+            },
+        ),
+        ("delete-a", Action::DeleteMesh { id: 1 }),
+    ] {
+        index += 1;
+        assert!(
+            store
+                .apply([entry(index, EntryPayload::Normal(command(key, action)))])
+                .await
+                .unwrap()[0]
+                .is_ok()
+        );
+    }
+    store
+        .run(|conn| {
+            let inv = crate::admin::read(conn, crate::admin::Operation::Inventory)?;
+            assert_eq!(inv["tunnels"].as_array().unwrap().len(), 2);
+            assert!(
+                inv["tunnels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|t| t["mtu"] == 1280 && t["intents"].as_array().unwrap().len() == 1)
+            );
+            assert!(inv["invites"].as_array().unwrap().is_empty());
+            assert_eq!(
+                crate::db::control_identity_for_node(conn, 1)?.topology_revision,
+                1
+            );
+            // Unknown historical ownership is explicitly retained through membership removal.
+            conn.batch_execute(
+                "INSERT INTO tunnel_intents SELECT id,'legacy',0 FROM wireguard_tunnels;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    index += 1;
+    store
+        .apply([entry(
+            index,
+            EntryPayload::Normal(command(
+                "remove-b",
+                Action::RemoveMembership {
+                    mesh_id: 2,
+                    node_id: 2,
+                },
+            )),
+        )])
+        .await
+        .unwrap();
+    let before = store.build_snapshot().await.unwrap();
+    store.run(|conn| {
+        let inv = crate::admin::read(conn,crate::admin::Operation::Inventory)?;
+        assert_eq!(inv["tunnels"].as_array().unwrap().len(),2);
+        conn.batch_execute("CREATE TRIGGER management_abort BEFORE DELETE ON nodes BEGIN SELECT RAISE(ABORT,'rollback'); END;")?;
+        Ok(())
+    }).await.unwrap();
+    let deletion = command("delete-node", Action::DeleteNode { id: 2 });
+    assert!(
+        store
+            .apply([entry(index + 1, EntryPayload::Normal(deletion.clone()))])
+            .await
+            .is_err()
+    );
+    let after = store.build_snapshot().await.unwrap();
+    let before: Image = serde_json::from_slice(before.snapshot.0.get_ref()).unwrap();
+    let after: Image = serde_json::from_slice(after.snapshot.0.get_ref()).unwrap();
+    assert_eq!(before.tables, after.tables);
+    store
+        .run(|conn| {
+            conn.batch_execute("DROP TRIGGER management_abort")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // Explicit legacy confirmation removes only the selected address family.
+    index += 1;
+    store
+        .apply([entry(
+            index,
+            EntryPayload::Normal(command(
+                "confirm",
+                Action::RemoveTunnelIntent {
+                    tunnel_id: 1,
+                    kind: IntentKind::Legacy,
+                },
+            )),
+        )])
+        .await
+        .unwrap();
+    store
+        .run(|conn| {
+            assert_eq!(
+                crate::admin::read(conn, crate::admin::Operation::Inventory)?["tunnels"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    index += 1;
+    let result = store
+        .apply([entry(index, EntryPayload::Normal(deletion.clone()))])
+        .await
+        .unwrap();
+    assert!(result[0].is_ok());
+    store
+        .run(|conn| {
+            assert!(crate::db::identity_revoked(conn, "peer2")?);
+            assert!(crate::db::control_identity_for_peer(conn, "peer2").is_err());
+            let retry = crate::db::EnrollmentCommand {
+                request: cat4igp_shared::control::EnrollmentRequest {
+                    request_id: "old".into(), node_name: "two".into(), invitation_code: "mesh-a".into(),
+                    client_peer_id: "peer2".into(), client_signing_key: "key".into(),
+                    client_encryption_key: "key".into(), wireguard_public_key: "key".into(),
+                },
+                node_id: 3, auth_key: "new".into(), applied_at: chrono::Utc::now().naive_utc(),
+                allocation: crate::db::EnrollmentAllocation { membership: None, tunnels: vec![] },
+                response: cat4igp_shared::control::EnrollmentResponse {
+                    node_id: 3, topology_revision: 0, network_id: "test".into(),
+                    controller_signing_key: "key".into(), controller_encryption_key: "key".into(),
+                },
+            };
+            assert!(matches!(crate::db::apply_enrollment(conn, &retry)?.0,
+                cat4igp_shared::control::ControlResponse::Rejected(reason) if reason == "identity permanently revoked"));
+            assert!(crate::db::authenticate(conn, "two").is_err());
+            assert_eq!(crate::db::next_management_id(conn, "node")?, 3);
+            let inv = crate::admin::read(conn, crate::admin::Operation::Inventory)?;
+            assert!(inv["tunnels"].as_array().unwrap().is_empty());
+            assert_eq!(
+                crate::db::control_identity_for_node(conn, 1)?.topology_revision,
+                3
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let restored = Database::new();
+    let mut receiver = Store::open(restored.0.clone()).await.unwrap();
+    let snap = store.build_snapshot().await.unwrap();
+    receiver
+        .install_snapshot(&snap.meta, snap.snapshot)
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver
+            .apply([entry(index + 1, EntryPayload::Normal(deletion))])
+            .await
+            .unwrap(),
+        result
+    );
+    receiver
+        .run(|conn| {
+            assert!(crate::db::identity_revoked(conn, "peer2")?);
+            assert_eq!(crate::db::next_management_id(conn, "node")?, 3);
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
 impl StoreBuilder<TypeConfig, Store, Store, Database> for Builder {
     async fn build(&self) -> Result<(Database, Store, Store), StorageError<u64>> {
         let db = Database::new();
@@ -62,7 +364,8 @@ async fn incompatible_application_rejects_without_mutation() {
         let mut image: serde_json::Value =
             serde_json::from_slice(good.snapshot.0.get_ref()).unwrap();
         if future {
-            image["application_version"] = 2.into();
+            image["application_version"] =
+                (cat4igp_shared::discovery::join::APPLICATION_VERSION + 1).into();
         } else {
             image.as_object_mut().unwrap().remove("application_version");
         }
@@ -91,7 +394,11 @@ async fn incompatible_application_rejects_without_mutation() {
         store
             .run(move |conn| {
                 if future {
-                    put(conn, "application_version", &2u8)?;
+                    put(
+                        conn,
+                        "application_version",
+                        &(cat4igp_shared::discovery::join::APPLICATION_VERSION + 1),
+                    )?;
                 } else {
                     diesel::sql_query("DELETE FROM raft_meta WHERE key='application_version'")
                         .execute(conn)?;
@@ -657,9 +964,56 @@ async fn snapshot_preserves_all_application_tables_and_initialization() {
             INSERT INTO wireguard_tunnels(id,node_id_peer1,node_id_peer2,endpoint_ipv6) VALUES(1,1,2,0);
             INSERT INTO control_answer_results(node_id,request_id,fingerprint,result,expires_at) VALUES(1,'answer','f','accepted','2026-10-03');
             INSERT INTO control_enrollment_results(peer_id,request_id,fingerprint,result) VALUES('peer','enroll','f','{}');
-            INSERT INTO operator_invite_results(request_id,fingerprint,result) VALUES('invite','f','{}');")?;
+            INSERT INTO operator_invite_results(request_id,fingerprint,result) VALUES('invite','f','{}');
+            INSERT INTO administrator(id,username,password_hash) VALUES(1,'admin','hash');
+            INSERT INTO administrator_results(request_id,fingerprint,result) VALUES('admin','f','{}');
+            INSERT INTO node_revocations(peer_id,node_id,revoked_at) VALUES('deleted',3,'2026-10-05');
+            INSERT INTO tunnel_intents(tunnel_id,kind,mesh_id) VALUES(1,'legacy',0);")?;
         Ok(())
     }).await.unwrap();
+    let at = chrono::Utc::now().naive_utc();
+    let rename = crate::admin::Mutation {
+        request_id: "snapshot-rename".into(),
+        action: crate::admin::Action::RenameMesh {
+            id: 1,
+            name: "renamed".into(),
+        },
+        applied_at: at,
+    };
+    let invalidate = crate::admin::Mutation {
+        request_id: "snapshot-invalidate".into(),
+        action: crate::admin::Action::InvalidateInvite { id: 2 },
+        applied_at: at,
+    };
+    let invite = crate::db::InviteCommand {
+        request_id: "snapshot-invite".into(),
+        id: 2,
+        code: "snapshot-secret".into(),
+        expires_at: None,
+        max_uses: None,
+        join_mesh: Some(1),
+        applied_at: at,
+    };
+    let saved_invite = invite.clone();
+    store
+        .run(move |conn| {
+            assert!(crate::db::apply_invite(conn, &saved_invite)?.is_ok());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    for (index, command) in [rename.clone(), invalidate.clone()].into_iter().enumerate() {
+        assert!(
+            store
+                .apply([entry(
+                    index as u64 + 1,
+                    EntryPayload::Normal(Command::Admin(command))
+                )])
+                .await
+                .unwrap()[0]
+                .is_ok()
+        );
+    }
     let snap = store.build_snapshot().await.unwrap();
     let original: Image = serde_json::from_slice(snap.snapshot.0.get_ref()).unwrap();
     assert!(original.tables.iter().all(|rows| !rows.is_empty()));
@@ -672,6 +1026,46 @@ async fn snapshot_preserves_all_application_tables_and_initialization() {
     let restored: Image = serde_json::from_slice(restored.snapshot.0.get_ref()).unwrap();
     assert_eq!(original.tables, restored.tables);
     assert_eq!(original.meta.last_log_id, restored.meta.last_log_id);
+    drop(receiver);
+    let mut receiver = Store::open(target.0.clone()).await.unwrap();
+    for (index, command) in [rename.clone(), invalidate.clone()].into_iter().enumerate() {
+        assert_eq!(
+            receiver
+                .apply([entry(
+                    index as u64 + 3,
+                    EntryPayload::Normal(Command::Admin(command))
+                )])
+                .await
+                .unwrap(),
+            vec![Ok(Some("{\"committed\":true}".into()))]
+        );
+    }
+    receiver
+        .run(move |conn| {
+            assert_eq!(
+                crate::db::apply_invite(conn, &invite)?,
+                Err("invite invalidated by administrator".into())
+            );
+            assert!(crate::db::get_invites(conn)?.iter().all(|i| i.id != 2));
+            let mut changed = rename;
+            changed.action = crate::admin::Action::RenameMesh {
+                id: 1,
+                name: "changed".into(),
+            };
+            assert_eq!(
+                crate::admin::apply(conn, &changed)?,
+                Err("idempotency key conflict".into())
+            );
+            let mut changed = invalidate;
+            changed.action = crate::admin::Action::InvalidateInvite { id: 1 };
+            assert_eq!(
+                crate::admin::apply(conn, &changed)?,
+                Err("idempotency key conflict".into())
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

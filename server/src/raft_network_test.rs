@@ -653,7 +653,7 @@ async fn binding_cluster_bounds_deadline_overload_and_persistent_identity() {
         rpc: vote(1),
     };
     assert!(authorized(&network, a.public().to_peer_id(), &request));
-    request.application_version = 2;
+    request.application_version = cat4igp_shared::discovery::join::APPLICATION_VERSION + 1;
     assert!(!authorized(&network, a.public().to_peer_id(), &request));
     request.application_version = cat4igp_shared::discovery::join::APPLICATION_VERSION;
     let mut missing = serde_json::to_value(&request).unwrap();

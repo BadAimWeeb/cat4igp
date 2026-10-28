@@ -14,6 +14,12 @@ pub(crate) async fn make_router(
                 "CAT4IGP Controller Server - https://github.com/BadAimWeeb/cat4igp"
             }),
         )
+        .nest(
+            "/admin",
+            crate::admin::router(jobs.clone())
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e })?,
+        )
         .nest("/operator", make_router_operator(jobs).await?))
 }
 

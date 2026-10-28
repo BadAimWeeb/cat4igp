@@ -53,7 +53,7 @@ impl WireguardTunnelC {
             // ponytail: use the active WireGuard/FEC socket for retries when socket handoff is supported.
             let _ = crate::network::ports::punch_udp(port, peer).await;
         }
-        let fec_res = Self::gen_new_fec(rest_info.clone(), port).await?;
+        let fec_res = Self::gen_new_fec(rest_info.clone(), port, &local_private_key).await?;
 
         let (fec, os_tun) = if let Some((fec, fec_listen_port, wg_port)) = fec_res {
             let fec1 = fec.clone();
@@ -90,12 +90,19 @@ impl WireguardTunnelC {
     async fn gen_new_fec(
         rest_info: Arc<WireguardTunnelInfo>,
         port: u16,
+        local_private_key: &str,
     ) -> Result<Option<(Arc<FEC::PeerEngine>, u16, u16)>, Box<dyn Error>> {
         if rest_info.fec {
+            let local = wireguard_control::Key::from_base64(local_private_key)
+                .map_err(|_| "invalid local WireGuard private key for FEC handshake")?;
+            let remote = wireguard_control::Key::from_base64(&rest_info.public_key)
+                .map_err(|_| "invalid peer WireGuard public key for FEC handshake")?;
+            let psk = FEC::tunnel_psk(local.0, remote.0, rest_info.tunnel_id)
+                .ok_or("invalid peer WireGuard public key for FEC handshake")?;
             let local_bind_port = crate::network::ports::get_random_udp_port()?;
             let local_app_port = crate::network::ports::get_random_udp_port()?;
 
-            let cfg = FEC::Config::new(
+            let mut cfg = FEC::Config::new(
                 SocketAddr::new(
                     if rest_info.endpoint_ipv6 {
                         std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
@@ -113,6 +120,13 @@ impl WireguardTunnelC {
                     local_app_port,
                 ),
             );
+            cfg.initial_peer_addr = rest_info
+                .remote_endpoint
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(|_| "invalid remote endpoint")?;
+            cfg.handshake_psk = Some(psk);
             Ok(Some((
                 Arc::new(FEC::PeerEngine::start(cfg).await?),
                 local_bind_port,
@@ -202,19 +216,24 @@ impl WireguardTunnelC {
         }
 
         self.mtu = rest_info.mtu;
-        if self.ipv6 != rest_info.endpoint_ipv6 {
+        if self.ipv6 != rest_info.endpoint_ipv6 || self.fec.is_some() != rest_info.fec {
             // Completely destroy and recreate the tunnel because of name
             let local_private_key = self.os_tun.get_local_private_key().to_string();
 
             let ifcreated = self.os_tun.is_ift_created();
-            let _ = self.os_tun.destroy();
-            self.ipv6 = rest_info.endpoint_ipv6;
+            self.os_tun.destroy().await?;
+            if let Some(fec) = self.fec.take() {
+                Arc::try_unwrap(fec)
+                    .map_err(|_| "FEC engine still in use")?
+                    .shutdown()
+                    .await;
+            }
 
             let port = daemon_memory
                 .reserve_tunnel_port(rest_info.tunnel_id)
                 .await
                 .map_err(std::io::Error::other)?;
-            let fec_res = Self::gen_new_fec(rest_info.clone(), port).await?;
+            let fec_res = Self::gen_new_fec(rest_info.clone(), port, &local_private_key).await?;
 
             let (fec, os_tun) = if let Some((fec, fec_listen_port, wg_port)) = fec_res {
                 let fec1 = fec.clone();
@@ -237,6 +256,7 @@ impl WireguardTunnelC {
 
             self.fec = fec;
             self.os_tun = os_tun;
+            self.ipv6 = rest_info.endpoint_ipv6;
 
             if ifcreated {
                 self.os_tun.setup().await?;
@@ -246,13 +266,19 @@ impl WireguardTunnelC {
             return Ok(());
         }
 
-        if self.fec.is_none() {
-            let endpoint = rest_info
-                .remote_endpoint
-                .as_deref()
-                .map(str::parse)
-                .transpose()
-                .map_err(|_| "invalid remote endpoint")?;
+        let endpoint = rest_info
+            .remote_endpoint
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(|_| "invalid remote endpoint")?;
+        if let Some(fec) = &self.fec {
+            if let Some(endpoint) = endpoint {
+                fec.handle().set_peer_addr(endpoint).await;
+            } else {
+                fec.handle().unpin_peer_addr().await;
+            }
+        } else {
             if endpoint != self.os_tun.get_peer_endpoint() {
                 if let Some(endpoint) = endpoint {
                     self.os_tun.set_peer_endpoint(endpoint);
@@ -260,7 +286,7 @@ impl WireguardTunnelC {
             }
         }
 
-        // ponytail: recreate when FEC, FakeTCP, public key, or listen mode changes.
+        // ponytail: recreate when FakeTCP, public key, or listen mode changes.
 
         Ok(())
     }
@@ -337,4 +363,77 @@ impl WireguardTunnelC {
     pub fn get_listen_port(&self) -> Option<u16> {
         self.os_tun.get_listen_port()
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[tokio::test]
+async fn fec_toggle_releases_socket_and_updates_peer() {
+    let memory = Arc::new(DaemonMemory::new(crate::config::ClientConfig::default()));
+    let private = wireguard_control::Key::generate_private();
+    let local_public = private.get_public();
+    let remote_private = wireguard_control::Key::generate_private();
+    let remote_public = remote_private.get_public();
+    assert_eq!(
+        FEC::tunnel_psk(private.0, remote_public.0, 1),
+        FEC::tunnel_psk(remote_private.0, local_public.0, 1)
+    );
+    let mut info: WireguardTunnelInfo = serde_json::from_value(serde_json::json!({
+        "tunnel_id": 1, "peer_node_id": 2, "public_key": remote_public.to_base64(), "preferred_port": 0,
+        "remote_endpoint": "127.0.0.1:12345", "local_answered": "Unanswered", "remote_response": "Unanswered",
+        "mtu": 1420, "endpoint_ipv6": false, "fec": true, "faketcp": false,
+        "created_at": 0, "updated_at": 0
+    })).unwrap();
+    let (mut tunnel, port) = WireguardTunnelC::new_from_rest(
+        Arc::new(info.clone()),
+        private.to_base64(),
+        memory.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tunnel.fec.as_ref().unwrap().handle().get_peer_addr().await,
+        Some("127.0.0.1:12345".parse().unwrap())
+    );
+    info.remote_endpoint = Some("127.0.0.1:12346".into());
+    tunnel
+        .update_from_rest(Arc::new(info.clone()), memory.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        tunnel.fec.as_ref().unwrap().handle().get_peer_addr().await,
+        Some("127.0.0.1:12346".parse().unwrap())
+    );
+    info.remote_endpoint = None;
+    tunnel
+        .update_from_rest(Arc::new(info.clone()), memory.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        tunnel.fec.as_ref().unwrap().handle().get_peer_addr().await,
+        None
+    );
+    info.remote_endpoint = Some("127.0.0.1:12346".into());
+    info.fec = false;
+    tunnel
+        .update_from_rest(Arc::new(info.clone()), memory.clone())
+        .await
+        .unwrap();
+    assert!(tunnel.fec.is_none());
+    assert_eq!(tunnel.get_listen_port(), Some(port));
+    drop(
+        tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+            .await
+            .unwrap(),
+    );
+    info.fec = true;
+    tunnel
+        .update_from_rest(Arc::new(info), memory)
+        .await
+        .unwrap();
+    let engine = Arc::try_unwrap(tunnel.fec.take().unwrap()).ok().unwrap();
+    assert_eq!(engine.handle().fec_bind_addr().port(), port);
+    engine.shutdown().await;
+    tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+        .await
+        .unwrap();
 }

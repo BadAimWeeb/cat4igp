@@ -606,53 +606,53 @@ impl PublicIpDetector {
             return Err("STUN response too short".to_string());
         }
 
-        let response_len = u16::from_be_bytes([response[2], response[3]]) as usize;
-        if response.len() < 20 + response_len {
-            return Err("STUN response incomplete".to_string());
+        if response[..2] != [0x01, 0x01] || response[4..8] != [0x21, 0x12, 0xa4, 0x42] {
+            return Err("Invalid STUN binding response header".to_string());
         }
 
+        let response_len = u16::from_be_bytes([response[2], response[3]]) as usize;
+        if response_len % 4 != 0 || response.len() != 20 + response_len {
+            return Err("Invalid STUN response length".to_string());
+        }
+
+        // ponytail: wire-format validation only; correlate replies with requests at receive sites.
         // Parse attributes
         let mut offset = 20;
-        while offset + 4 <= 20 + response_len {
+        while offset + 4 <= response.len() {
             let attr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
             let attr_len =
                 u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
             let attr_data_offset = offset + 4;
-
-            // XOR-MAPPED-ADDRESS (0x0020)
-            if attr_type == 0x0020 && attr_data_offset + attr_len <= response.len() {
-                let data = &response[attr_data_offset..attr_data_offset + attr_len];
-                let family = data[1];
-
-                if family == 0x01 {
-                    // IPv4
-                    let magic = [0x21, 0x12, 0xa4, 0x42];
-                    let port = u16::from_be_bytes([data[2] ^ magic[0], data[3] ^ magic[1]]);
-                    let ip = Ipv4Addr::new(
-                        data[4] ^ magic[0],
-                        data[5] ^ magic[1],
-                        data[6] ^ magic[2],
-                        data[7] ^ magic[3],
-                    );
-                    return Ok(std::net::SocketAddr::new(IpAddr::V4(ip), port));
-                } else if family == 0x02 {
-                    // IPv6
-                    let magic = [0x21, 0x12, 0xa4, 0x42];
-                    let port = u16::from_be_bytes([data[2] ^ magic[0], data[3] ^ magic[1]]);
-                    let mut bytes = [0u8; 16];
-                    for i in 0..4 {
-                        bytes[i] = data[4 + i] ^ magic[i];
-                    }
-                    for i in 4..16 {
-                        bytes[i] = data[4 + i];
-                    }
-                    let ip = Ipv6Addr::from(bytes);
-                    return Ok(std::net::SocketAddr::new(IpAddr::V6(ip), port));
-                }
+            let padded_end = attr_data_offset + attr_len.next_multiple_of(4);
+            if padded_end > response.len() {
+                return Err("STUN attribute exceeds message length".to_string());
             }
 
-            let padded_len = ((attr_len + 3) / 4) * 4;
-            offset = attr_data_offset + padded_len;
+            // XOR-MAPPED-ADDRESS (0x0020), with MAPPED-ADDRESS (0x0001) fallback.
+            if matches!(attr_type, 0x0020 | 0x0001) {
+                let data = &response[attr_data_offset..attr_data_offset + attr_len];
+                if !matches!((data.get(1), data.len()), (Some(1), 8) | (Some(2), 20)) {
+                    return Err("Invalid STUN mapped address family or length".to_string());
+                }
+                let mut port = u16::from_be_bytes([data[2], data[3]]);
+                let mut bytes = [0u8; 16];
+                bytes[..data.len() - 4].copy_from_slice(&data[4..]);
+                if attr_type == 0x0020 {
+                    port ^= 0x2112;
+                    // RFC 8489: IPv6 uses the cookie followed by the transaction ID.
+                    for (byte, mask) in bytes[..data.len() - 4].iter_mut().zip(&response[4..20]) {
+                        *byte ^= mask;
+                    }
+                }
+                let ip = if data[1] == 1 {
+                    IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
+                } else {
+                    IpAddr::V6(Ipv6Addr::from(bytes))
+                };
+                return Ok(std::net::SocketAddr::new(ip, port));
+            }
+
+            offset = padded_end;
         }
 
         Err("No mapped address found in STUN response".to_string())
@@ -717,124 +717,11 @@ impl PublicIpDetector {
 
     /// Parse STUN response to extract IP address
     fn parse_stun_response(&self, response: &[u8], is_ipv4: bool) -> Result<IpAddr, String> {
-        if response.len() < 20 {
-            return Err("STUN response too short".to_string());
-        }
-
-        // Check if it's a STUN response (0x0101)
-        if response[0] != 0x01 || response[1] != 0x01 {
-            return Err("Invalid STUN response type".to_string());
-        }
-
-        let response_len = u16::from_be_bytes([response[2], response[3]]) as usize;
-        if response.len() < 20 + response_len {
-            return Err("STUN response incomplete".to_string());
-        }
-
-        // Parse attributes (starting at offset 20)
-        let mut offset = 20;
-        while offset + 4 <= 20 + response_len {
-            let attr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
-            let attr_len =
-                u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
-            let attr_data_offset = offset + 4;
-
-            // XOR-MAPPED-ADDRESS (0x0020)
-            if attr_type == 0x0020 && attr_data_offset + attr_len <= response.len() {
-                return self.parse_xor_mapped_address(
-                    &response[attr_data_offset..attr_data_offset + attr_len],
-                    is_ipv4,
-                );
-            }
-
-            // MAPPED-ADDRESS (0x0001) - fallback
-            if attr_type == 0x0001 && attr_data_offset + attr_len <= response.len() {
-                return self.parse_mapped_address(
-                    &response[attr_data_offset..attr_data_offset + attr_len],
-                    is_ipv4,
-                );
-            }
-
-            // Move to next attribute (with padding to 4-byte boundary)
-            let padded_len = ((attr_len + 3) / 4) * 4;
-            offset = attr_data_offset + padded_len;
-        }
-
-        Err("No mapped address found in STUN response".to_string())
-    }
-
-    /// Parse MAPPED-ADDRESS attribute
-    fn parse_mapped_address(&self, data: &[u8], is_ipv4: bool) -> Result<IpAddr, String> {
-        if data.len() < 2 {
-            return Err("Invalid MAPPED-ADDRESS".to_string());
-        }
-
-        let family = data[1];
-        if is_ipv4 {
-            if family != 0x01 {
-                return Err("Expected IPv4 address but got different family".to_string());
-            }
-            if data.len() < 8 {
-                return Err("Invalid IPv4 address in MAPPED-ADDRESS".to_string());
-            }
-            let ip = Ipv4Addr::new(data[4], data[5], data[6], data[7]);
-            Ok(IpAddr::V4(ip))
+        let mapped = self.parse_mapped_socket_addr(response)?;
+        if mapped.is_ipv4() == is_ipv4 {
+            Ok(mapped.ip())
         } else {
-            if family != 0x02 {
-                return Err("Expected IPv6 address but got different family".to_string());
-            }
-            if data.len() < 20 {
-                return Err("Invalid IPv6 address in MAPPED-ADDRESS".to_string());
-            }
-            let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&data[4..20]);
-            let ip = Ipv6Addr::from(bytes);
-            Ok(IpAddr::V6(ip))
-        }
-    }
-
-    /// Parse XOR-MAPPED-ADDRESS attribute
-    fn parse_xor_mapped_address(&self, data: &[u8], is_ipv4: bool) -> Result<IpAddr, String> {
-        if data.len() < 2 {
-            return Err("Invalid XOR-MAPPED-ADDRESS".to_string());
-        }
-
-        let family = data[1];
-        if is_ipv4 {
-            if family != 0x01 {
-                return Err("Expected IPv4 address but got different family".to_string());
-            }
-            if data.len() < 8 {
-                return Err("Invalid IPv4 address in XOR-MAPPED-ADDRESS".to_string());
-            }
-            // XOR with magic cookie
-            let magic = [0x21, 0x12, 0xa4, 0x42];
-            let ip = Ipv4Addr::new(
-                data[4] ^ magic[0],
-                data[5] ^ magic[1],
-                data[6] ^ magic[2],
-                data[7] ^ magic[3],
-            );
-            Ok(IpAddr::V4(ip))
-        } else {
-            if family != 0x02 {
-                return Err("Expected IPv6 address but got different family".to_string());
-            }
-            if data.len() < 20 {
-                return Err("Invalid IPv6 address in XOR-MAPPED-ADDRESS".to_string());
-            }
-            let mut bytes = [0u8; 16];
-            let magic = [0x21, 0x12, 0xa4, 0x42];
-            // XOR first 4 bytes with magic cookie
-            for i in 0..4 {
-                bytes[i] = data[4 + i] ^ magic[i];
-            }
-            // Remaining bytes are not XORed in XOR-MAPPED-ADDRESS for IPv6
-            for i in 4..16 {
-                bytes[i] = data[4 + i];
-            }
-            let ip = Ipv6Addr::from(bytes);
-            Ok(IpAddr::V6(ip))
+            Err("Unexpected STUN mapped address family".to_string())
         }
     }
 }

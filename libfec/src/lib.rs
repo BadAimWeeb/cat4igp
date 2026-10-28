@@ -12,6 +12,7 @@ pub use fec::{FecConfig, FecDecoder, FecEncoder, FecError, FecMode};
 pub use stats::Snapshot;
 pub use transport::{TokioUdpPipe, TransportError, UdpPipe};
 
+pub use handshake::tunnel_psk;
 pub use handshake::{ControlMessage, HandshakeError, Role};
 pub use proto::{decode_packet, encode_packet, Header, Packet, ProtoError, MAGIC, VERSION};
 
@@ -44,6 +45,10 @@ impl EngineHandle {
 
     pub async fn clear_peer_addr(&self) {
         self.peer_state.clear_peer_addr().await;
+    }
+
+    pub async fn unpin_peer_addr(&self) {
+        self.peer_state.unpin_peer_addr().await;
     }
 
     pub async fn get_peer_addr(&self) -> Option<SocketAddr> {
@@ -92,5 +97,9 @@ impl PeerEngine {
 
     pub fn handle(&self) -> &EngineHandle {
         &self.handle
+    }
+
+    pub async fn shutdown(self) {
+        self._runtime.shutdown().await;
     }
 }

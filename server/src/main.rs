@@ -1,3 +1,4 @@
+mod admin;
 mod cluster;
 
 #[cfg(test)]
@@ -45,6 +46,10 @@ const CONTROL_PROTOCOL: &str = "/cat4igp/control/1";
 const DATABASE_QUEUE_CAPACITY: usize = 32;
 pub(crate) type DatabaseSender = tokio::sync::mpsc::Sender<DatabaseJob>;
 pub(crate) enum DatabaseJob {
+    Admin {
+        operation: admin::Operation,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
     Control(
         libp2p::PeerId,
         cat4igp_shared::control::ControlRequest,
@@ -147,13 +152,7 @@ fn control_response(
         };
         use diesel::prelude::*;
         // ponytail: local serialized submission only; replace with committed leader allocation before HA.
-        let node_id = crate::schema::nodes::table
-            .select(diesel::dsl::max(crate::schema::nodes::id))
-            .first::<Option<i32>>(conn)
-            .expect("cannot allocate enrollment node ID")
-            .unwrap_or(0)
-            .checked_add(1)
-            .expect("node IDs exhausted");
+        let node_id = crate::db::next_management_id(conn, "node").expect("node IDs exhausted");
         let command = crate::db::EnrollmentCommand {
             allocation: crate::db::prepare_enrollment_allocation(conn, &request.invitation_code)
                 .expect("cannot allocate enrollment tunnels"),
@@ -457,6 +456,27 @@ fn database_worker(
 ) -> diesel::SqliteConnection {
     while let Some(job) = work.blocking_recv() {
         let (peer, request, channel) = match job {
+            DatabaseJob::Admin { operation, reply } => {
+                let result = match operation {
+                    admin::Operation::Replicas
+                    | admin::Operation::Replica(_)
+                    | admin::Operation::CodeRead => {
+                        Err("cluster administration not available".into())
+                    }
+                    admin::Operation::Mutate(command) => admin::apply(&mut conn, &command)
+                        .map_err(|_| "unavailable; outcome may be unknown".to_string())
+                        .and_then(|result| result)
+                        .and_then(|value| {
+                            serde_json::from_str(value.as_deref().unwrap_or("null"))
+                                .map_err(|_| "unavailable".into())
+                        }),
+                    operation => {
+                        admin::read(&mut conn, operation).map_err(|_| "unavailable".into())
+                    }
+                };
+                let _ = reply.send(result);
+                continue;
+            }
             DatabaseJob::Control(peer, request, channel) => (peer, request, channel),
             DatabaseJob::Invite {
                 request_id,
@@ -557,6 +577,93 @@ async fn main() -> Result<(), String> {
         return cluster::offline_transport();
     }
     if args.as_slice() == ["discover-replica"] || args.as_slice() == ["join-replica"] {
+        // One-command join: `join-replica --bundle <file>` reads the operator's
+        // join bundle (JSON) and derives every discovery/join parameter from it.
+        // Remaining flags: --address (advertised IP/TCP/p2p endpoint, required),
+        // --node-id (overrides bundle pre-assignment), --identity (identity file,
+        // default next to the config), --config (output path, default ./cluster.json).
+        let mut bundle_path: Option<String> = None;
+        let mut address: Option<String> = None;
+        let mut node_id: Option<u64> = None;
+        let mut identity_path: Option<String> = None;
+        let mut config_path: Option<String> = None;
+        let rest = &args[1..];
+        if rest.first().is_some_and(|a| a == "--bundle") {
+            let mut flags = rest.iter();
+            while let Some(flag) = flags.next() {
+                let Some(value) = flags.next() else {
+                    return Err(format!("missing value for {flag:?}"));
+                };
+                match flag.to_str() {
+                    Some("--bundle") => bundle_path = Some(value.to_string_lossy().into_owned()),
+                    Some("--address") => address = Some(value.to_string_lossy().into_owned()),
+                    Some("--node-id") => {
+                        node_id = Some(value.to_string_lossy().parse().map_err(|_| "invalid --node-id")?)
+                    }
+                    Some("--identity") => identity_path = Some(value.to_string_lossy().into_owned()),
+                    Some("--config") => config_path = Some(value.to_string_lossy().into_owned()),
+                    other => return Err(format!("unknown join flag {other:?}")),
+                }
+            }
+            let bundle_path = bundle_path.ok_or("--bundle <file> is required")?;
+            let bytes = std::fs::read(&bundle_path).map_err(|e| format!("cannot read bundle: {e}"))?;
+            let bundle: cat4igp_shared::discovery::join::Bundle =
+                serde_json::from_slice(&bytes).map_err(|e| format!("invalid bundle: {e}"))?;
+            bundle.validate().map_err(|e| e.to_string())?;
+            let address = address.ok_or("--address <ip/tcp/p2p/PEER_ID> is required")?;
+            let advertised: libp2p::Multiaddr =
+                address.parse().map_err(|_| "invalid --address")?;
+            let identity_path = identity_path.unwrap_or_else(|| {
+                let config = config_path.as_deref().unwrap_or("cluster.json");
+                format!("{}.identity", std::path::Path::new(config).with_extension("").to_string_lossy())
+            });
+            let config_path = config_path.unwrap_or_else(|| "cluster.json".into());
+            // Identity is created mode-0600 on first use; retries reuse it, so the
+            // PeerId stays stable across uncertain-result retries.
+            let key = crate::raft_network::replica_identity(std::path::Path::new(&identity_path))
+                .map_err(|e| e.to_string())?;
+            // Stable request ID persisted next to the identity: exact retries keep
+            // the committed admission, changed payloads fail closed.
+            let request_id_path = format!("{identity_path}.request-id");
+            let request_id = match std::fs::read_to_string(&request_id_path) {
+                Ok(id) => id.trim().to_string(),
+                Err(_) => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    std::fs::write(&request_id_path, &id)
+                        .map_err(|e| format!("cannot persist request id: {e}"))?;
+                    id
+                }
+            };
+            let node_id = node_id.or(bundle.node_id).ok_or(
+                "no node ID: pass --node-id or ask the operator to pre-assign one in the bundle",
+            )?;
+            let request = cat4igp_shared::discovery::join::Request {
+                application_version: bundle.application_version,
+                cluster_id: bundle.cluster_id,
+                request_id,
+                node_id,
+                address: advertised.clone(),
+                code: bundle.code,
+            };
+            let pin = identity::PublicKey::try_decode_protobuf(&hex_decode(&bundle.signing_key)?)
+                .map_err(|e| e.to_string())?;
+            let response = cat4igp_shared::discovery::join::request(
+                &key,
+                &pin,
+                &[bundle.bootstrap],
+                bundle.minimum_revision,
+                request.clone(),
+            )
+            .await?;
+            // The learner listen address is the advertised endpoint without /p2p.
+            let mut listen = advertised.clone();
+            listen.pop();
+            cluster::save_join(&config_path, identity_path, listen, &request, &response)?;
+            println!(
+                "Committed learner bootstrap saved to {config_path}; start server with CLUSTER_CONFIG_FILE={config_path}, then explicitly activate learner."
+            );
+            return Ok(());
+        }
         let pin = identity::PublicKey::try_decode_protobuf(&hex_decode(
             &env::var("DISCOVERY_SIGNING_KEY").map_err(
                 |_| "DISCOVERY_SIGNING_KEY must be a trusted protobuf public key in hex",
@@ -690,7 +797,19 @@ async fn main() -> Result<(), String> {
     }
     drop(conn);
     let (jobs, work) = tokio::sync::mpsc::channel(DATABASE_QUEUE_CAPACITY);
-    let app = router::make_router(jobs.clone()).await.unwrap();
+    let control_jobs = jobs.clone();
+    let mut control = tokio::spawn(async move {
+        run_control_plane(control_jobs, work)
+            .await
+            .map_err(|e| e.to_string())
+    });
+    let app = match router::make_router(jobs.clone()).await {
+        Ok(app) => app,
+        Err(error) => {
+            control.abort();
+            return Err(error.to_string());
+        }
+    };
     let listener = tokio::net::TcpListener::bind(
         env::var("BIND_HOST_PORT").expect("BIND_HOST_PORT must be set"),
     )
@@ -698,7 +817,7 @@ async fn main() -> Result<(), String> {
     .unwrap();
     tokio::select! {
         result = axum::serve(listener, app) => result.unwrap(),
-        result = run_control_plane(jobs, work) => return Err(format!("control plane stopped: {result:?}")),
+        result = &mut control => return Err(format!("control plane stopped: {result:?}")),
         result = run_discovery() => return Err(format!("discovery stopped: {result}")),
     }
     Ok(())
