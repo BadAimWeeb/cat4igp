@@ -704,9 +704,10 @@ pub(crate) enum Operation {
     OpenEpochWindow(u8),
     CloseEpochWindow,
     WindowStatus,
-    // Rolling upgrade: any bound peer's answer to the leader's automatic epoch
-    // probe. No state mutation, just the peer's binary epoch.
+    // Retained for wire compatibility; this report does not authorize upgrades.
     ProbeEpoch,
+    // ponytail: observation only; add fenced activation before trusting reports.
+    ProbeCapabilities,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -748,6 +749,7 @@ pub(crate) enum Outcome {
     EpochWindow(Result<crate::raft_storage::EpochWindow, String>),
     WindowOpen(bool),
     EpochProbe(Result<u8, String>),
+    Capabilities { version: u8, application_version: u8, max_reader_fence: u8, capabilities: Vec<String> },
 }
 
 #[derive(Clone)]
@@ -761,26 +763,72 @@ pub(crate) struct Service {
     allocation: Arc<tokio::sync::Mutex<()>>,
     cluster_psk: libp2p::pnet::PreSharedKey,
     transport_credential: TransportCredential,
-    // Reports this binary's application epoch to the leader's automatic probes.
-    // Only test fixtures ever override it; normal startup pins the binary epoch.
-    epoch_report: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    admin_keys: Option<Arc<crate::admin::Keys>>,
     #[cfg(test)]
     interrupt_revocation: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Service {
-    async fn committed_window(
-        &self,
-    ) -> Option<crate::raft_storage::EpochWindow> {
-        self.store
-            .run(|conn| crate::raft_storage::get(conn, "epoch_window"))
-            .await
-            .ok()
-            .flatten()
+    // ponytail: internal only; expose preparation after authenticated lifecycle and failover tests.
+    #[allow(dead_code)]
+    async fn prepare_reader_fence(&self, target: u8) -> Result<crate::raft_storage::FencePrepare, String> {
+        let service = self.clone();
+        let guard = service.allocation.clone().try_lock_owned().map_err(|_| "unavailable")?;
+        tokio::spawn(async move {
+            let _guard = guard;
+            service.node.ensure_linearizable().await.map_err(|_| "unavailable")?;
+            let (membership, active, pending) = service.store.run(|conn| Ok((
+                crate::raft_storage::get::<openraft::StoredMembership<u64, BasicNode>>(conn, "membership")?,
+                crate::raft_storage::get::<crate::raft_storage::FencePrepare>(conn, "fence_prepare")?,
+                read_revocations(conn)?.values().any(|revocation| !revocation.complete),
+            ))).await.map_err(|_| "unavailable")?;
+            let membership = membership.ok_or("missing membership")?;
+            let effective = service.node.with_raft_state(|state| state.membership_state.effective().clone()).await.map_err(|_| "unavailable")?;
+            if pending || membership.log_id().is_none() || membership.membership().get_joint_config().len() != 1
+                || membership.membership().voter_ids().next().is_none()
+                || effective.log_id() != membership.log_id() || effective.membership() != membership.membership() {
+                return Err("membership transition in progress".into());
+            }
+            if let Some(active) = active {
+                return if active.target == target && active.membership == membership { Ok(active) } else { Err("fence preparation already active".into()) };
+            }
+            let reply = service.node.client_write(Command::PrepareReaderFence { target, membership: membership.clone() }).await.map_err(|_| "unavailable")?;
+            reply.data?;
+            Ok(crate::raft_storage::FencePrepare { target, log_id: reply.log_id, membership })
+        }).await.map_err(|_| "unavailable".to_string())?
     }
 
-    // Epoch-4-only actions must not be dispatched while a lagging peer epoch is
-    // in the quorum because an older follower cannot decode them and stalls.
+    #[allow(dead_code)]
+    async fn cancel_reader_fence(&self, prepare_log_id: openraft::LogId<u64>) -> Result<(), String> {
+        let service = self.clone();
+        let guard = service.allocation.clone().try_lock_owned().map_err(|_| "unavailable")?;
+        tokio::spawn(async move {
+            let _guard = guard;
+            service.node.ensure_linearizable().await.map_err(|_| "unavailable")?;
+            let reply = service.node.client_write(Command::CancelReaderFence { prepare_log_id }).await.map_err(|_| "unavailable")?;
+            reply.data.map(|_| ())
+        }).await.map_err(|_| "unavailable".to_string())?
+    }
+
+    pub(crate) async fn acknowledge_prepare(&self, source: u64, expected: crate::raft_storage::FencePrepare) -> bool {
+        let local = self.node.metrics().borrow().id;
+        self.store.acknowledge_prepare(source, local, expected).await
+    }
+
+    async fn committed_window(
+        &self,
+    ) -> Result<Option<crate::raft_storage::EpochWindow>, openraft::StorageError<u64>> {
+        self.store
+            .run(crate::raft_storage::read_window)
+            .await
+    }
+
+    // ponytail: proposal gate only; activation needs every leader to serialize prepare with membership.
+    async fn membership_frozen(&self) -> Result<bool, openraft::StorageError<u64>> {
+        self.store.run(|conn| Ok(crate::raft_storage::get::<crate::raft_storage::FencePrepare>(conn, "fence_prepare")?.is_some())).await
+    }
+
+    // Legacy gate only; mixed-epoch operation remains unsupported.
     fn epoch_feature_available(&self, action: &crate::admin::Action, window_open: bool) -> bool {
         let epoch_gated = matches!(
             action,
@@ -790,136 +838,23 @@ impl Service {
         !epoch_gated || !window_open
     }
 
-    // Leader-side rolling-upgrade reconciliation across all bound replicas.
-    // Pending learners are excluded: a not-yet-active learner is not a quorum
-    // member and reports through admission, not this loop.
-    async fn reconcile_epoch_window(&self) -> Outcome {
-        let metrics = self.node.metrics().borrow().clone();
-        let Some(network) = &self.network else {
-            return Outcome::Unavailable;
-        };
-        let mut minimum_peer = None;
-        for id in metrics
-            .membership_config
-            .membership()
-            .voter_ids()
-            .filter(|id| *id != metrics.id)
-            .collect::<Vec<_>>()
-        {
-            match network.forward(id, Operation::ProbeEpoch).await {
-                Outcome::EpochProbe(Ok(epoch)) if epoch < cat4igp_shared::compat::APPLICATION_VERSION => {
-                    minimum_peer.get_or_insert(epoch);
-                }
-                Outcome::EpochProbe(_) => (),
-                // Unreachable peer keeps a stable fingerprint at the compat floor;
-                // using distinguishable values per-failure would churn the ledger.
-                _ => {
-                    let floor = cat4igp_shared::compat::MIN_SUPPORTED_VERSION;
-                    minimum_peer.get_or_insert(floor);
-                }
-            }
-        }
-        let Some(minimum_peer) = minimum_peer
-        else {
-            // No lagging peer observed: every bound voter answered at the current
-            // epoch, or the probes could not resolve a report (unavailable counts
-            // as lagging? no — fail-open would commit epoch-gated writes against a
-            // potentially stale peer; treat as lagging and retry next tick).
-            return Outcome::WindowOpen(false);
-        };
-        let desired = crate::raft_storage::EpochWindow::Mixed {
-            epoch: cat4igp_shared::compat::APPLICATION_VERSION,
-            minimum_peer,
-        };
-        if self.committed_window().await.as_ref() == Some(&desired) {
-            return Outcome::WindowOpen(true);
-        }
-        match self.node.client_write(Command::EpochWindow(desired.clone())).await {
-            Ok(reply) if reply.data.is_ok() => Outcome::EpochWindow(Ok(desired)),
-            _ => Outcome::Unavailable,
-        }
-    }
-
-    async fn commit_epoch_window_if_stable(&self) -> Outcome {
-        let metrics = self.node.metrics().borrow().clone();
-        let Some(network) = &self.network else {
-            return Outcome::Unavailable;
-        };
-        // A lagging peer keeps the window open; only a unanimous current-epoch
-        // report closes it. A single missing/stale probe defers, never closes.
-        let mut lagging = false;
-        for id in metrics
-            .membership_config
-            .membership()
-            .voter_ids()
-            .filter(|id| *id != metrics.id)
-            .collect::<Vec<_>>()
-        {
-            if !matches!(
-                network.forward(id, Operation::ProbeEpoch).await,
-                Outcome::EpochProbe(Ok(epoch)) if epoch >= cat4igp_shared::compat::APPLICATION_VERSION
-            ) {
-                lagging = true;
-            }
-        }
-        if lagging {
-            return Outcome::WindowOpen(true);
-        }
-        let desired = crate::raft_storage::EpochWindow::Stable {
-            epoch: cat4igp_shared::compat::APPLICATION_VERSION,
-        };
-        if self.committed_window().await.as_ref() == Some(&desired) {
-            return Outcome::WindowOpen(false);
-        }
-        match self.node.client_write(Command::EpochWindow(desired.clone())).await {
-            Ok(reply) if reply.data.is_ok() => Outcome::EpochWindow(Ok(desired)),
-            _ => Outcome::Unavailable,
-        }
-    }
-
-    // A mixed window closes automatically only when the last upgrade in the previous
-    // check succeeded; the lagging check runs first so nothing spuriously closes.
-    async fn schedule_window(&self) {
-        let mut timer = tokio::time::interval(Duration::from_secs(2));
-        loop {
-            timer.tick().await;
-            let metrics = self.node.metrics().borrow().clone();
-            if metrics.current_leader != Some(metrics.id) {
-                continue;
-            }
-            let window_open = self
-                .committed_window()
-                .await
-                .is_some_and(|window| window.window_open());
-            let outcome = if window_open {
-                self.commit_epoch_window_if_stable().await
-            } else {
-                self.reconcile_epoch_window().await
-            };
-            match outcome {
-                Outcome::WindowOpen(state) => {
-                    eprintln!("[cluster] rolling-upgrade window state: open={state}");
-                }
-                Outcome::EpochWindow(Ok(window)) => {
-                    eprintln!("[cluster] committed rolling-upgrade window: {window:?}");
-                }
-                _ => (),
-            }
-        }
-    }
-
     pub(crate) async fn local(&self, operation: Operation) -> Outcome {
         if let Operation::Invite { request_id, .. } = &operation {
             if request_id.is_empty() || request_id.len() > 128 || !request_id.is_ascii() {
                 return Outcome::Invite(Err("invalid request ID".into()));
             }
         }
-        // Any bound replica answers the rolling-upgrade epoch probe about itself;
-        // it must not redirect, or the leader's probe would loop forever.
+        // Any bound replica answers about itself without redirecting.
         if matches!(operation, Operation::ProbeEpoch) {
-            return Outcome::EpochProbe(Ok(self.epoch_report.load(
-                std::sync::atomic::Ordering::SeqCst,
-            )));
+            return Outcome::EpochProbe(Ok(cat4igp_shared::compat::APPLICATION_VERSION));
+        }
+        if matches!(operation, Operation::ProbeCapabilities) {
+            return Outcome::Capabilities {
+                version: 1,
+                application_version: cat4igp_shared::compat::APPLICATION_VERSION,
+                max_reader_fence: crate::raft_storage::MAX_READER_FENCE,
+                capabilities: vec!["capability_report_v1".into()],
+            };
         }
         let metrics = self.node.metrics().borrow().clone();
         if metrics.current_leader != Some(metrics.id) {
@@ -1148,6 +1083,11 @@ impl Service {
                     if service.node.ensure_linearizable().await.is_err() {
                         return Outcome::Unavailable;
                     }
+                    match service.membership_frozen().await {
+                        Ok(true) => return Outcome::Revocation(Err("membership frozen for upgrade preparation".into())),
+                        Ok(false) => (),
+                        Err(_) => return Outcome::Unavailable,
+                    }
                     let metrics = service.node.metrics().borrow().clone();
                     let membership = metrics.membership_config.membership();
                     if id == metrics.id
@@ -1243,6 +1183,11 @@ impl Service {
                     if service.node.ensure_linearizable().await.is_err() {
                         return Outcome::Unavailable;
                     }
+                    match service.membership_frozen().await {
+                        Ok(true) => return Outcome::Promotion(Err("membership frozen for upgrade preparation".into())),
+                        Ok(false) => (),
+                        Err(_) => return Outcome::Unavailable,
+                    }
                     let admitted = service
                         .store
                         .run(move |conn| {
@@ -1306,6 +1251,11 @@ impl Service {
                 Operation::ActivateLearner(id) => {
                     if service.node.ensure_linearizable().await.is_err() {
                         return Outcome::Unavailable;
+                    }
+                    match service.membership_frozen().await {
+                        Ok(true) => return Outcome::Learner(Err("membership frozen for upgrade preparation".into())),
+                        Ok(false) => (),
+                        Err(_) => return Outcome::Unavailable,
                     }
                     let admission = service
                         .store
@@ -1719,11 +1669,36 @@ impl Service {
                         return Outcome::Unavailable;
                     }
                     match operation {
+                        // ponytail: disable all lifecycle ingress until activation and recovery are safe.
+                        crate::admin::Operation::SignedFenceLifecycle(..) => Outcome::Unavailable,
+                        crate::admin::Operation::SignedFenceAttestation(envelope, session) => {
+                            let Some(keys) = &service.admin_keys else { return Outcome::Unavailable; };
+                            let Ok(Some(key)) = crate::admin::attestation_key(keys) else { return Outcome::Unavailable; };
+                            let now = chrono::Utc::now().timestamp();
+                            if now < 0 || !crate::admin::verify(keys, &session, now as u64)
+                                || !crate::admin::verify_fence_attestation(&envelope.body, &envelope.signature, &key, &service.cluster_id, now as u64) {
+                                return Outcome::Admin(Err("invalid signed attestation".into()));
+                            }
+                            let body = envelope.body;
+                            let command = crate::admin::Mutation {
+                                request_id: body.request_id,
+                                action: crate::admin::Action::AttestUpgradeFence { prepare: body.prepare, externally_fenced: body.externally_fenced },
+                                applied_at: chrono::Utc::now().naive_utc(),
+                            };
+                            match service.node.client_write(Command::Admin(command)).await {
+                                Ok(reply) => Outcome::Admin(reply.data.and_then(|value| serde_json::from_str(value.as_deref().unwrap_or("null")).map_err(|_| "unavailable".into()))),
+                                Err(_) => Outcome::Unavailable,
+                            }
+                        }
                         crate::admin::Operation::Mutate(command) => {
-                            let window_open = service
-                                .committed_window()
-                                .await
-                                .is_some_and(|w| w.window_open());
+                            if matches!(command.action, crate::admin::Action::AttestUpgradeFence { .. }) {
+                                // ponytail: signed attestations only; add no unsigned forwarding path.
+                                return Outcome::Unavailable;
+                            }
+                            let window_open = match service.committed_window().await {
+                                Ok(window) => window.is_some_and(|w| w.window_open()),
+                                Err(_) => return Outcome::Unavailable,
+                            };
                             if !service.epoch_feature_available(&command.action, window_open)
                             {
                                 return Outcome::Admin(Err(
@@ -1784,36 +1759,15 @@ impl Service {
                         Err(_) => Outcome::Unavailable,
                     }
                 }
-                Operation::OpenEpochWindow(minimum_peer) => {
-                    if service.node.ensure_linearizable().await.is_err() {
-                        return Outcome::Unavailable;
-                    }
-                    // Only the exact previous cohort is a valid mixed window; the
-                    // same epoch means no window and anything else is unsupported.
-                    if minimum_peer != cat4igp_shared::compat::APPLICATION_VERSION - 1 {
-                        return Outcome::EpochWindow(Err(
-                            "window floor must be the previous epoch".into(),
-                        ));
-                    }
-                    let command = crate::raft_storage::EpochWindow::Mixed {
-                        epoch: cat4igp_shared::compat::APPLICATION_VERSION,
-                        minimum_peer,
-                    };
-                    match service.node.client_write(Command::EpochWindow(command.clone())).await {
-                        Ok(reply) if reply.data.is_ok() => Outcome::EpochWindow(Ok(command)),
-                        Ok(reply) => Outcome::EpochWindow(Err(
-                            reply.data.err().unwrap_or_else(|| "window rejected".into()),
-                        )),
-                        Err(_) => Outcome::Unavailable,
-                    }
-                }
+                // ponytail: no mixed-epoch operation until fenced activation is implemented.
+                Operation::OpenEpochWindow(_) => Outcome::EpochWindow(Err(
+                    "cross-epoch rolling upgrades are unsupported".into(),
+                )),
                 Operation::CloseEpochWindow => {
                     if service.node.ensure_linearizable().await.is_err() {
                         return Outcome::Unavailable;
                     }
-                    // Correctness depends on the operator: command succeeds only when
-                    // the last lagging peer has been upgraded and reproduced before this
-                    // leader's declared uniform-epoch state. The commit records intent.
+                    // Recovery of legacy state only; this does not authorize an upgrade.
                     let command = crate::raft_storage::EpochWindow::Stable {
                         epoch: cat4igp_shared::compat::APPLICATION_VERSION,
                     };
@@ -1828,8 +1782,9 @@ impl Service {
                 Operation::WindowStatus => {
                     let window = service.committed_window().await;
                     match window {
-                        Some(window) => Outcome::WindowOpen(window.window_open()),
-                        None => Outcome::WindowOpen(false),
+                        Ok(Some(window)) => Outcome::WindowOpen(window.window_open()),
+                        Ok(None) => Outcome::WindowOpen(false),
+                        Err(_) => Outcome::Unavailable,
                     }
                 }
                 // ProbeEpoch is answered before the leader check in local(); it
@@ -1837,6 +1792,7 @@ impl Service {
                 Operation::ProbeEpoch => {
                     Outcome::EpochProbe(Ok(cat4igp_shared::compat::APPLICATION_VERSION))
                 }
+                Operation::ProbeCapabilities => unreachable!("answered before leader dispatch"),
             }
         })
         .await
@@ -2035,6 +1991,11 @@ impl Service {
     async fn submit_replica(&self, operation: Operation) -> Outcome {
         tokio::time::timeout(DEADLINE, async {
             let mut result = self.local(operation.clone()).await;
+            if matches!(&operation, Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation {
+                action: crate::admin::Action::AttestUpgradeFence { .. }, ..
+            }))) && matches!(result, Outcome::Redirect(_)) {
+                return Outcome::Unavailable;
+            }
             // ponytail: two redirects, static admitted bindings; add discovery only with committed admission.
             for _ in 0..2 {
                 let Outcome::Redirect(target) = result else {
@@ -2421,7 +2382,7 @@ async fn start_inner(
             if previous.is_some_and(|p| p.value != binding) {
                 return Err(std::io::Error::other("persisted cluster/node/peer binding mismatch").into());
             }
-            let used = diesel::sql_query("SELECT 'used' AS value FROM raft_meta WHERE key NOT IN ('replica_binding', 'application_version') UNION ALL SELECT 'used' AS value FROM raft_logs LIMIT 1")
+            let used = diesel::sql_query("SELECT 'used' AS value FROM raft_meta WHERE key NOT IN ('replica_binding', 'application_version', 'reader_fence') UNION ALL SELECT 'used' AS value FROM raft_logs LIMIT 1")
                 .get_result::<Value>(conn).optional()?.is_some();
             if (mode == Mode::Recover && !persisted) || (mode != Mode::Recover && (persisted || used) && !(learner && persisted)) {
                 return Err(std::io::Error::other("initialize/join require pristine consensus state; existing replicas must recover").into());
@@ -2543,9 +2504,7 @@ async fn start_inner(
         allocation: Arc::new(tokio::sync::Mutex::new(())),
         cluster_psk: psk,
         transport_credential,
-        epoch_report: Arc::new(std::sync::atomic::AtomicU8::new(
-            cat4igp_shared::compat::APPLICATION_VERSION,
-        )),
+        admin_keys: crate::admin::load_keys()?,
         #[cfg(test)]
         interrupt_revocation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
@@ -2998,8 +2957,7 @@ fn publish_transport_config(path: &str, bytes: &[u8]) -> Result<(), String> {
     result.map_err(|_| "cannot publish protected config (output must not exist)".into())
 }
 
-// ponytail: operator-attested stop-all, never online recovery or pnet hot switching.
-// TODO: process-kill maintenance rehearsal before claiming crash recovery automation.
+// ponytail: operator-attested stop-all; add verified automation before removing operator coordination.
 pub(crate) fn offline_transport() -> Result<(), String> {
     let env = |name| std::env::var(name).map_err(|_| format!("{name} required"));
     apply_offline_transport(
@@ -3409,7 +3367,6 @@ pub(crate) async fn serve(path: &str, database: String, apply: bool) -> Result<(
             crate::router::auth_middleware_operator,
         ));
     let scheduler = service.clone();
-    let windows = service.clone();
     let readiness = service;
     let app = crate::router::make_router(jobs)
         .await
@@ -3434,7 +3391,6 @@ pub(crate) async fn serve(path: &str, database: String, apply: bool) -> Result<(
     eprintln!("[cluster] committed ingress and opt-in discovery/private control");
     tokio::select! {
         _ = scheduler.schedule_codes() => Err("code scheduler stopped".into()),
-        _ = windows.schedule_window() => Err("epoch window scheduler stopped".into()),
         result = control => Err(format!("private control stopped: {result:?}")),
         result = discovery => Err(format!("public discovery stopped: {result:?}")),
         _ = async {

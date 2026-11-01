@@ -22,9 +22,7 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 openraft::declare_raft_types!(pub TypeConfig: D = Command, R = Result<Option<String>, String>, SnapshotData = SnapshotData);
 
 /// Rolling-upgrade window state, committed through the replicated write path.
-/// An epoch-4 leader commits `Mixed(minimum_peer_epoch)` while any quorum replica
-/// still runs an older binary, and later closes the window with `Stable(4)` once
-/// every member is upgraded. Persisted state stays epoch-exact regardless.
+/// Legacy window state; it is not an upgrade or downgrade fence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "window", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum EpochWindow {
@@ -32,12 +30,34 @@ pub(crate) enum EpochWindow {
     Mixed { epoch: u8, minimum_peer: u8 },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FencePrepare {
+    pub(crate) target: u8,
+    pub(crate) log_id: LogId<u64>,
+    pub(crate) membership: StoredMembership<u64, openraft::BasicNode>,
+}
+
+impl FencePrepare {
+    fn valid(&self, fence: u8, applied: Option<LogId<u64>>, membership: &StoredMembership<u64, openraft::BasicNode>) -> bool {
+        self.target > fence && self.membership == *membership
+            && self.membership.membership().get_joint_config().len() == 1
+            && self.membership.membership().voter_ids().next().is_some()
+            && self.membership.log_id().is_some_and(|id| id.index < self.log_id.index)
+            && applied.is_some_and(|id| self.log_id.index < id.index || self.log_id == id)
+    }
+}
+
 impl EpochWindow {
     pub(crate) fn window_open(&self) -> bool {
         matches!(self, EpochWindow::Mixed { .. })
     }
-    fn epoch_current(epoch: u8) -> bool {
-        epoch == cat4igp_shared::compat::APPLICATION_VERSION
+    pub(crate) fn valid(&self) -> bool {
+        match self {
+            Self::Stable { epoch } => *epoch == cat4igp_shared::compat::APPLICATION_VERSION,
+            Self::Mixed { epoch, minimum_peer } => *epoch == cat4igp_shared::compat::APPLICATION_VERSION
+                && cat4igp_shared::compat::wire_compatible(*minimum_peer),
+        }
     }
 }
 
@@ -84,6 +104,19 @@ pub enum Command {
         command: crate::db::AnswerCommand,
     },
     EpochWindow(EpochWindow),
+    // ponytail: internal replay primitive only; add all-member fencing before submission.
+    ReaderFence { target: u8 },
+    // ponytail: internal preparation only; add authenticated attestation and acknowledgements before activation.
+    PrepareReaderFence { target: u8, membership: StoredMembership<u64, openraft::BasicNode> },
+    CancelReaderFence { prepare_log_id: LogId<u64> },
+    FenceLifecycle { request_id: String, action: FenceLifecycle, membership: Option<StoredMembership<u64, openraft::BasicNode>> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum FenceLifecycle {
+    Prepare { target: u8 },
+    Cancel { prepare_log_id: LogId<u64> },
 }
 
 const SNAPSHOT_LIMIT: usize = 16 * 1024 * 1024;
@@ -162,7 +195,10 @@ pub(crate) fn preflight_application_version(path: &str) -> Result<(), String> {
         .load::<Row>(&mut conn)?;
         match tables.len() {
             0 => Ok(()), // Fresh or standalone legacy database; no consensus tables.
-            2 => check_application_version(&mut conn),
+            2 => conn.transaction::<_, Error, _>(|conn| {
+                check_application_version(conn)?;
+                check_committed_fences(conn)
+            }),
             _ => Err("incomplete consensus metadata".into()),
         }
     };
@@ -172,7 +208,7 @@ pub(crate) fn preflight_application_version(path: &str) -> Result<(), String> {
 fn check_application_version(conn: &mut SqliteConnection) -> Result<(), Error> {
     let version = get::<u8>(conn, "application_version")?;
     if version == Some(cat4igp_shared::discovery::join::APPLICATION_VERSION) {
-        return Ok(());
+        return check_reader_fence(conn).map(|_| ());
     }
     // Only standalone legacy application databases may acquire their first epoch.
     let occupied = diesel::sql_query(
@@ -187,7 +223,100 @@ fn check_application_version(conn: &mut SqliteConnection) -> Result<(), Error> {
     Ok(())
 }
 
+// ponytail: baseline only; raise the ceiling after implementing fenced activation.
+const INITIAL_READER_FENCE: u8 = 1;
+pub(crate) const MAX_READER_FENCE: u8 = 1;
+
+fn check_reader_fence(conn: &mut SqliteConnection) -> Result<u8, Error> {
+    get::<u8>(conn, "reader_fence")?
+        .filter(|fence| (INITIAL_READER_FENCE..=MAX_READER_FENCE).contains(fence))
+        .ok_or_else(|| "missing or unsupported reader fence".into())
+}
+
+fn check_snapshot_fence(local: u8, incoming: u8) -> Result<(), Error> {
+    if incoming < local { return Err("snapshot would lower reader fence".into()); }
+    Ok(())
+}
+
+// ponytail: local durable commits only; add activation fencing for remote commits.
+fn check_committed_fences(conn: &mut SqliteConnection) -> Result<(), Error> {
+    let applied: Option<LogId<u64>> = get::<Option<LogId<u64>>>(conn, "applied")?.flatten();
+    let prepare: Option<FencePrepare> = get(conn, "fence_prepare")?;
+    if let Some(prepare) = prepare {
+        let membership = get::<StoredMembership<u64, openraft::BasicNode>>(conn, "membership")?.unwrap_or_default();
+        if !prepare.valid(check_reader_fence(conn)?, applied, &membership) {
+            return Err("invalid fence preparation".into());
+        }
+    }
+    let committed: Option<LogId<u64>> = get::<Option<LogId<u64>>>(conn, "committed")?.flatten();
+    let purged: Option<LogId<u64>> = get(conn, "purged")?;
+    if [applied, committed, purged].into_iter().flatten().any(|id| id.index == u64::MAX) {
+        return Err("raft log index exhausted".into());
+    }
+    for (left, right) in [(applied, committed), (applied, purged), (committed, purged)] {
+        if matches!((left, right), (Some(a), Some(b)) if a.index == b.index && a != b) {
+            return Err("conflicting raft log IDs".into());
+        }
+    }
+    if purged.is_some_and(|p| applied.is_none_or(|a| p.index > a.index)) {
+        return Err("purged beyond applied".into());
+    }
+    let Some(committed) = committed.filter(|c| applied.is_none_or(|a| c.index > a.index)) else {
+        return Ok(());
+    };
+    let start = match applied {
+        Some(applied) => applied.index.checked_add(1).ok_or("invalid applied index")?,
+        None => 0,
+    };
+    let mut next = start;
+    let mut reached = false;
+    let query = diesel::sql_query("SELECT json_array(idx,value) AS value FROM raft_logs WHERE idx >= ? AND idx <= ? ORDER BY idx")
+        .bind::<Text, _>(format!("{start:016x}"))
+        .bind::<Text, _>(format!("{:016x}", committed.index));
+    for row in query.load_iter::<Row, diesel::connection::DefaultLoadingMode>(conn)? {
+        let row = row?;
+        let (index, value): (String, String) = serde_json::from_str(&row.value)?;
+        let entry: Entry<TypeConfig> = serde_json::from_str(&value)?;
+        if index != format!("{next:016x}") || entry.log_id.index != next {
+            return Err("invalid committed log sequence".into());
+        }
+        if matches!(entry.payload, EntryPayload::Normal(Command::ReaderFence { target }) if target > MAX_READER_FENCE) {
+            return Err("unsupported committed reader fence".into());
+        }
+        if next == committed.index {
+            if entry.log_id != committed { return Err("committed log ID mismatch".into()); }
+            reached = true;
+            break;
+        }
+        next = next.checked_add(1).ok_or("invalid committed index")?;
+    }
+    if reached { Ok(()) } else { Err("incomplete committed log".into()) }
+}
+
+pub(crate) fn read_window(conn: &mut SqliteConnection) -> Result<Option<EpochWindow>, Error> {
+    let window: Option<EpochWindow> = get(conn, "epoch_window")?;
+    if window.as_ref().is_some_and(|window| !window.valid()) {
+        return Err("invalid epoch window".into());
+    }
+    Ok(window)
+}
+
 impl Store {
+    pub(crate) async fn acknowledge_prepare(&self, source: u64, local: u64, expected: FencePrepare) -> bool {
+        self.run(move |conn| conn.transaction::<_, Error, _>(|conn| {
+            let prepare: Option<FencePrepare> = get(conn, "fence_prepare")?;
+            let applied = get::<Option<LogId<u64>>>(conn, "applied")?.flatten();
+            let membership: StoredMembership<u64, openraft::BasicNode> = get(conn, "membership")?.unwrap_or_default();
+            let fence = check_reader_fence(conn)?;
+            Ok(prepare.as_ref().is_some_and(|prepare| {
+                prepare == &expected && prepare.valid(fence, applied, &membership)
+                    && prepare.target <= MAX_READER_FENCE
+                    && membership.membership().nodes().any(|(id, _)| *id == source)
+                    && membership.membership().nodes().any(|(id, _)| *id == local)
+            }))
+        })).await.unwrap_or(false)
+    }
+
     pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<()> {
         self.1.subscribe()
     }
@@ -203,13 +332,15 @@ impl Store {
                 crate::db::migrate(&mut conn, false).map_err(std::io::Error::other)?;
                 check_application_version(&mut conn)?;
                 crate::db::configure_connection(&mut conn)?;
-                if get::<u8>(&mut conn, "application_version")?.is_none() {
-                    put(
-                        &mut conn,
-                        "application_version",
-                        &cat4igp_shared::discovery::join::APPLICATION_VERSION,
-                    )?;
-                }
+                conn.immediate_transaction::<_, Error, _>(|conn| {
+                    check_application_version(conn)?;
+                    if get::<u8>(conn, "application_version")?.is_none() {
+                        put(conn, "reader_fence", &INITIAL_READER_FENCE)?;
+                        put(conn, "application_version", &cat4igp_shared::discovery::join::APPLICATION_VERSION)?;
+                    }
+                    check_committed_fences(conn)?;
+                    Ok(())
+                })?;
                 Ok(conn)
             })();
             match conn {
@@ -390,11 +521,13 @@ impl RaftStateMachine<TypeConfig> for Store {
         let entries: Vec<_> = entries.into_iter().collect();
         let result = self.run(move |conn| {
             conn.immediate_transaction::<_, Error, _>(|conn| {
+                check_reader_fence(conn)?;
                 let mut responses = Vec::with_capacity(entries.len());
                 for entry in entries {
                     let response = match entry.payload {
                         EntryPayload::Blank => Ok(None),
                         EntryPayload::Membership(membership) => {
+                            diesel::sql_query("DELETE FROM raft_meta WHERE key = 'fence_prepare'").execute(conn)?;
                             put(
                                 conn,
                                 "membership",
@@ -483,15 +616,91 @@ impl RaftStateMachine<TypeConfig> for Store {
                             }
                         }
                         EntryPayload::Normal(Command::EpochWindow(window)) => {
-                            match &window {
-                                EpochWindow::Stable { epoch } if EpochWindow::epoch_current(*epoch) => (),
-                                EpochWindow::Mixed { epoch, minimum_peer }
-                                    if EpochWindow::epoch_current(*epoch)
-                                        && cat4igp_shared::compat::wire_compatible(*minimum_peer) => (),
-                                _ => return Err("invalid epoch window".into()),
+                            if !window.valid() {
+                                return Err("invalid epoch window".into());
                             }
                             put(conn, "epoch_window", &window)?;
                             Ok(None)
+                        }
+                        EntryPayload::Normal(Command::ReaderFence { target }) => {
+                            let current = check_reader_fence(conn)?;
+                            if target < current {
+                                Err("reader fence cannot decrease".into())
+                            } else if target > MAX_READER_FENCE {
+                                return Err("unsupported reader fence target".into());
+                            } else if target > current {
+                                // ponytail: no activation until every retained member is fenced.
+                                Err("reader fence activation unsupported".into())
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        EntryPayload::Normal(Command::PrepareReaderFence { target, membership }) => {
+                            let current: StoredMembership<u64, openraft::BasicNode> = get(conn, "membership")?.unwrap_or_default();
+                            let active: Option<FencePrepare> = get(conn, "fence_prepare")?;
+                            if target <= check_reader_fence(conn)? || membership != current
+                                || crate::cluster::read_revocations(conn)?.values().any(|revocation| !revocation.complete)
+                                || membership.log_id().is_none_or(|id| id.index >= entry.log_id.index)
+                                || membership.membership().get_joint_config().len() != 1
+                                || membership.membership().voter_ids().next().is_none() {
+                                Err("invalid fence preparation".into())
+                            } else if active.is_some() {
+                                Err("fence preparation already active".into())
+                            } else {
+                                put(conn, "fence_prepare", &FencePrepare { target, log_id: entry.log_id, membership })?;
+                                Ok(None)
+                            }
+                        }
+                        EntryPayload::Normal(Command::CancelReaderFence { prepare_log_id }) => {
+                            let active: Option<FencePrepare> = get(conn, "fence_prepare")?;
+                            match active {
+                                Some(prepare) if prepare.log_id == prepare_log_id => {
+                                    diesel::sql_query("DELETE FROM raft_meta WHERE key = 'fence_prepare'").execute(conn)?;
+                                    Ok(None)
+                                }
+                                _ => Err("fence preparation not current".into()),
+                            }
+                        }
+                        EntryPayload::Normal(Command::FenceLifecycle { request_id, action, membership }) => {
+                            use crate::schema::administrator_results;
+                            let fingerprint = format!("fence-lifecycle-v1:{}", serde_json::to_string(&action)?);
+                            if request_id.len() <= 8 || request_id.len() > 108 || !request_id.starts_with("admin:1:") || !request_id.is_ascii() {
+                                Err("invalid idempotency key".into())
+                            } else if let Some(saved) = crate::admin::serving_receipt(conn, &request_id, &fingerprint)? {
+                                saved
+                            } else {
+                                let active: Option<FencePrepare> = get(conn, "fence_prepare")?;
+                                let result = match action {
+                                    FenceLifecycle::Prepare { target } => {
+                                        let current: StoredMembership<u64, openraft::BasicNode> = get(conn, "membership")?.unwrap_or_default();
+                                        if target <= check_reader_fence(conn)? || membership.as_ref() != Some(&current)
+                                            || crate::cluster::read_revocations(conn)?.values().any(|r| !r.complete)
+                                            || current.log_id().is_none_or(|id| id.index >= entry.log_id.index)
+                                            || current.membership().get_joint_config().len() != 1
+                                            || current.membership().voter_ids().next().is_none() {
+                                            Err("invalid fence preparation".into())
+                                        } else if active.is_some() {
+                                            Err("fence preparation already active".into())
+                                        } else {
+                                            let prepare = FencePrepare { target, log_id: entry.log_id, membership: current };
+                                            put(conn, "fence_prepare", &prepare)?;
+                                            Ok(Some(serde_json::to_string(&prepare)?))
+                                        }
+                                    }
+                                    FenceLifecycle::Cancel { prepare_log_id } => {
+                                        if active.is_some_and(|prepare| prepare.log_id == prepare_log_id) {
+                                            diesel::sql_query("DELETE FROM raft_meta WHERE key = 'fence_prepare'").execute(conn)?;
+                                            Ok(Some("null".into()))
+                                        } else { Err("fence preparation not current".into()) }
+                                    }
+                                };
+                                diesel::insert_into(administrator_results::table).values((
+                                    administrator_results::request_id.eq(&request_id),
+                                    administrator_results::fingerprint.eq(fingerprint),
+                                    administrator_results::result.eq(serde_json::to_string(&result)?),
+                                )).execute(conn)?;
+                                result
+                            }
                         }
                     };
                     put(conn, "applied", &Some(entry.log_id))?;
@@ -524,7 +733,17 @@ impl RaftStateMachine<TypeConfig> for Store {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
-        self.run(|conn| get::<Image>(conn, "snapshot")?.map(snapshot).transpose())
+        self.run(|conn| {
+            let local_fence = check_reader_fence(conn)?;
+            get::<Image>(conn, "snapshot")?.map(|image| {
+                if !image.valid() {
+                    return Err("invalid stored snapshot fence".into());
+                }
+                check_snapshot_fence(local_fence, image.reader_fence)?;
+                validate_management_ids(&image.tables)?;
+                snapshot(image)
+            }).transpose()
+        })
             .await
     }
 }
@@ -540,10 +759,18 @@ async fn install(
     store.run(move |conn| {
             if bytes.len() > SNAPSHOT_LIMIT { return Err(std::io::Error::other("snapshot exceeds 16 MiB").into()); }
             let image: Image = serde_json::from_slice(&bytes)?;
-            if image.version != 1 || image.application_version != cat4igp_shared::discovery::join::APPLICATION_VERSION || image.meta != meta || image.tables.len() != TABLES.len() {
+            if !image.valid() || image.meta != meta || image.tables.len() != TABLES.len() {
                 return Err(std::io::Error::other("invalid snapshot header").into());
             }
+            validate_management_ids(&image.tables)?;
             conn.immediate_transaction::<_, Error, _>(|conn| {
+                let local_fence = check_reader_fence(conn)?;
+                check_snapshot_fence(local_fence, image.reader_fence)?;
+                let applied: Option<LogId<u64>> = get::<Option<LogId<u64>>>(conn, "applied")?.flatten();
+                if applied.is_some_and(|local| meta.last_log_id.is_none_or(|incoming|
+                    incoming.index < local.index || (incoming.index == local.index && incoming != local))) {
+                    return Err("snapshot would regress applied state".into());
+                }
                 // Delete dependent rows first, and never touch Raft logs/vote/commit/purge or local settings.
                 for (table, _) in TABLES.iter().rev() {
                     diesel::sql_query(format!("DELETE FROM {table}{}", filter(table))).execute(conn)?;
@@ -562,6 +789,15 @@ async fn install(
                 }
                 put(conn, "applied", &meta.last_log_id)?;
                 put(conn, "membership", &meta.last_membership)?;
+                put(conn, "reader_fence", &image.reader_fence)?;
+                match &image.epoch_window {
+                    Some(window) => put(conn, "epoch_window", window)?,
+                    None => { diesel::sql_query("DELETE FROM raft_meta WHERE key = 'epoch_window'").execute(conn)?; },
+                }
+                match &image.fence_prepare {
+                    Some(prepare) => put(conn, "fence_prepare", prepare)?,
+                    None => { diesel::sql_query("DELETE FROM raft_meta WHERE key = 'fence_prepare'").execute(conn)?; },
+                }
                 put(conn, "snapshot", &image)
             })
         }).await
@@ -633,6 +869,26 @@ fn application_tables(conn: &mut SqliteConnection) -> Result<Vec<Vec<serde_json:
         .collect()
 }
 
+fn validate_management_ids(tables: &[Vec<serde_json::Value>]) -> Result<(), Error> {
+    let rows = |name| TABLES.iter().position(|(table, _)| *table == name)
+        .and_then(|index| tables.get(index)).ok_or("missing snapshot table");
+    let ids = rows("management_ids")?;
+    if ids.len() != 3 { return Err("invalid management IDs".into()); }
+    for (kind, table) in [("node", "nodes"), ("mesh", "mesh_groups"), ("tunnel", "wireguard_tunnels")] {
+        let matching: Vec<_> = ids.iter().filter_map(|row| row.as_array())
+            .filter(|row| row.len() == 2 && row[0].as_str() == Some(kind)).collect();
+        if matching.len() != 1 { return Err("invalid management IDs".into()); }
+        let high = matching[0][1].as_i64().filter(|id| (0..=i32::MAX as i64).contains(id))
+            .ok_or("invalid management high-water mark")?;
+        for row in rows(table)? {
+            let id = row.as_array().and_then(|row| row.first()).and_then(|id| id.as_i64())
+                .filter(|id| *id > 0 && *id <= i32::MAX as i64).ok_or("invalid application ID")?;
+            if id > high { return Err("management high-water mark below live ID".into()); }
+        }
+    }
+    Ok(())
+}
+
 fn insert_tables(
     conn: &mut SqliteConnection,
     tables: &[Vec<serde_json::Value>],
@@ -640,6 +896,7 @@ fn insert_tables(
     if tables.len() != TABLES.len() {
         return Err("invalid application tables".into());
     }
+    validate_management_ids(tables)?;
     for ((table, columns), rows) in TABLES.iter().zip(tables) {
         let count = columns.split(',').count();
         let values = (0..count)
@@ -707,9 +964,7 @@ pub(crate) fn verify_recovery(
                 return Err("snapshot exceeds limit".into());
             }
             let image: Image = serde_json::from_slice(&bytes)?;
-            if image.version != 1
-                || image.application_version != cat4igp_shared::discovery::join::APPLICATION_VERSION
-            {
+            if !image.valid() {
                 return Err("unsupported snapshot version".into());
             }
             (
@@ -738,7 +993,14 @@ pub(crate) fn verify_recovery(
             }
             crate::db::verify_schema(&mut conn).map_err(std::io::Error::other)?;
             check_application_version(&mut conn)?;
+            check_committed_fences(&mut conn)?;
+            let reader_fence = get::<u8>(&mut conn, "reader_fence")?;
             let applied: Option<LogId<u64>> = get(&mut conn, "applied")?.flatten();
+            let window = read_window(&mut conn)?;
+            let prepare: Option<FencePrepare> = get(&mut conn, "fence_prepare")?;
+            if applied.is_none() && window.is_some() {
+                return Err("window without applied log".into());
+            }
             let membership =
                 get::<StoredMembership<u64, openraft::BasicNode>>(&mut conn, "membership")?
                     .unwrap_or_default();
@@ -785,12 +1047,14 @@ pub(crate) fn verify_recovery(
                 snapshot(Image {
                     version: image.version,
                     application_version: image.application_version,
+                    reader_fence: image.reader_fence,
+                    epoch_window: image.epoch_window.clone(),
+                    fence_prepare: image.fence_prepare.clone(),
                     meta: image.meta.clone(),
                     tables: image.tables.clone(),
                 })?;
-                if image.version != 1
-                    || image.application_version
-                        != cat4igp_shared::discovery::join::APPLICATION_VERSION
+                if !image.valid()
+                    || reader_fence.is_none_or(|fence| image.reader_fence > fence)
                     || image
                         .meta
                         .last_log_id
@@ -805,6 +1069,9 @@ pub(crate) fn verify_recovery(
                 verify_membership(image.meta.last_log_id, &image.meta.last_membership)?;
                 if image.meta.last_log_id == applied
                     && (image.meta.last_membership != membership
+                        || Some(image.reader_fence) != reader_fence
+                        || image.epoch_window != window
+                        || image.fence_prepare != prepare
                         || image.tables != application_tables(&mut conn)?)
                 {
                     return Err("snapshot disagrees with application at same applied log".into());
@@ -994,8 +1261,22 @@ pub(crate) fn legacy_backup(
 struct Image {
     version: u8,
     application_version: u8,
+    reader_fence: u8,
+    #[serde(deserialize_with = "Option::deserialize")]
+    epoch_window: Option<EpochWindow>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    fence_prepare: Option<FencePrepare>,
     meta: SnapshotMeta<u64, openraft::BasicNode>,
     tables: Vec<Vec<serde_json::Value>>,
+}
+
+impl Image {
+    fn valid(&self) -> bool {
+        self.version == 4 && (INITIAL_READER_FENCE..=MAX_READER_FENCE).contains(&self.reader_fence)
+            && self.application_version == cat4igp_shared::compat::APPLICATION_VERSION
+            && self.epoch_window.as_ref().is_none_or(|window| window.valid() && self.meta.last_log_id.is_some())
+            && self.fence_prepare.as_ref().is_none_or(|prepare| prepare.valid(self.reader_fence, self.meta.last_log_id, &self.meta.last_membership))
+    }
 }
 
 fn snapshot(image: Image) -> Result<Snapshot<TypeConfig>, Error> {
@@ -1013,6 +1294,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Store {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
         self.run(|conn| {
             conn.immediate_transaction::<_, Error, _>(|conn| {
+                let reader_fence = check_reader_fence(conn)?;
                 let mut tables = Vec::with_capacity(TABLES.len());
                 let mut size = 0;
                 for (table, columns) in TABLES {
@@ -1033,8 +1315,11 @@ impl RaftSnapshotBuilder<TypeConfig> for Store {
                     tables.push(values);
                 }
                 let image = Image {
-                    version: 1,
+                    version: 4,
                     application_version: cat4igp_shared::discovery::join::APPLICATION_VERSION,
+                    reader_fence,
+                    epoch_window: read_window(conn)?,
+                    fence_prepare: get(conn, "fence_prepare")?,
                     meta: SnapshotMeta {
                         last_log_id: get(conn, "applied")?.flatten(),
                         last_membership: get(conn, "membership")?.unwrap_or_default(),
@@ -1042,9 +1327,13 @@ impl RaftSnapshotBuilder<TypeConfig> for Store {
                     },
                     tables,
                 };
+                if !image.valid() { return Err("invalid snapshot state".into()); }
                 let result = snapshot(Image {
                     version: image.version,
                     application_version: image.application_version,
+                    reader_fence: image.reader_fence,
+                    epoch_window: image.epoch_window.clone(),
+                    fence_prepare: image.fence_prepare.clone(),
                     meta: image.meta.clone(),
                     tables: image.tables.clone(),
                 })?;

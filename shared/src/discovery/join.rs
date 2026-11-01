@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 // ponytail: exact application schema/protocol epoch; incompatible changes require stop-all upgrades.
-pub const APPLICATION_VERSION: u8 = 4;
+pub const APPLICATION_VERSION: u8 = crate::compat::APPLICATION_VERSION;
 
 /// Operator-issued join parameters, packaged so a joining replica needs one
 /// command instead of ~11 environment variables. Contains a live enrollment

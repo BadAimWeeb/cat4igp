@@ -27,7 +27,7 @@ pub enum DaemonRequest {
     Shutdown,
     /// Get daemon configuration
     GetConfig,
-    /// Modify daemon configuration
+    /// Modify supplied hostnames; an empty string clears the corresponding hostname.
     ModifyConfig {
         public_hostname_ipv4: Option<String>,
         public_hostname_ipv6: Option<String>,

@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config::ClientConfig::default()
             };
 
-            start_daemon(client_config).await?;
+            start_daemon(client_config, config_path).await?;
         }
 
         Some(command @ (Commands::Register { .. } | Commands::RegisterBundle { .. })) => {
@@ -306,14 +306,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config::ClientConfig::default()
             };
 
-            start_daemon(client_config).await?;
+            start_daemon(client_config, config_path).await?;
         }
     }
 
     Ok(())
 }
 
-async fn start_daemon(config: config::ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn start_daemon(
+    config: config::ClientConfig,
+    config_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting cat4igp client daemon...");
     println!("Configuration:");
     println!("  Daemon socket: {:?}", config.daemon_socket);
@@ -330,7 +333,7 @@ async fn start_daemon(config: config::ClientConfig) -> Result<(), Box<dyn std::e
         println!("  Public IPv6 hostname: {}", hostname);
     }
 
-    let daemon = daemon::Daemon::new(config).await?;
+    let daemon = daemon::Daemon::new_with_config_path(config, Some(config_path)).await?;
     println!("✓ Daemon initialized");
 
     if daemon.is_server_configured().await {

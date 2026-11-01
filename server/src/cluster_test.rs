@@ -99,6 +99,10 @@ fn startup_epoch_preflight_accepts_fresh_legacy_and_current_without_writes() {
         )
         .execute(&mut conn)
         .unwrap();
+    assert!(crate::raft_storage::preflight_application_version(path).is_err());
+    diesel::sql_query("INSERT INTO raft_meta VALUES ('reader_fence', '1')")
+        .execute(&mut conn)
+        .unwrap();
     let before = std::fs::read(&database).unwrap();
     crate::raft_storage::preflight_application_version(path).unwrap();
     assert_eq!(std::fs::read(&database).unwrap(), before);
@@ -1416,6 +1420,190 @@ fn three_process_leader_kill_recovers_invites() {
 }
 
 #[tokio::test]
+#[ignore = "subprocess helper"]
+async fn transport_rehearsal_child() {
+    use std::io::Write;
+    if std::env::var_os("CAT4IGP_MAINTENANCE_CHILD").is_some() {
+        offline_transport().unwrap();
+        println!("CAT4IGP_MAINTENANCE_DONE");
+        std::io::stdout().flush().unwrap();
+        return;
+    }
+    let config: Config = serde_json::from_slice(&protected_read(&std::env::var("CLUSTER_CONFIG_FILE").unwrap()).unwrap()).unwrap();
+    let database = std::env::var("DATABASE_URL").unwrap();
+    let mut conn = diesel::SqliteConnection::establish(&database).unwrap();
+    crate::db::migrate(&mut conn, true).unwrap();
+    drop(conn);
+    let psk = config.cluster_psk.as_ref().unwrap().parse().unwrap();
+    let (node, store, _task, service) = match start(config, database, psk).await {
+        Ok(running) => running,
+        Err(error) => {
+            println!("CAT4IGP_REJECTED {error}");
+            return;
+        }
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            if tx.send(line.unwrap()).is_err() { break; }
+        }
+    });
+    println!("CAT4IGP_STARTED");
+    std::io::stdout().flush().unwrap();
+    while let Some(command) = rx.recv().await {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let next = credential("rotation-kill", 1, libp2p::pnet::PreSharedKey::new([42; 32]));
+            match command.as_str() {
+                "ready" => loop {
+                    if matches!(service.submit(Operation::Ready).await, Outcome::Ready) { break; }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                },
+                "invite" => {
+                    assert!(matches!(service.submit(Operation::Invite { request_id: "rotation-kill-invite".into(), expires_at: None, max_uses: Some(3), join_mesh: None }).await, Outcome::Invite(Ok(_))));
+                }
+                "prepare" => assert!(matches!(service.submit(Operation::PrepareTransport(next.clone())).await, Outcome::Transport(Ok(_)))),
+                "complete" => assert!(matches!(service.submit(Operation::CompleteTransport).await, Outcome::Transport(Ok(s)) if s.active == next && s.next.is_none())),
+                "prepared" | "completed" => loop {
+                    let state = store.run(read_transport).await.unwrap();
+                    if state.is_some_and(|s| if command == "prepared" { s.next.as_ref() == Some(&next) } else { s.active == next && s.next.is_none() }) { break; }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                },
+                _ => panic!("unknown rehearsal command"),
+            }
+            println!("CAT4IGP_OK");
+            std::io::stdout().flush().unwrap();
+        }).await.expect("rehearsal command deadline");
+    }
+    node.shutdown().await.unwrap();
+}
+
+#[test]
+fn three_process_transport_rotation_kill_rehearsal() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::process::ExitStatusExt;
+    // ponytail: SIGKILL at durable boundaries only; add publication/fsync fault injection for power-loss coverage.
+    let root = tempfile::tempdir().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let listeners: Vec<_> = (0..3).map(|_| reserve_startup_listener()).collect();
+    let addresses: Vec<libp2p::Multiaddr> = listeners.iter().map(|l| format!("/ip4/127.0.0.1/tcp/{}", l.local_addr().unwrap().port()).parse().unwrap()).collect();
+    let identities: Vec<_> = (0..3).map(|i| root.path().join(format!("{i}.key"))).collect();
+    let keys: Vec<_> = identities.iter().map(|p| crate::raft_network::replica_identity(p).unwrap()).collect();
+    let databases: Vec<_> = (0..3).map(|i| root.path().join(format!("{i}.sqlite"))).collect();
+    let old = libp2p::pnet::PreSharedKey::new([41; 32]);
+    let new = libp2p::pnet::PreSharedKey::new([42; 32]);
+    let next = credential("rotation-kill", 1, new);
+    let configs: Vec<_> = (0..3).map(|i| Config {
+        cluster_id: "rotation-kill".into(), node_id: i as u64 + 1,
+        mode: if i == 2 { Mode::Initialize } else { Mode::Join },
+        identity_file: identities[i].to_str().unwrap().into(), listen: addresses[i].clone(),
+        replicas: (0..3).map(|j| (j as u64 + 1, Replica { peer_id: keys[j].public().to_peer_id(), address: addresses[j].clone() })).collect(),
+        learner: None, cluster_psk: Some(old.to_key_file()), transport_generation: 0, legacy_import: None,
+    }).collect();
+    let initial: Vec<_> = (0..3).map(|i| root.path().join(format!("{i}-initial.json"))).collect();
+    let old_paths: Vec<_> = (0..3).map(|i| root.path().join(format!("{i}-old.json"))).collect();
+    let new_paths: Vec<_> = (0..3).map(|i| root.path().join(format!("{i}-new.json"))).collect();
+    for i in 0..3 {
+        publish_transport_config(initial[i].to_str().unwrap(), &serde_json::to_vec(&configs[i]).unwrap()).unwrap();
+        let mut recovery: Config = serde_json::from_slice(&serde_json::to_vec(&configs[i]).unwrap()).unwrap();
+        recovery.mode = Mode::Recover;
+        publish_transport_config(old_paths[i].to_str().unwrap(), &serde_json::to_vec(&recovery).unwrap()).unwrap();
+    }
+    let key_path = root.path().join("next.psk");
+    publish_transport_config(key_path.to_str().unwrap(), new.to_key_file().as_bytes()).unwrap();
+    drop(listeners);
+    let spawn = |i: usize, path: &std::path::Path| {
+        let mut child = KilledChild(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cluster::tests::transport_rehearsal_child", "--ignored", "--nocapture"])
+            .env("CLUSTER_CONFIG_FILE", path).env("DATABASE_URL", &databases[i])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().unwrap());
+        let stdout = child.0.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let line = line.unwrap();
+                if line.starts_with("CAT4IGP_") && tx.send(line).is_err() { break; }
+            }
+        });
+        (child, rx)
+    };
+    let receive = |rx: &std::sync::mpsc::Receiver<String>| rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()).min(Duration::from_secs(25))).expect("bounded subprocess handshake");
+    let command = |child: &mut (KilledChild, std::sync::mpsc::Receiver<String>), text: &str| {
+        writeln!(child.0.0.stdin.as_mut().unwrap(), "{text}").unwrap();
+        child.0.0.stdin.as_mut().unwrap().flush().unwrap();
+        assert_eq!(receive(&child.1), "CAT4IGP_OK");
+    };
+    let kill = |child: &mut (KilledChild, std::sync::mpsc::Receiver<String>)| {
+        child.0.0.kill().unwrap();
+        assert_eq!(child.0.0.wait().unwrap().signal(), Some(9));
+    };
+    let mut children: Vec<_> = (0..3).map(|i| spawn(i, &initial[i])).collect();
+    for child in &children { assert_eq!(receive(&child.1), "CAT4IGP_STARTED"); }
+    command(&mut children[0], "ready");
+    command(&mut children[0], "invite");
+    command(&mut children[0], "prepare");
+    for child in &mut children { command(child, "prepared"); }
+    for child in &mut children { kill(child); }
+    drop(children);
+    let preserved = |i: usize| {
+        let mut conn = diesel::SqliteConnection::establish(databases[i].to_str().unwrap()).unwrap();
+        (crate::db::get_invites(&mut conn).unwrap().into_iter().map(|invite| invite.code).collect::<Vec<_>>(),
+         ["control_private_key", "control_encryption_private_key", "control_network_id"].map(|key| crate::db::get_setting(&mut conn, key).unwrap()))
+    };
+    let expected = preserved(0);
+    assert_eq!(expected.0.len(), 1);
+    for i in 1..3 { assert_eq!(preserved(i), expected); }
+    for i in 0..3 {
+        let mut maintenance = KilledChild(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cluster::tests::transport_rehearsal_child", "--ignored", "--nocapture"])
+            .env("CAT4IGP_MAINTENANCE_CHILD", "1").env("CLUSTER_MAINTENANCE_STOPPED", "true")
+            .env("CLUSTER_CONFIG_FILE", &old_paths[i]).env("CLUSTER_NEXT_PSK_FILE", &key_path)
+            .env("CLUSTER_ROTATED_CONFIG_FILE", &new_paths[i]).env("DATABASE_URL", &databases[i])
+            .stdout(std::process::Stdio::piped()).spawn().unwrap());
+        let stdout = maintenance.0.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || for line in std::io::BufReader::new(stdout).lines() {
+            if line.unwrap().contains("CAT4IGP_MAINTENANCE_DONE") { let _ = tx.send(()); }
+        });
+        rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()).min(Duration::from_secs(25))).expect("bounded offline maintenance");
+        assert!(maintenance.0.wait().unwrap().success());
+        let config: Config = serde_json::from_slice(&protected_read(new_paths[i].to_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(config.transport_generation, 1);
+        assert_eq!(config.cluster_psk.as_deref(), Some(new.to_key_file().as_str()));
+    }
+    let mut first = spawn(0, &new_paths[0]);
+    assert_eq!(receive(&first.1), "CAT4IGP_STARTED");
+    kill(&mut first);
+    drop(first);
+    let mut conn = diesel::SqliteConnection::establish(databases[0].to_str().unwrap()).unwrap();
+    assert_eq!(crate::raft_storage::get::<TransportCredential>(&mut conn, "transport_credential").unwrap(), Some(next.clone()));
+    assert_eq!(read_transport(&mut conn).unwrap().unwrap().next, Some(next.clone()));
+    drop(conn);
+    let mut rejected = spawn(0, &old_paths[0]);
+    assert!(receive(&rejected.1).starts_with("CAT4IGP_REJECTED "));
+    assert!(rejected.0.0.wait().unwrap().success());
+    let mut children: Vec<_> = (0..3).map(|i| spawn(i, &new_paths[i])).collect();
+    for child in &children { assert_eq!(receive(&child.1), "CAT4IGP_STARTED"); }
+    command(&mut children[0], "ready");
+    command(&mut children[0], "complete");
+    for child in &mut children { command(child, "completed"); }
+    for child in &mut children { kill(child); }
+    drop(children);
+    for i in 0..3 {
+        let mut conn = diesel::SqliteConnection::establish(databases[i].to_str().unwrap()).unwrap();
+        let state = read_transport(&mut conn).unwrap().unwrap();
+        assert_eq!(state.active, next);
+        assert!(state.next.is_none());
+        assert_eq!(crate::raft_network::replica_identity(&identities[i]).unwrap().public().to_peer_id(), keys[i].public().to_peer_id());
+        drop(conn);
+        assert_eq!(preserved(i), expected);
+        let mut rejected = spawn(i, &old_paths[i]);
+        assert!(receive(&rejected.1).starts_with("CAT4IGP_REJECTED "));
+        assert!(rejected.0.0.wait().unwrap().success());
+    }
+}
+
+#[tokio::test]
 async fn three_node_offline_transport_rotation_rehearsal() {
     // ponytail: real in-process Raft/swarm stop-all; subprocess kill/power-loss is a separate rehearsal.
     tokio::time::timeout(Duration::from_secs(90), async {
@@ -2514,7 +2702,7 @@ async fn follower_retry_rehearsal(surviving_election: bool) {
         let config: Config = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
         let psk = config.cluster_psk.as_ref().unwrap().parse().unwrap();
         let (restarted, _, restart_task, restart_service) = start(config, fourth_path.clone(), psk).await.unwrap();
-        restarted.wait(Some(DEADLINE)).applied_index(Some(serving_index), "voter restart retained state").await.unwrap();
+        restarted.wait(Some(DEADLINE)).applied_index_at_least(Some(serving_index), "voter restart retained state").await.unwrap();
         assert!(restarted.metrics().borrow().membership_config.membership().voter_ids().any(|id| id == 9));
         // Real follower-forwarded removal of the fourth promoted voter.
         // Recovery/restart can elect another writer. Never forward an old
@@ -4220,14 +4408,11 @@ async fn rolling_window_gates_epoch_features_and_replicates_state() {
     let leader = nodes.iter().find_map(|n| n.metrics().borrow().current_leader).unwrap() as usize - 1;
     let follower = (leader + 1) % 3;
     nodes[follower].wait(Some(DEADLINE)).current_leader(leader as u64 + 1, "follower learns leader").await.unwrap();
-    // An epoch-4-only action is available while no window is declared.
+    // The legacy gate permits the action while no window is declared.
     assert!(matches!(services[leader].submit(Operation::WindowStatus).await, Outcome::WindowOpen(false)));
-    // Declare a mixed window: a lagging epoch cohort remains in the quorum.
-    let opened = match services[leader].submit(Operation::OpenEpochWindow(3)).await {
-        Outcome::EpochWindow(result) => result,
-        other => panic!("{other:?}"),
-    };
-    assert!(opened.is_ok(), "{opened:?}");
+    // A previously committed mixed window can still be recovered.
+    let opened = crate::raft_storage::EpochWindow::Mixed { epoch: 6, minimum_peer: 5 };
+    assert!(nodes[leader].client_write(Command::EpochWindow(opened.clone())).await.unwrap().data.is_ok());
     // The window must be committed at the leader and replicated to a follower.
     let learned = loop {
         if let Some(window) = stores[follower].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap() {
@@ -4235,17 +4420,16 @@ async fn rolling_window_gates_epoch_features_and_replicates_state() {
         }
         tokio::task::yield_now().await;
     };
-    assert_eq!(opened.unwrap(), learned);
+    assert_eq!(opened, learned);
     // Read-only window status may be queried on any node.
     assert!(matches!(services[follower].submit(Operation::WindowStatus).await, Outcome::WindowOpen(true)));
-    // An epoch-4-only action is refused while the window is open: replicating it to
-    // an epoch-3 peer would stall the log.
+    // The action is refused while the legacy window is open.
     let rejected = services[leader].submit(Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation {
         request_id: "rolling-window-fecline".into(), applied_at: chrono::Utc::now().naive_utc(),
         action: crate::admin::Action::CreateMesh { name: "blocked".into(), auto_wireguard: true, mtu: 1400, fec: true },
     }))).await;
     assert!(matches!(rejected, Outcome::Admin(Err(ref e)) if e.contains("rolling-upgrade window")), "{rejected:?}");
-    // Close the window: the last lagging peer has been upgraded.
+    // Close legacy state; this is not an upgrade authorization.
     let closed = match services[leader].submit(Operation::CloseEpochWindow).await {
         Outcome::EpochWindow(result) => result,
         other => panic!("{other:?}"),
@@ -4258,12 +4442,25 @@ async fn rolling_window_gates_epoch_features_and_replicates_state() {
         tokio::task::yield_now().await;
     };
     assert_eq!(closed.unwrap(), learned);
-    assert_eq!(learned, crate::raft_storage::EpochWindow::Stable { epoch: 4 });
+    assert_eq!(learned, crate::raft_storage::EpochWindow::Stable { epoch: 6 });
     // The exact action now applies (Bootstrap commit proves authoring; the gate released).
     assert!(matches!(services[leader].submit(Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation {
         request_id: "rolling-window-fecline".into(), applied_at: chrono::Utc::now().naive_utc(),
         action: crate::admin::Action::CreateMesh { name: "after-close".into(), auto_wireguard: true, mtu: 1400, fec: true },
     }))).await, Outcome::Admin(Ok(_))));
+    // Malformed or invalid-epoch state must not release the gate.
+    for value in ["invalid", r#"{"window":"stable","epoch":5}"#, r#"{"window":"mixed","epoch":6,"minimum_peer":0}"#] {
+        stores[leader].run(move |conn| {
+            diesel::sql_query("UPDATE raft_meta SET value = ? WHERE key = 'epoch_window'")
+                .bind::<diesel::sql_types::Text, _>(value).execute(conn)?;
+            Ok(())
+        }).await.unwrap();
+        assert!(matches!(services[leader].submit(Operation::WindowStatus).await, Outcome::Unavailable));
+        assert!(matches!(services[leader].submit(Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation {
+            request_id: "invalid-window".into(), applied_at: chrono::Utc::now().naive_utc(),
+            action: crate::admin::Action::CreateMesh { name: "not-admitted".into(), auto_wireguard: true, mtu: 1400, fec: true },
+        }))).await, Outcome::Unavailable));
+    }
     for node in &nodes { node.shutdown().await.unwrap(); }
     for task in &transports { task.abort(); }
     drop(stores); drop(services); drop(nodes); drop(transports);
@@ -4271,13 +4468,12 @@ async fn rolling_window_gates_epoch_features_and_replicates_state() {
 }
 
 #[tokio::test]
-async fn rolling_window_rejects_nonpreceding_epoch_floor() {
+async fn rolling_window_rejects_all_new_mixed_windows() {
     let (root, nodes, stores, transports, services) = rolling_window_cluster(true).await;
-    // Only the exact previous epoch (APPLICATION_VERSION - 1) opens a mixed window.
-    for floor in [0u8, 2u8, 4u8, 5u8, 255u8] {
+    for floor in [0u8, 2u8, 3u8, 4u8, 5u8, 255u8] {
         let outcome = services[0].submit(Operation::OpenEpochWindow(floor)).await;
         assert!(
-            matches!(outcome, Outcome::EpochWindow(Err(_))),
+            matches!(outcome, Outcome::EpochWindow(Err(ref error)) if error.contains("unsupported")),
             "{outcome:?}"
         );
         assert!(stores[0].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap().is_none());
@@ -4289,55 +4485,206 @@ async fn rolling_window_rejects_nonpreceding_epoch_floor() {
 }
 
 #[tokio::test]
-async fn rolling_window_auto_reconciles_by_binary_replacement() {
+async fn rolling_window_probe_does_not_change_declared_state() {
     let (root, nodes, stores, transports, services) = rolling_window_cluster(false).await;
     let leader = nodes.iter().find_map(|n| n.metrics().borrow().current_leader).unwrap() as usize - 1;
-    // The scheduler runs on the leader only; spawn it as serve() would.
-    let scheduler = tokio::spawn({
-        let leader_service = services[leader].clone();
-        async move { leader_service.schedule_window().await }
-    });
-    // Uniform current epoch: nothing opens and the ledger stays empty.
+    assert!(nodes[leader].client_write(Command::EpochWindow(crate::raft_storage::EpochWindow::Mixed { epoch: 6, minimum_peer: 5 })).await.unwrap().data.is_ok());
+    assert!(matches!(services[(leader + 1) % 3].submit(Operation::ProbeEpoch).await,
+        Outcome::EpochProbe(Ok(epoch)) if epoch == cat4igp_shared::compat::APPLICATION_VERSION));
+    let follower = (leader + 1) % 3;
+    for (source, target) in [(leader, follower), (follower, leader)] {
+        assert!(matches!(services[source].network.as_ref().unwrap().forward(target as u64 + 1, Operation::ProbeCapabilities).await,
+            Outcome::Capabilities { version: 1, application_version, max_reader_fence, capabilities }
+                if application_version == cat4igp_shared::compat::APPLICATION_VERSION
+                    && max_reader_fence == crate::raft_storage::MAX_READER_FENCE && capabilities == ["capability_report_v1"]));
+    }
+    let membership = stores[leader].run(|conn| Ok(crate::raft_storage::get::<openraft::StoredMembership<u64, openraft::BasicNode>>(conn, "membership")?.unwrap())).await.unwrap();
+    let reply = nodes[leader].client_write(Command::PrepareReaderFence {
+        target: crate::raft_storage::MAX_READER_FENCE + 1, membership,
+    }).await.unwrap();
+    assert!(reply.data.is_ok());
+    nodes[follower].wait(Some(DEADLINE)).applied_index_at_least(Some(reply.log_id.index), "prepare applied").await.unwrap();
+    let unsupported = stores[follower].run(|conn| Ok(crate::raft_storage::get::<crate::raft_storage::FencePrepare>(conn, "fence_prepare")?.unwrap())).await.unwrap();
+    let membership_before = nodes[leader].metrics().borrow().membership_config.clone();
+    for operation in [Operation::ActivateLearner(42), Operation::PromoteLearner(42), Operation::RevokeReplica(42)] {
+        let outcome = tokio::time::timeout(DEADLINE, async {
+            loop {
+                let outcome = services[leader].submit(operation.clone()).await;
+                if !matches!(outcome, Outcome::Unavailable) { break outcome; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(matches!(outcome, Outcome::Learner(Err(ref error)) | Outcome::Promotion(Err(ref error)) | Outcome::Revocation(Err(ref error)) if error.contains("membership frozen")), "{outcome:?}");
+    }
+    assert_eq!(nodes[leader].metrics().borrow().membership_config, membership_before);
+    assert!(!stores[leader].run(|conn| Ok(read_revocations(conn)?.contains_key(&42))).await.unwrap());
+    let unsigned = Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation {
+        request_id: "admin:1:unsigned".into(), applied_at: chrono::Utc::now().naive_utc(),
+        action: crate::admin::Action::AttestUpgradeFence { prepare: unsupported.clone(), externally_fenced: true },
+    }));
+    assert!(matches!(services[leader].submit(unsigned).await, Outcome::Unavailable));
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let body = crate::admin::SignedFenceAttestation {
+        cluster_id: "rolling-window".into(), subject: "administrator:1".into(), request_id: "admin:1:signed".into(),
+        prepare: unsupported.clone(), externally_fenced: true,
+        issued_at: chrono::Utc::now().timestamp() as u64, expires_at: chrono::Utc::now().timestamp() as u64 + 60,
+    };
+    let signature = signer.sign(&serde_json::to_vec(&("cat4igp/admin/fence-attestation/v1", &body)).unwrap()).unwrap();
+    let mut signed_leader = services[leader].clone();
+    let (keys, token) = crate::admin::test_attestation_credentials(&signer.public());
+    signed_leader.admin_keys = Some(keys);
+    let network = signed_leader.network.as_ref().unwrap().clone();
+    signed_leader.network = Some(network.consensus());
+    network.attach_service(signed_leader.clone());
+    nodes[follower].wait(Some(DEADLINE)).current_leader(leader as u64 + 1, "follower learns leader").await.unwrap();
+    let envelope = crate::admin::SignedFenceEnvelope { body, signature };
+    let operation = Operation::Admin(crate::admin::Operation::SignedFenceAttestation(envelope.clone(), token.clone()));
+    assert!(!format!("{operation:?}").contains(&token));
+    let result = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let result = services[follower].submit(operation.clone()).await;
+            if !matches!(result, Outcome::Unavailable) { break result; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(matches!(result, Outcome::Admin(Ok(_))), "{result:?}");
+    let signature_json = serde_json::to_string(&envelope.signature).unwrap();
+    let token_copy = token.clone();
+    stores[leader].run(move |conn| {
+        #[derive(diesel::QueryableByName)]
+        struct Value { #[diesel(sql_type = diesel::sql_types::Text)] value: String }
+        for row in diesel::sql_query("SELECT value FROM raft_logs UNION ALL SELECT result AS value FROM administrator_results").load::<Value>(conn)? {
+            assert!(!row.value.contains(&signature_json));
+            assert!(!row.value.contains(&token_copy));
+        }
+        Ok(())
+    }).await.unwrap();
+    let mut forged = envelope.clone();
+    forged.body.request_id = "admin:1:forged".into();
+    let result = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let result = services[follower].submit(Operation::Admin(crate::admin::Operation::SignedFenceAttestation(forged.clone(), token.clone()))).await;
+            if !matches!(result, Outcome::Unavailable) { break result; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(matches!(result, Outcome::Admin(Err(_))), "{result:?}");
+    let result = services[follower].submit(Operation::Admin(crate::admin::Operation::SignedFenceAttestation(envelope, "invalid".into()))).await;
+    assert!(matches!(result, Outcome::Admin(Err(_))), "{result:?}");
+    assert!(!services[leader].network.as_ref().unwrap().acknowledge_prepare(follower as u64 + 1, unsupported.clone()).await);
+    assert!(nodes[leader].client_write(Command::CancelReaderFence { prepare_log_id: unsupported.log_id }).await.unwrap().data.is_ok());
+    let outcome = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let outcome = services[leader].submit(Operation::ActivateLearner(42)).await;
+            if !matches!(outcome, Outcome::Unavailable) { break outcome; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(matches!(outcome, Outcome::Learner(Err(ref error)) if error.contains("no committed pending admission")), "{outcome:?}");
     tokio::time::sleep(Duration::from_millis(2600)).await;
-    assert!(stores[leader].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap().is_none());
-    // Simulate a binary replacement finished on one replica only: it reports
-    // the previous epoch. The leader must commit a Mixed window within a tick.
-    services[(leader + 1) % 3].epoch_report.store(3, std::sync::atomic::Ordering::SeqCst);
-    let opened = {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    assert!(matches!(stores[leader].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap(),
+        Some(crate::raft_storage::EpochWindow::Mixed { .. })));
+    for node in &nodes { node.shutdown().await.unwrap(); }
+    for task in &transports { task.abort(); }
+    drop(stores); drop(services); drop(nodes); drop(transports);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn preparation_blocks_membership_after_leader_loss() {
+    let (root, nodes, stores, transports, services) = rolling_window_cluster(false).await;
+    let leader = nodes.iter().find_map(|node| node.metrics().borrow().current_leader).unwrap() as usize - 1;
+    let prepared = services[leader].prepare_reader_fence(2).await.unwrap();
+    assert_eq!(services[leader].prepare_reader_fence(2).await.unwrap(), prepared);
+    assert!(services[leader].prepare_reader_fence(3).await.is_err());
+    for (i, node) in nodes.iter().enumerate() {
+        if i != leader { node.wait(Some(DEADLINE)).applied_index_at_least(Some(prepared.log_id.index), "preparation replicated").await.unwrap(); }
+    }
+    nodes[leader].shutdown().await.unwrap();
+    transports[leader].abort();
+    let next = tokio::time::timeout(DEADLINE, async {
         loop {
-            match stores[leader].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap() {
-                Some(window @ crate::raft_storage::EpochWindow::Mixed { .. }) => break window,
-                Some(other) => assert!(tokio::time::Instant::now() < deadline, "deadline: {other:?}"),
-                None => assert!(tokio::time::Instant::now() < deadline, "deadline: no window"),
+            for (i, node) in nodes.iter().enumerate() {
+                if i != leader && node.metrics().borrow().current_leader == Some(i as u64 + 1) { return i; }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
         }
-    };
-    assert_eq!(opened, crate::raft_storage::EpochWindow::Mixed { epoch: 4, minimum_peer: 3 });
-    // Feature gating engages without any operator involvement.
-    let rejected = services[leader].submit(Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation {
-        request_id: "auto-window-gate".into(), applied_at: chrono::Utc::now().naive_utc(),
-        action: crate::admin::Action::SetMeshFec { id: 1, fec: true },
-    }))).await;
-    assert!(matches!(rejected, Outcome::Admin(Err(ref e)) if e.contains("rolling-upgrade window")), "{rejected:?}");
-    // The last binary is replaced; the window closes automatically and the
-    // same action now commits.
-    services[(leader + 1) % 3].epoch_report.store(4, std::sync::atomic::Ordering::SeqCst);
-    let closed = {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    }).await.unwrap();
+    let outcome = tokio::time::timeout(DEADLINE, async {
         loop {
-            match stores[leader].run(|conn| crate::raft_storage::get::<crate::raft_storage::EpochWindow>(conn, "epoch_window")).await.unwrap() {
-                Some(window @ crate::raft_storage::EpochWindow::Stable { .. }) => break window,
-                Some(other) => assert!(tokio::time::Instant::now() < deadline, "deadline: {other:?}"),
-                None => assert!(tokio::time::Instant::now() < deadline, "deadline: no window"),
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let outcome = services[next].submit(Operation::RevokeReplica(42)).await;
+            if !matches!(outcome, Outcome::Unavailable) { break outcome; }
+            tokio::task::yield_now().await;
         }
+    }).await.unwrap();
+    assert!(matches!(outcome, Outcome::Revocation(Err(ref error)) if error.contains("membership frozen")), "{outcome:?}");
+    let stale = openraft::LogId::new(openraft::CommittedLeaderId::new(0, 0), 0);
+    assert!(services[next].cancel_reader_fence(stale).await.is_err());
+    assert_eq!(services[next].prepare_reader_fence(2).await.unwrap(), prepared);
+    services[next].cancel_reader_fence(prepared.log_id).await.unwrap();
+    for (i, node) in nodes.iter().enumerate() { if i != leader { node.shutdown().await.unwrap(); } }
+    for task in &transports { task.abort(); }
+    drop(stores); drop(services); drop(nodes); drop(transports);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn preparation_serializes_with_membership_admission() {
+    let (root, nodes, stores, transports, services) = rolling_window_cluster(false).await;
+    let leader = nodes.iter().find_map(|node| node.metrics().borrow().current_leader).unwrap() as usize - 1;
+    let guard = services[leader].allocation.clone().lock_owned().await;
+    assert!(services[leader].prepare_reader_fence(2).await.is_err());
+    assert!(matches!(services[leader].submit(Operation::RevokeReplica(42)).await, Outcome::Unavailable));
+    drop(guard);
+    let prepared = services[leader].prepare_reader_fence(2).await.unwrap();
+    let outcome = services[leader].submit(Operation::RevokeReplica(42)).await;
+    assert!(matches!(outcome, Outcome::Revocation(Err(ref error)) if error.contains("membership frozen")), "{outcome:?}");
+    services[leader].cancel_reader_fence(prepared.log_id).await.unwrap();
+    for node in &nodes { node.shutdown().await.unwrap(); }
+    for task in &transports { task.abort(); }
+    drop(stores); drop(services); drop(nodes); drop(transports);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn signed_lifecycle_rejected_at_leader_and_transport() {
+    let (root, nodes, stores, transports, services) = rolling_window_cluster(false).await;
+    let leader = nodes.iter().find_map(|node| node.metrics().borrow().current_leader).unwrap() as usize - 1;
+    let follower = (leader + 1) % 3;
+    nodes[follower].wait(Some(DEADLINE)).current_leader(leader as u64 + 1, "leader known").await.unwrap();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (keys, token) = crate::admin::test_attestation_credentials(&signer.public());
+    let mut local = services[leader].clone();
+    local.admin_keys = Some(keys);
+    let network = local.network.as_ref().unwrap().clone();
+    local.network = Some(network.consensus());
+    network.attach_service(local);
+    let now = chrono::Utc::now().timestamp() as u64;
+    let sign = |request: &str, action| {
+        let body = crate::admin::SignedLifecycle { cluster_id: "rolling-window".into(), subject: "administrator:1".into(), request_id: format!("admin:1:{request}"), action, issued_at: now, expires_at: now + 60 };
+        let signature = signer.sign(&serde_json::to_vec(&("cat4igp/admin/fence-lifecycle/v1", &body)).unwrap()).unwrap();
+        crate::admin::SignedLifecycleEnvelope { body, signature }
     };
-    assert_eq!(closed, crate::raft_storage::EpochWindow::Stable { epoch: 4 });
-    assert!(matches!(services[leader].submit(Operation::WindowStatus).await, Outcome::WindowOpen(false)));
-    scheduler.abort();
+    let prepared = sign("prepare", crate::raft_storage::FenceLifecycle::Prepare { target: 2 });
+    let mut unknown = serde_json::to_value(&prepared).unwrap();
+    unknown["body"]["action"]["Prepare"]["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<crate::admin::SignedLifecycleEnvelope>(unknown).is_err());
+    let operation = Operation::Admin(crate::admin::Operation::SignedFenceLifecycle(prepared.clone(), token.clone()));
+    assert!(!format!("{operation:?}").contains(&token));
+    assert!(crate::admin::verify_lifecycle(&prepared.body, &prepared.signature, &signer.public(), "rolling-window", now));
+    assert!(matches!(services[leader].submit(operation.clone()).await, Outcome::Unavailable));
+    assert!(matches!(services[follower].network.as_ref().unwrap().forward(leader as u64 + 1, operation).await, Outcome::Unavailable));
+    let signature = serde_json::to_string(&prepared.signature).unwrap();
+    let secret = token.clone();
+    stores[leader].run(move |conn| {
+        #[derive(diesel::QueryableByName)]
+        struct Value { #[diesel(sql_type = diesel::sql_types::Text)] value: String }
+        for row in diesel::sql_query("SELECT value FROM raft_logs UNION ALL SELECT result AS value FROM administrator_results").load::<Value>(conn)? {
+            assert!(!row.value.contains(&signature) && !row.value.contains(&secret));
+        }
+        Ok(())
+    }).await.unwrap();
+    assert!(stores[leader].run(|conn| crate::raft_storage::get::<crate::raft_storage::FencePrepare>(conn, "fence_prepare")).await.unwrap().is_none());
     for node in &nodes { node.shutdown().await.unwrap(); }
     for task in &transports { task.abort(); }
     drop(stores); drop(services); drop(nodes); drop(transports);

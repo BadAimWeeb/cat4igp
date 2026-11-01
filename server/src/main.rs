@@ -460,7 +460,12 @@ fn database_worker(
                 let result = match operation {
                     admin::Operation::Replicas
                     | admin::Operation::Replica(_)
+                    | admin::Operation::SignedFenceAttestation(..)
+                    | admin::Operation::SignedFenceLifecycle(..)
                     | admin::Operation::CodeRead => {
+                        Err("cluster administration not available".into())
+                    }
+                    admin::Operation::Mutate(admin::Mutation { action: admin::Action::AttestUpgradeFence { .. }, .. }) => {
                         Err("cluster administration not available".into())
                     }
                     admin::Operation::Mutate(command) => admin::apply(&mut conn, &command)

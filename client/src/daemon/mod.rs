@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,6 +25,8 @@ use protocol::{DaemonRequest, DaemonResponse, SharedSecret};
 /// Daemon state and management
 pub struct Daemon {
     config: Arc<ClientConfig>,
+    config_path: Option<PathBuf>,
+    hostnames: Arc<Mutex<(Option<String>, Option<String>)>>,
     server_config: Arc<Mutex<Option<ServerConfig>>>,
     secret: SharedSecret,
     memory: Arc<daemon_memory::DaemonMemory>,
@@ -73,6 +75,13 @@ struct IpcMessage {
 impl Daemon {
     /// Create a new daemon instance
     pub async fn new(config: ClientConfig) -> io::Result<Self> {
+        Self::new_with_config_path(config, None).await
+    }
+
+    pub async fn new_with_config_path(
+        config: ClientConfig,
+        config_path: Option<PathBuf>,
+    ) -> io::Result<Self> {
         // Load or create shared secret
         let secret = match SharedSecret::load(&config.data_dir) {
             Ok(s) => s,
@@ -99,7 +108,12 @@ impl Daemon {
         let cfg_clone = config.clone();
 
         Ok(Daemon {
+            hostnames: Arc::new(Mutex::new((
+                config.public_hostname_ipv4.clone(),
+                config.public_hostname_ipv6.clone(),
+            ))),
             config: Arc::new(config),
+            config_path,
             server_config: Arc::new(Mutex::new(server_config)),
             secret,
             memory: Arc::new(daemon_memory::DaemonMemory::new(cfg_clone)),
@@ -364,7 +378,11 @@ impl Daemon {
     }
 
     async fn handle_get_config(&self) -> DaemonResponse {
-        match serde_json::to_value(&*self.config) {
+        let hostnames = self.hostnames.lock().await;
+        let mut config = (*self.config).clone();
+        config.public_hostname_ipv4 = hostnames.0.clone();
+        config.public_hostname_ipv6 = hostnames.1.clone();
+        match serde_json::to_value(&config) {
             Ok(value) => DaemonResponse::Config(value),
             Err(e) => DaemonResponse::Error(format!("Failed to serialize config: {}", e)),
         }
@@ -375,12 +393,156 @@ impl Daemon {
         public_hostname_ipv4: Option<String>,
         public_hostname_ipv6: Option<String>,
     ) -> DaemonResponse {
-        // In a real implementation, we would modify the config file
-        // For now, just return success
-        if public_hostname_ipv4.is_some() || public_hostname_ipv6.is_some() {
-            DaemonResponse::Ok(Some("TODO: implement".to_string()))
-        } else {
-            DaemonResponse::Error("No configuration parameters provided".to_string())
+        if public_hostname_ipv4.is_none() && public_hostname_ipv6.is_none() {
+            return DaemonResponse::Error("No configuration parameters provided".into());
+        }
+        for (hostname, ipv6) in [
+            (&public_hostname_ipv4, false),
+            (&public_hostname_ipv6, true),
+        ] {
+            if let Some(hostname) = hostname {
+                if !valid_hostname(hostname, ipv6) {
+                    return DaemonResponse::Error("Invalid public hostname".into());
+                }
+            }
+        }
+        let Some(path) = &self.config_path else {
+            return DaemonResponse::Error("No configuration file available to update".into());
+        };
+        let mut hostnames = self.hostnames.lock().await;
+        let result = (|| -> io::Result<()> {
+            use std::io::Read;
+            use std::io::Write;
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::OpenOptionsExt;
+            #[cfg(not(target_os = "linux"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "safe configuration replacement is only supported on Linux",
+            ));
+            let mut original = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)?;
+            let metadata = original.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "configuration path is not a regular file",
+                ));
+            }
+            // ponytail: check other platforms' ACLs before enabling configuration replacement there.
+            #[cfg(target_os = "linux")]
+            {
+                let count =
+                    unsafe { libc::flistxattr(original.as_raw_fd(), std::ptr::null_mut(), 0) };
+                if count > 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "configuration has ACLs or extended attributes; edit it manually",
+                    ));
+                }
+                if count < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ENOTSUP) {
+                        return Err(error);
+                    }
+                }
+            }
+            let mut content = String::new();
+            original.read_to_string(&mut content)?;
+            // Validate the complete file before changing any source spans.
+            let disk_config: ClientConfig = toml::from_str(&content)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if disk_config.public_hostname_ipv4 != hostnames.0
+                || disk_config.public_hostname_ipv6 != hostnames.1
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "configuration hostnames changed on disk; restart the daemon",
+                ));
+            }
+            #[derive(serde::Deserialize)]
+            struct HostnameSpans {
+                public_hostname_ipv4: Option<toml::Spanned<String>>,
+                public_hostname_ipv6: Option<toml::Spanned<String>>,
+            }
+            let spans: HostnameSpans = toml::from_str(&content)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let mut edits = Vec::new();
+            let mut prefix = String::new();
+            for (key, value, span) in [
+                (
+                    "public_hostname_ipv4",
+                    &public_hostname_ipv4,
+                    spans.public_hostname_ipv4,
+                ),
+                (
+                    "public_hostname_ipv6",
+                    &public_hostname_ipv6,
+                    spans.public_hostname_ipv6,
+                ),
+            ] {
+                if let Some(value) = value {
+                    let encoded = toml::Value::String(value.clone()).to_string();
+                    if let Some(span) = span {
+                        edits.push((span.span(), encoded));
+                    } else {
+                        prefix.push_str(&format!("{key} = {encoded}\n"));
+                    }
+                }
+            }
+            edits.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
+            for (span, value) in edits {
+                content.replace_range(span, &value);
+            }
+            content.insert_str(0, &prefix);
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let directory = std::fs::File::open(parent)?;
+            let temporary = parent.join(format!(
+                ".cat4igp-config-{:032x}.tmp",
+                rand::random::<u128>()
+            ));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            let written = (|| {
+                if unsafe { libc::fchown(file.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                file.set_permissions(metadata.permissions())?;
+                file.write_all(content.as_bytes())?;
+                file.sync_all()?;
+                // ponytail: operator edits must not race replacement; add shared file locking if needed.
+                std::fs::rename(&temporary, path)?;
+                Ok(())
+            })();
+            if written.is_err() {
+                let _ = std::fs::remove_file(&temporary);
+            }
+            written?;
+            if let Some(value) = public_hostname_ipv4 {
+                hostnames.0 = (!value.is_empty()).then_some(value);
+            }
+            if let Some(value) = public_hostname_ipv6 {
+                hostnames.1 = (!value.is_empty()).then_some(value);
+            }
+            directory.sync_all().map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("update published but directory sync failed: {error}"),
+                )
+            })
+        })();
+        match result {
+            Ok(()) => DaemonResponse::Ok(Some("Configuration updated".into())),
+            Err(error) => DaemonResponse::Error(format!("Failed to update configuration: {error}")),
         }
     }
 
@@ -509,6 +671,8 @@ impl Daemon {
         // For now, create a simplified approach
         Arc::new(Daemon {
             config: self.config.clone(),
+            config_path: self.config_path.clone(),
+            hostnames: Arc::clone(&self.hostnames),
             server_config: Arc::clone(&self.server_config),
             secret: SharedSecret {
                 secret: self.secret.secret.clone(),
@@ -868,13 +1032,17 @@ impl Daemon {
         tunnel: &cat4igp_shared::control::WireguardTunnelInfo,
     ) -> Result<SocketAddr, String> {
         let port = self.memory.reserve_tunnel_port(tunnel.tunnel_id).await?;
+        let hostnames = self.hostnames.lock().await;
         let hostname = if tunnel.endpoint_ipv6 {
-            self.config.public_hostname_ipv6.as_deref()
+            &hostnames.1
         } else {
-            self.config.public_hostname_ipv4.as_deref()
-        };
+            &hostnames.0
+        }
+        .clone();
+        drop(hostnames);
         if let Some(hostname) = hostname {
-            let address = format!("{hostname}:{port}")
+            // ponytail: refreshed on the next control poll; trigger reconciliation here for lower latency.
+            let address = (hostname.as_str(), port)
                 .to_socket_addrs()
                 .map_err(|error| format!("failed to resolve {hostname}: {error}"))?
                 .find(|address| address.is_ipv6() == tunnel.endpoint_ipv6)
@@ -890,6 +1058,26 @@ impl Daemon {
             .mapped_addr_from_port(port, tunnel.endpoint_ipv6)
             .await
     }
+}
+
+fn valid_hostname(value: &str, ipv6: bool) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if let Ok(address) = value.parse::<std::net::IpAddr>() {
+        return address.is_ipv6() == ipv6 && !address.is_unspecified() && !address.is_multicast();
+    }
+    let name = value.strip_suffix('.').unwrap_or(value);
+    name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 /// Handle a client connection

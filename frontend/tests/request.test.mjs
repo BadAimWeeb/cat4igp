@@ -224,7 +224,7 @@ try {
     desiredState({ action: "rotate_enrollment_code", expected_generation: -1 }),
   );
   const bundleResponse = {
-    application_version: 4,
+    application_version: 6,
     cluster_id: "demo-cluster",
     signing_key: "e".repeat(64),
     bootstrap: "/ip4/203.0.113.9/tcp/9000/p2p/demo-peer-1",

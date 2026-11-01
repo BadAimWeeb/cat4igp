@@ -2,6 +2,206 @@ use super::*;
 use tempfile::TempDir;
 
 #[tokio::test]
+async fn ipc_modify_config_updates_and_persists_hostnames() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    async fn request(daemon: Arc<Daemon>, request: DaemonRequest, secret: &str) -> DaemonResponse {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let handler = tokio::spawn(handle_client(server, daemon));
+        let message = serde_json::to_vec(&IpcMessage {
+            secret: secret.into(),
+            request,
+        })
+        .unwrap();
+        client.write_u32(message.len() as u32).await.unwrap();
+        client.write_all(&message).await.unwrap();
+        let length = client.read_u32().await.unwrap();
+        let mut response = vec![0; length as usize];
+        client.read_exact(&mut response).await.unwrap();
+        handler.await.unwrap().unwrap();
+        serde_json::from_slice(&response).unwrap()
+    }
+    fn modify(v4: Option<&str>, v6: Option<&str>) -> DaemonRequest {
+        DaemonRequest::ModifyConfig {
+            public_hostname_ipv4: v4.map(str::to_owned),
+            public_hostname_ipv6: v6.map(str::to_owned),
+        }
+    }
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("client.toml");
+    let config = ClientConfig {
+        data_dir: directory.path().to_owned(),
+        daemon_socket: directory.path().join("daemon.sock"),
+        public_hostname_ipv4: Some("old.example".into()),
+        ..Default::default()
+    };
+    config.save_to_file(&path).unwrap();
+    let original = format!(
+        "# keep this comment\n{}\n# keep this too\n",
+        std::fs::read_to_string(&path).unwrap()
+    );
+    std::fs::write(&path, &original).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let daemon = Arc::new(
+        Daemon::new_with_config_path(config, Some(path.clone()))
+            .await
+            .unwrap(),
+    );
+    let secret = daemon.get_secret().to_owned();
+    assert!(matches!(
+        request(daemon.clone(), modify(Some("new.example"), None), "wrong").await,
+        DaemonResponse::Error(_)
+    ));
+    for bad in [
+        modify(None, None),
+        modify(Some("not a host"), None),
+        modify(Some("127.0.0.1"), Some("0.0.0.0")),
+        modify(None, Some("[::1]")),
+        modify(None, Some("ff02::1")),
+    ] {
+        assert!(matches!(
+            request(daemon.clone(), bad, &secret).await,
+            DaemonResponse::Error(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+    assert!(matches!(
+        request(
+            daemon.clone(),
+            modify(Some("127.0.0.1"), Some("::1")),
+            &secret
+        )
+        .await,
+        DaemonResponse::Ok(_)
+    ));
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("# keep this comment") && saved.contains("# keep this too"));
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    let saved_config = ClientConfig::from_file(&path).unwrap();
+    assert_eq!(
+        saved_config.public_hostname_ipv4.as_deref(),
+        Some("127.0.0.1")
+    );
+    assert_eq!(saved_config.public_hostname_ipv6.as_deref(), Some("::1"));
+    assert!(
+        matches!(request(daemon.clone(), DaemonRequest::GetConfig, &secret).await, DaemonResponse::Config(value) if value["public_hostname_ipv6"] == "::1")
+    );
+    let mut tunnel = cat4igp_shared::control::WireguardTunnelInfo {
+        tunnel_id: 1,
+        peer_node_id: 2,
+        public_key: String::new(),
+        preferred_port: 0,
+        remote_endpoint: None,
+        local_answered: WireguardAnswered::Unanswered,
+        remote_response: WireguardAnswered::Unanswered,
+        mtu: 1420,
+        endpoint_ipv6: false,
+        fec: false,
+        faketcp: false,
+        created_at: 0,
+        updated_at: 0,
+    };
+    assert_eq!(
+        daemon
+            .local_endpoint(&tunnel)
+            .await
+            .unwrap()
+            .ip()
+            .to_string(),
+        "127.0.0.1"
+    );
+    tunnel.endpoint_ipv6 = true;
+    assert_eq!(
+        daemon
+            .local_endpoint(&tunnel)
+            .await
+            .unwrap()
+            .ip()
+            .to_string(),
+        "::1"
+    );
+    assert!(matches!(
+        request(daemon.clone(), modify(Some("next.example"), None), &secret).await,
+        DaemonResponse::Ok(_)
+    ));
+    assert_eq!(
+        ClientConfig::from_file(&path)
+            .unwrap()
+            .public_hostname_ipv6
+            .as_deref(),
+        Some("::1")
+    );
+    assert!(matches!(
+        request(daemon.clone(), modify(None, Some("")), &secret).await,
+        DaemonResponse::Ok(_)
+    ));
+    assert_eq!(
+        ClientConfig::from_file(&path).unwrap().public_hostname_ipv6,
+        None
+    );
+    assert!(matches!(
+        request(daemon.clone(), DaemonRequest::GetConfig, &secret).await,
+        DaemonResponse::Config(value) if value["public_hostname_ipv6"].is_null()
+    ));
+    assert!(matches!(
+        request(daemon.clone(), modify(None, Some("::1")), &secret).await,
+        DaemonResponse::Ok(_)
+    ));
+    let restarted =
+        Daemon::new_with_config_path(ClientConfig::from_file(&path).unwrap(), Some(path.clone()))
+            .await
+            .unwrap();
+    assert!(
+        matches!(restarted.handle_request(DaemonRequest::GetConfig, restarted.get_secret()).await, DaemonResponse::Config(value) if value["public_hostname_ipv4"] == "next.example")
+    );
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = c"user.cat4igp-test";
+        let result =
+            unsafe { libc::setxattr(path_c.as_ptr(), name.as_ptr(), b"x".as_ptr().cast(), 1, 0) };
+        if result == 0 {
+            let before = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                request(daemon.clone(), modify(None, Some("v6.example")), &secret).await,
+                DaemonResponse::Error(error) if error.contains("extended attributes")
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                unsafe { libc::removexattr(path_c.as_ptr(), name.as_ptr()) },
+                0
+            );
+        } else {
+            let error = io::Error::last_os_error();
+            assert_eq!(error.raw_os_error(), Some(libc::ENOTSUP));
+        }
+    }
+    let edited = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("next.example", "external.example");
+    std::fs::write(&path, &edited).unwrap();
+    assert!(matches!(
+        request(daemon.clone(), modify(None, Some("v6.example")), &secret).await,
+        DaemonResponse::Error(error) if error.contains("changed on disk")
+    ));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+    std::fs::remove_file(&path).unwrap();
+    symlink(directory.path().join("missing"), &path).unwrap();
+    assert!(matches!(
+        request(daemon.clone(), modify(Some("fail.example"), None), &secret).await,
+        DaemonResponse::Error(_)
+    ));
+    assert!(
+        matches!(request(daemon, DaemonRequest::GetConfig, &secret).await, DaemonResponse::Config(value) if value["public_hostname_ipv4"] == "next.example")
+    );
+    assert!(!directory.path().join("missing").exists());
+}
+
+#[tokio::test]
 async fn run_stop_cancel_restart_preserves_socket_and_config() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let directory = TempDir::new().unwrap();

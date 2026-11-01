@@ -385,7 +385,7 @@ export function createMockApi() {
           !/[\s\p{Cc}]/u.test(b.bootstrap),
       );
       return {
-        application_version: 4,
+        application_version: 6,
         cluster_id: "demo-cluster",
         signing_key: signingKey,
         bootstrap: b.bootstrap,

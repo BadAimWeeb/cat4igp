@@ -96,6 +96,7 @@ pub struct Binding {
 #[derive(Debug, Serialize, Deserialize)]
 enum Rpc {
     Operator(crate::cluster::Operation),
+    PrepareAck(crate::raft_storage::FencePrepare),
     Vote(VoteRequest<u64>),
     Append(AppendEntriesRequest<TypeConfig>),
     Snapshot(InstallSnapshotRequest<TypeConfig>),
@@ -112,6 +113,7 @@ struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 enum Response {
     Operator(crate::cluster::Outcome),
+    PrepareAck(bool),
     Vote(Result<VoteResponse<u64>, RaftError<u64>>),
     Append(Result<AppendEntriesResponse<u64>, RaftError<u64>>),
     Snapshot(Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>>),
@@ -331,6 +333,11 @@ impl Network {
         }
     }
 
+    pub(crate) async fn acknowledge_prepare(&self, target: u64, prepare: crate::raft_storage::FencePrepare) -> bool {
+        matches!(self.call::<RaftError<u64>>(target, Rpc::PrepareAck(prepare), RPCOption::new(DEADLINE)).await,
+            Ok(Response::PrepareAck(true)))
+    }
+
     async fn call<E: std::error::Error>(
         &self,
         target: u64,
@@ -349,6 +356,7 @@ impl Network {
         };
         let action = match &request.rpc {
             Rpc::Operator(_) => RPCTypes::AppendEntries,
+            Rpc::PrepareAck(_) => RPCTypes::AppendEntries,
             Rpc::Vote(_) => RPCTypes::Vote,
             Rpc::Append(_) => RPCTypes::AppendEntries,
             Rpc::Snapshot(_) => RPCTypes::InstallSnapshot,
@@ -564,21 +572,27 @@ impl RaftNetwork<TypeConfig> for Client {
 fn authorized(network: &Network, peer: PeerId, request: &Request) -> bool {
     let leader = match &request.rpc {
         Rpc::Operator(_) => request.source,
+        Rpc::PrepareAck(_) => request.source,
         Rpc::Vote(r) => r.vote.leader_id.node_id,
         Rpc::Append(r) => r.vote.leader_id.node_id,
         Rpc::Snapshot(r) => r.vote.leader_id.node_id,
     };
-    // Rolling window: accept the local epoch or one below. Directional sync only,
-    // any wire_incompatible peer is rejected exactly as before.
-    cat4igp_shared::compat::wire_compatible(request.application_version)
+    // ponytail: exact epochs only; enable mixed epochs after real cross-version tests.
+    request.application_version == cat4igp_shared::compat::APPLICATION_VERSION
         && request.cluster == network.cluster
-        // Snapshot install is persisted state; it stays epoch-exact. A lagging peer
-        // cannot consume an epoch-4 Image (unknown tables), so it must not be the
-        // snapshot target while the window is open.
-        && (cat4igp_shared::compat::APPLICATION_VERSION == request.application_version
-            || !matches!(request.rpc, Rpc::Snapshot(_)))
+        // ponytail: unsigned attestations are forbidden; forward only leader-verified signatures.
+        && !matches!(request.rpc, Rpc::Operator(crate::cluster::Operation::Admin(
+            crate::admin::Operation::Mutate(crate::admin::Mutation {
+                action: crate::admin::Action::AttestUpgradeFence { .. }, ..
+            })
+        )))
+        && !matches!(request.rpc, Rpc::Operator(crate::cluster::Operation::Admin(crate::admin::Operation::SignedFenceLifecycle(..))))
         && (!matches!(request.rpc, Rpc::Operator(_))
             || network.bootstrap.get(&request.source).map(|b| b.peer) == Some(peer)
+            // Capability observations are read-only and available to bound replicas,
+            // including learners that do not yet appear in the serving roster.
+            || matches!(request.rpc, Rpc::Operator(crate::cluster::Operation::ProbeCapabilities))
+            || matches!(request.rpc, Rpc::Operator(crate::cluster::Operation::Admin(crate::admin::Operation::SignedFenceAttestation(..))))
             || (matches!(
                 request.rpc,
                 Rpc::Operator(
@@ -865,6 +879,10 @@ async fn run(
                                     Rpc::Operator(operation) => Response::Operator(match service {
                                         Some(service) => service.local(operation).await,
                                         None => crate::cluster::Outcome::Unavailable,
+                                    }),
+                                    Rpc::PrepareAck(prepare) => Response::PrepareAck(match service {
+                                        Some(service) => service.acknowledge_prepare(request.source, prepare).await,
+                                        None => false,
                                     }),
                                     Rpc::Vote(r) => Response::Vote(raft.vote(r).await),
                                     Rpc::Append(r) => Response::Append(raft.append_entries(r).await),

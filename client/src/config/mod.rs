@@ -22,9 +22,11 @@ pub struct ClientConfig {
     pub tunnel_protocols: TunnelProtocols,
 
     /// Optional public IPv4 hostname for responding to connection requests
+    #[serde(default, deserialize_with = "optional_hostname")]
     pub public_hostname_ipv4: Option<String>,
 
     /// Optional public IPv6 hostname for responding to connection requests
+    #[serde(default, deserialize_with = "optional_hostname")]
     pub public_hostname_ipv6: Option<String>,
 
     /// Additional controller multiaddresses used if the enrollment address is unavailable.
@@ -91,6 +93,12 @@ impl Default for ClientConfig {
 
 fn default_control_network_id() -> String {
     "default".to_string()
+}
+
+fn optional_hostname<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|value| !value.is_empty()))
 }
 
 impl ClientConfig {

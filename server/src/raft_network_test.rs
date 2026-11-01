@@ -320,12 +320,18 @@ async fn dynamic_authorization_reopen_collision_and_revocation() {
         keys[1].public().to_peer_id(),
         &privileged
     ));
+    let capability_probe = Request {
+        rpc: Rpc::Operator(crate::cluster::Operation::ProbeCapabilities),
+        ..privileged
+    };
+    assert!(authorized(&network, keys[1].public().to_peer_id(), &capability_probe));
+    assert!(!authorized(&network, keys[2].public().to_peer_id(), &capability_probe));
     let promotion = Request {
         application_version: cat4igp_shared::discovery::join::APPLICATION_VERSION,
         rpc: Rpc::Operator(crate::cluster::Operation::PromoteLearner(2)),
-        cluster: privileged.cluster.clone(),
-        source: privileged.source,
-        target: privileged.target,
+        cluster: capability_probe.cluster.clone(),
+        source: capability_probe.source,
+        target: capability_probe.target,
     };
     assert!(!authorized(
         &network,
@@ -364,7 +370,7 @@ async fn dynamic_authorization_reopen_collision_and_revocation() {
         keys[1].public().to_peer_id(),
         &Request {
             rpc: vote(2),
-            ..privileged
+            ..capability_probe
         }
     ));
     network.reconcile_store(&reopened).await.unwrap();
@@ -653,8 +659,10 @@ async fn binding_cluster_bounds_deadline_overload_and_persistent_identity() {
         rpc: vote(1),
     };
     assert!(authorized(&network, a.public().to_peer_id(), &request));
-    request.application_version = cat4igp_shared::discovery::join::APPLICATION_VERSION + 1;
-    assert!(!authorized(&network, a.public().to_peer_id(), &request));
+    for epoch in [cat4igp_shared::discovery::join::APPLICATION_VERSION - 1, cat4igp_shared::discovery::join::APPLICATION_VERSION + 1] {
+        request.application_version = epoch;
+        assert!(!authorized(&network, a.public().to_peer_id(), &request));
+    }
     request.application_version = cat4igp_shared::discovery::join::APPLICATION_VERSION;
     let mut missing = serde_json::to_value(&request).unwrap();
     missing
@@ -665,7 +673,24 @@ async fn binding_cluster_bounds_deadline_overload_and_persistent_identity() {
     assert!(!authorized(&network, b.public().to_peer_id(), &request));
     request.rpc = Rpc::Operator(crate::cluster::Operation::Ready);
     assert!(authorized(&network, a.public().to_peer_id(), &request));
+    request.application_version -= 1;
+    assert!(!authorized(&network, a.public().to_peer_id(), &request));
+    request.application_version += 1;
     assert!(!authorized(&network, b.public().to_peer_id(), &request));
+    request.rpc = Rpc::Operator(crate::cluster::Operation::ProbeCapabilities);
+    assert!(authorized(&network, a.public().to_peer_id(), &request));
+    assert!(!authorized(&network, b.public().to_peer_id(), &request));
+    request.application_version -= 1;
+    assert!(!authorized(&network, a.public().to_peer_id(), &request));
+    request.application_version += 1;
+    request.rpc = Rpc::Operator(crate::cluster::Operation::Admin(crate::admin::Operation::Mutate(crate::admin::Mutation {
+        request_id: "forged".into(), applied_at: chrono::Utc::now().naive_utc(),
+        action: crate::admin::Action::AttestUpgradeFence {
+            prepare: crate::raft_storage::FencePrepare { target: 2, log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 1), membership: Default::default() },
+            externally_fenced: true,
+        },
+    })));
+    assert!(!authorized(&network, a.public().to_peer_id(), &request));
     request.rpc = vote(1);
     request.cluster = "b".into();
     assert!(!authorized(&network, a.public().to_peer_id(), &request));

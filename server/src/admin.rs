@@ -35,6 +35,8 @@ pub(crate) enum Operation {
     CodeRead,
     Replica(ReplicaAction),
     Mutate(Mutation),
+    SignedFenceAttestation(SignedFenceEnvelope, String),
+    SignedFenceLifecycle(SignedLifecycleEnvelope, String),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -72,6 +74,74 @@ pub(crate) struct Mutation {
     pub applied_at: chrono::NaiveDateTime,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SignedFenceAttestation {
+    pub(crate) cluster_id: String,
+    pub(crate) subject: String,
+    pub(crate) request_id: String,
+    pub(crate) prepare: crate::raft_storage::FencePrepare,
+    pub(crate) externally_fenced: bool,
+    pub(crate) issued_at: u64,
+    pub(crate) expires_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SignedFenceEnvelope {
+    pub(crate) body: SignedFenceAttestation,
+    pub(crate) signature: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SignedLifecycle {
+    pub(crate) cluster_id: String,
+    pub(crate) subject: String,
+    pub(crate) request_id: String,
+    pub(crate) action: crate::raft_storage::FenceLifecycle,
+    pub(crate) issued_at: u64,
+    pub(crate) expires_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SignedLifecycleEnvelope {
+    pub(crate) body: SignedLifecycle,
+    pub(crate) signature: Vec<u8>,
+}
+
+pub(crate) fn verify_lifecycle(body: &SignedLifecycle, signature: &[u8], key: &libp2p::identity::PublicKey, cluster: &str, now: u64) -> bool {
+    key.clone().try_into_ed25519().is_ok() && signature.len() == 64
+        && !cluster.is_empty() && cluster.len() <= 128 && body.cluster_id == cluster
+        && body.subject == "administrator:1" && body.request_id.starts_with("admin:1:")
+        && body.request_id.len() > 8 && body.request_id.len() <= 108 && body.request_id.is_ascii()
+        && body.issued_at <= now && body.expires_at > now
+        && body.expires_at.checked_sub(body.issued_at).is_some_and(|duration| duration <= 300)
+        && serde_json::to_vec(&("cat4igp/admin/fence-lifecycle/v1", body)).is_ok_and(|bytes| bytes.len() <= 64 * 1024 && key.verify(&bytes, signature))
+}
+
+pub(crate) fn verify_fence_attestation(
+    body: &SignedFenceAttestation,
+    signature: &[u8],
+    key: &libp2p::identity::PublicKey,
+    cluster_id: &str,
+    now: u64,
+) -> bool {
+    if key.clone().try_into_ed25519().is_err() || signature.len() != 64
+        || cluster_id.is_empty() || cluster_id.len() > 128 || body.cluster_id != cluster_id
+        || body.subject != "administrator:1" || !body.request_id.starts_with("admin:1:")
+        || body.request_id.len() <= "admin:1:".len() || body.request_id.len() > 108
+        || !body.request_id.is_ascii() || !body.externally_fenced
+        || body.issued_at > now || body.expires_at <= now
+        || body.expires_at.checked_sub(body.issued_at).is_none_or(|lifetime| lifetime > 300)
+    {
+        return false;
+    }
+    serde_json::to_vec(&("cat4igp/admin/fence-attestation/v1", body))
+        .is_ok_and(|bytes| bytes.len() <= 64 * 1024 && key.verify(&bytes, signature))
+}
+
 impl std::fmt::Debug for Mutation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("AdministratorMutation([redacted])")
@@ -81,6 +151,12 @@ impl std::fmt::Debug for Mutation {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Action {
+    // ponytail: records an assertion only; require all-member fencing before activation.
+    AttestUpgradeFence {
+        #[serde(deserialize_with = "deserialize_prepare")]
+        prepare: crate::raft_storage::FencePrepare,
+        externally_fenced: bool,
+    },
     Bootstrap {
         username: String,
         password_hash: String,
@@ -129,6 +205,11 @@ pub(crate) enum Action {
         tunnel_id: i32,
         kind: IntentKind,
     },
+}
+
+fn deserialize_prepare<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<crate::raft_storage::FencePrepare, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -554,7 +635,7 @@ pub(crate) fn read(
         Operation::Replica(_) | Operation::CodeRead => {
             Err("cluster administration not available".into())
         }
-        Operation::Mutate(_) => Err("not a read".into()),
+        Operation::Mutate(_) | Operation::SignedFenceAttestation(..) | Operation::SignedFenceLifecycle(..) => Err("not a read".into()),
     }
 }
 
@@ -635,6 +716,14 @@ pub(crate) fn apply(
             !name.trim().is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)
         };
         let result = match &command.action {
+            Action::AttestUpgradeFence { prepare, externally_fenced } => {
+                let current: Option<crate::raft_storage::FencePrepare> = crate::raft_storage::get(conn, "fence_prepare")?;
+                if !externally_fenced || current.as_ref() != Some(prepare) {
+                    Err("external fence attestation requires the current preparation".into())
+                } else {
+                    Ok(Some(serde_json::json!({"recorded":true,"subject":"administrator:1","prepare":prepare,"semantics":"operator assertion; not activation authorization"}).to_string()))
+                }
+            }
             Action::Bootstrap {
                 username,
                 password_hash,
@@ -753,12 +842,35 @@ pub(crate) async fn send(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Keys {
+pub(crate) struct Keys {
     origin: String,
     issuer: String,
     audience: String,
     active: String,
     keys: BTreeMap<String, String>,
+    #[serde(default)]
+    attestation_public_key: Option<String>,
+}
+
+pub(crate) fn attestation_key(keys: &Keys) -> Result<Option<libp2p::identity::PublicKey>, Error> {
+    keys.attestation_public_key.as_ref().map(|encoded| {
+        if encoded.len() > 256 { return Err("attestation key too large".into()); }
+        let key = libp2p::identity::PublicKey::try_decode_protobuf(&crate::hex_decode(encoded)?)?;
+        if key.clone().try_into_ed25519().is_err() { return Err("attestation key must be Ed25519".into()); }
+        Ok(key)
+    }).transpose()
+}
+
+pub(crate) fn load_keys() -> Result<Option<Arc<Keys>>, String> {
+    let path = match std::env::var("ADMIN_JWT_CONFIG_FILE") {
+        Ok(path) => path,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => return Err("invalid admin configuration path".into()),
+    };
+    let keys: Keys = serde_json::from_slice(&protected_file(&path).map_err(|_| "invalid admin configuration")?)
+        .map_err(|_| "invalid admin configuration")?;
+    validate_keys(&keys).map_err(|_| "invalid admin configuration".to_owned())?;
+    Ok(Some(Arc::new(keys)))
 }
 
 fn protected_file(path: &str) -> Result<Vec<u8>, Error> {
@@ -790,6 +902,21 @@ struct Claims {
     exp: u64,
 }
 
+#[cfg(test)]
+pub(crate) fn test_attestation_credentials(key: &libp2p::identity::PublicKey) -> (Arc<Keys>, String) {
+    let keys = Keys {
+        origin: "https://controller.example".into(), issuer: "test".into(), audience: "browser".into(),
+        active: "a".into(), keys: BTreeMap::from([("a".into(), "01234567890123456789012345678901".into())]),
+        attestation_public_key: Some(crate::hex_encode(&key.encode_protobuf())),
+    };
+    let now = chrono::Utc::now().timestamp() as u64;
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = Some("a".into());
+    let claims = Claims { sub: "administrator:1".into(), iss: keys.issuer.clone(), aud: keys.audience.clone(), iat: now, exp: now + LIFE };
+    let token = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(keys.keys["a"].as_bytes())).unwrap();
+    (Arc::new(keys), token)
+}
+
 #[derive(Clone)]
 struct Web {
     jobs: crate::DatabaseSender,
@@ -814,7 +941,8 @@ fn cookie(headers: &HeaderMap) -> Option<&str> {
     found
 }
 
-fn verify(keys: &Keys, token: &str, now: u64) -> bool {
+pub(crate) fn verify(keys: &Keys, token: &str, now: u64) -> bool {
+    if token.is_empty() || token.len() > 4096 { return false; }
     let Ok(header) = jsonwebtoken::decode_header(token) else {
         return false;
     };
@@ -1079,6 +1207,10 @@ async fn mutate(
     if matches!(action, Action::Bootstrap { .. }) {
         return failure(StatusCode::FORBIDDEN, "bootstrap is local only");
     }
+    if matches!(action, Action::AttestUpgradeFence { .. }) {
+        // ponytail: unsigned attestations disabled; enable after leader verifies administrator signatures.
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "signed attestation not yet available");
+    }
     let Some(key) = headers
         .get("Idempotency-Key")
         .and_then(|v| v.to_str().ok())
@@ -1108,13 +1240,33 @@ async fn mutate(
     }
 }
 
-pub(crate) async fn router(jobs: crate::DatabaseSender) -> Result<Router, Error> {
-    let path = match std::env::var("ADMIN_JWT_CONFIG_FILE") {
-        Ok(path) => path,
-        Err(std::env::VarError::NotPresent) => return Ok(Router::new()),
-        Err(error) => return Err(error.into()),
+async fn signed_fence_attestation(
+    State(web): State<Web>,
+    headers: HeaderMap,
+    Json(envelope): Json<SignedFenceEnvelope>,
+) -> Response {
+    let Some(key) = headers.get("Idempotency-Key").and_then(|value| value.to_str().ok())
+        .filter(|key| !key.is_empty() && key.len() <= 100 && key.is_ascii()) else {
+        return failure(StatusCode::BAD_REQUEST, "Idempotency-Key required (1..100 ASCII bytes)");
     };
-    let keys: Keys = serde_json::from_slice(&protected_file(&path)?)?;
+    if envelope.body.request_id != format!("admin:1:{key}") || envelope.signature.len() != 64 {
+        return failure(StatusCode::BAD_REQUEST, "invalid attestation envelope");
+    }
+    let Some(session) = cookie(&headers) else { return failure(StatusCode::UNAUTHORIZED, "unauthorized"); };
+    match send(&web.jobs, Operation::SignedFenceAttestation(envelope, session.to_owned())).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) if error.starts_with("unavailable") => failure(StatusCode::SERVICE_UNAVAILABLE, "outcome unknown; retry with same key and payload"),
+        Err(error) => failure(StatusCode::CONFLICT, &error),
+    }
+}
+
+async fn signed_fence_lifecycle() -> Response {
+    // ponytail: lifecycle disabled until safe activation and recovery are implemented.
+    failure(StatusCode::SERVICE_UNAVAILABLE, "upgrade lifecycle is disabled")
+}
+
+fn validate_keys(keys: &Keys) -> Result<(), Error> {
+    attestation_key(&keys)?;
     let uri: axum::http::Uri = keys.origin.parse()?;
     if uri.scheme_str() != Some("https")
         || uri.authority().is_none()
@@ -1132,6 +1284,11 @@ pub(crate) async fn router(jobs: crate::DatabaseSender) -> Result<Router, Error>
     {
         return Err("invalid JWT configuration".into());
     }
+    Ok(())
+}
+
+pub(crate) async fn router(jobs: crate::DatabaseSender) -> Result<Router, Error> {
+    let Some(keys) = load_keys()? else { return Ok(Router::new()); };
     if let Ok(path) = std::env::var("ADMIN_BOOTSTRAP_FILE") {
         let login: Login = serde_json::from_slice(&protected_file(&path)?)?;
         if login.username.trim().is_empty()
@@ -1171,10 +1328,10 @@ pub(crate) async fn router(jobs: crate::DatabaseSender) -> Result<Router, Error>
     Ok(web_router(jobs, keys))
 }
 
-fn web_router(jobs: crate::DatabaseSender, keys: Keys) -> Router {
+fn web_router(jobs: crate::DatabaseSender, keys: impl Into<Arc<Keys>>) -> Router {
     let web = Web {
         jobs,
-        keys: Arc::new(keys),
+        keys: keys.into(),
         hashing: Arc::new(tokio::sync::Semaphore::new(2)),
         attempts: Arc::new(std::sync::Mutex::new((0, 0))),
     };
@@ -1202,6 +1359,8 @@ fn web_router(jobs: crate::DatabaseSender, keys: Keys) -> Router {
         .route("/replicas/reconcile", post(replica_action))
         .route("/invites", post(invite))
         .route("/actions", post(mutate))
+        .route("/upgrade/attestation", post(signed_fence_attestation))
+        .route("/upgrade/lifecycle", post(signed_fence_lifecycle))
         .layer(axum::middleware::from_fn_with_state(web.clone(), guard))
         .layer(axum::extract::DefaultBodyLimit::max(4096))
         .with_state(web)
@@ -1221,6 +1380,7 @@ pub(crate) async fn test_gateway(
                 audience: "browser".into(),
                 active: "test".into(),
                 keys: BTreeMap::from([("test".into(), "a".repeat(32))]),
+                attestation_public_key: None,
             },
         ),
     );
@@ -1486,6 +1646,10 @@ mod tests {
                         read(&mut conn, Operation::Inventory).unwrap()
                     }
                     Operation::Status => read(&mut conn, Operation::Status).unwrap(),
+                    Operation::SignedFenceAttestation(_, session) | Operation::SignedFenceLifecycle(_, session) => {
+                        assert!(session.starts_with("eyJ"));
+                        serde_json::json!({"recorded": true})
+                    }
                     Operation::Replicas | Operation::Replica(_) | Operation::CodeRead => {
                         let _ = reply.send(Err("cluster administration not available".into()));
                         continue;
@@ -1567,6 +1731,25 @@ mod tests {
         assert!(!set_cookie.contains("Domain="));
         let cookie = set_cookie.split(';').next().unwrap();
         let auth = format!("Cookie: {cookie}\r\n");
+        let envelope = SignedFenceEnvelope {
+            body: SignedFenceAttestation {
+                cluster_id: "test".into(), subject: "administrator:1".into(), request_id: "admin:1:attest".into(),
+                prepare: crate::raft_storage::FencePrepare { target: 2, log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 4), membership: Default::default() },
+                externally_fenced: true, issued_at: 1, expires_at: 2,
+            }, signature: vec![0; 64],
+        };
+        let body = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(request(first, "POST", "upgrade/attestation", &format!("{json}Idempotency-Key: attest\r\n"), &body).await.0, 401);
+        assert_eq!(request(first, "POST", "upgrade/attestation", &format!("{json}{auth}Idempotency-Key: wrong\r\n"), &body).await.0, 400);
+        assert_eq!(request(first, "POST", "upgrade/attestation", &format!("{json}{auth}Idempotency-Key: attest\r\n"), &body).await.0, 200);
+        let lifecycle = SignedLifecycleEnvelope {
+            body: SignedLifecycle { cluster_id: "test".into(), subject: "administrator:1".into(), request_id: "admin:1:prepare".into(),
+                action: crate::raft_storage::FenceLifecycle::Prepare { target: 2 }, issued_at: 1, expires_at: 2 }, signature: vec![0; 64],
+        };
+        let body = serde_json::to_string(&lifecycle).unwrap();
+        assert_eq!(request(first, "POST", "upgrade/lifecycle", &format!("{json}Idempotency-Key: prepare\r\n"), &body).await.0, 401);
+        assert_eq!(request(first, "POST", "upgrade/lifecycle", &format!("{json}{auth}Idempotency-Key: wrong\r\n"), &body).await.0, 503);
+        assert_eq!(request(first, "POST", "upgrade/lifecycle", &format!("{json}{auth}Idempotency-Key: prepare\r\n"), &body).await.0, 503);
         assert_eq!(request(first, "GET", "replicas", &auth, "").await.0, 409);
         assert_eq!(
             request(
@@ -1733,6 +1916,40 @@ mod tests {
     }
 
     #[test]
+    fn signed_attestation_binds_action_and_expiry() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let mut keys = Keys { origin: "https://controller.example".into(), issuer: "test".into(),
+            audience: "browser".into(), active: "a".into(), keys: BTreeMap::new(), attestation_public_key: None };
+        assert!(attestation_key(&keys).unwrap().is_none());
+        keys.attestation_public_key = Some(crate::hex_encode(&key.public().encode_protobuf()));
+        assert_eq!(attestation_key(&keys).unwrap().unwrap(), key.public());
+        keys.attestation_public_key = Some("invalid".into());
+        assert!(attestation_key(&keys).is_err());
+        let mut body = SignedFenceAttestation {
+            cluster_id: "cluster".into(), subject: "administrator:1".into(),
+            request_id: "admin:1:request".into(),
+            prepare: crate::raft_storage::FencePrepare {
+                target: 2, log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 4),
+                membership: Default::default(),
+            },
+            externally_fenced: true, issued_at: 100, expires_at: 200,
+        };
+        let bytes = serde_json::to_vec(&("cat4igp/admin/fence-attestation/v1", &body)).unwrap();
+        let signature = key.sign(&bytes).unwrap();
+        assert!(verify_fence_attestation(&body, &signature, &key.public(), "cluster", 150));
+        assert!(!verify_fence_attestation(&body, &signature, &key.public(), "other", 150));
+        assert!(!verify_fence_attestation(&body, &signature, &key.public(), "cluster", 200));
+        body.prepare.target = 3;
+        assert!(!verify_fence_attestation(&body, &signature, &key.public(), "cluster", 150));
+        body.prepare.target = 2;
+        body.request_id.push('x');
+        assert!(!verify_fence_attestation(&body, &signature, &key.public(), "cluster", 150));
+        body.request_id.pop();
+        body.externally_fenced = false;
+        assert!(!verify_fence_attestation(&body, &signature, &key.public(), "cluster", 150));
+    }
+
+    #[test]
     fn sessions_and_atomic_replay() {
         let now = chrono::Utc::now().timestamp() as u64;
         let keys = Keys {
@@ -1741,6 +1958,7 @@ mod tests {
             audience: "browser".into(),
             active: "a".into(),
             keys: BTreeMap::from([("a".into(), "01234567890123456789012345678901".into())]),
+            attestation_public_key: None,
         };
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some("a".into());

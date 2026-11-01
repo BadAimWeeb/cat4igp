@@ -1,27 +1,17 @@
-//! Application-epoch compatibility for rolling upgrades.
-//!
-//! A binary built for epoch N accepts peers running epoch N-1 during an explicit
-//! upgrade window. Everything else (older or newer epochs) is rejected exactly as
-//! before. Compatibility is one direction only: `N understands N-1`, never the
-//! reverse. `sync_compatible(old, new)` encodes that rule for request/response
-//! checks; it is asymmetric because the peers took different roles on the wire.
-//!
-//! Snapshots and persisted state remain epoch-exact. The window is transient and
-//! closed by committing `EpochWindow` state through the replicated write path.
+//! Experimental epoch-range helpers; they do not establish rolling compatibility.
+//! Raft RPCs, snapshots, and persisted state currently require the exact epoch.
 
 /// The application protocol epoch this binary implements.
-pub const APPLICATION_VERSION: u8 = 4;
+pub const APPLICATION_VERSION: u8 = 6;
 
-/// Number of epochs a binary tolerates while rolling forward. Only one cohort
-/// step is supported, so this stays 1 and the window is [N-1, N].
+/// Experimental range used to validate window metadata, not wire admission.
 pub const BACKWARD_COMPAT: u8 = 1;
 
-/// Emit the lowest epoch this binary accepts on the wire. For epoch below 1
-/// (nothing sensible) this collapses to 1.
+/// Lowest epoch recognized by the experimental window metadata.
 pub const MIN_SUPPORTED_VERSION: u8 =
     if APPLICATION_VERSION > BACKWARD_COMPAT { APPLICATION_VERSION - BACKWARD_COMPAT } else { 1 };
 
-/// True when `observed` is an epoch this binary can talk to (its own or one lower).
+/// True when `observed` falls within the experimental range.
 pub fn wire_compatible(observed: u8) -> bool {
     (MIN_SUPPORTED_VERSION..=APPLICATION_VERSION).contains(&observed)
 }

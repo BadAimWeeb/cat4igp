@@ -29,6 +29,328 @@ impl Drop for Database {
 struct Builder;
 
 #[tokio::test]
+async fn lifecycle_receipts_prevent_delayed_prepare_retry() {
+    let db = Database::new();
+    let mut store = Store::open(db.0.clone()).await.unwrap();
+    let membership = Membership::new(vec![std::collections::BTreeSet::from([1])], None);
+    let initial = entry(0, EntryPayload::Membership(membership.clone()));
+    store.apply([initial.clone()]).await.unwrap();
+    let captured = StoredMembership::new(Some(initial.log_id), membership);
+    let prepare = Command::FenceLifecycle { request_id: "admin:1:prepare".into(), action: FenceLifecycle::Prepare { target: 2 }, membership: Some(captured.clone()) };
+    let original = store.apply([entry(1, EntryPayload::Normal(prepare.clone()))]).await.unwrap().remove(0);
+    assert!(original.is_ok());
+    let cancel = Command::FenceLifecycle { request_id: "admin:1:cancel".into(), action: FenceLifecycle::Cancel { prepare_log_id: entry(1, EntryPayload::Blank).log_id }, membership: None };
+    let cancelled = store.apply([entry(2, EntryPayload::Normal(cancel.clone()))]).await.unwrap().remove(0);
+    assert!(cancelled.is_ok());
+    let snapshot = store.build_snapshot().await.unwrap();
+    let restored_db = Database::new();
+    let mut restored = Store::open(restored_db.0.clone()).await.unwrap();
+    restored.install_snapshot(&snapshot.meta, snapshot.snapshot).await.unwrap();
+    assert_eq!(restored.apply([entry(3, EntryPayload::Normal(prepare.clone()))]).await.unwrap().remove(0), original);
+    assert!(restored.run(|conn| get::<FencePrepare>(conn, "fence_prepare")).await.unwrap().is_none());
+    assert_eq!(store.apply([entry(3, EntryPayload::Normal(prepare))]).await.unwrap().remove(0), original);
+    assert!(store.run(|conn| get::<FencePrepare>(conn, "fence_prepare")).await.unwrap().is_none());
+    assert_eq!(store.apply([entry(4, EntryPayload::Normal(cancel))]).await.unwrap().remove(0), cancelled);
+    let conflict = Command::FenceLifecycle { request_id: "admin:1:prepare".into(), action: FenceLifecycle::Prepare { target: 3 }, membership: Some(captured) };
+    assert!(store.apply([entry(5, EntryPayload::Normal(conflict))]).await.unwrap()[0].is_err());
+}
+
+#[tokio::test]
+async fn preparation_rejects_incomplete_revocation() {
+    let db = Database::new();
+    let mut store = Store::open(db.0.clone()).await.unwrap();
+    let membership = Membership::new(vec![std::collections::BTreeSet::from([1])], None);
+    let initial = entry(0, EntryPayload::Membership(membership.clone()));
+    store.apply([initial.clone()]).await.unwrap();
+    store.run(|conn| {
+        let revoked = std::collections::BTreeMap::from([(2u64, crate::cluster::Revocation {
+            peer: libp2p::identity::Keypair::generate_ed25519().public().to_peer_id(), complete: false,
+        })]);
+        crate::db::set_setting(conn, "replica_revocations", &serde_json::to_string(&revoked)?)?;
+        Ok(())
+    }).await.unwrap();
+    let command = Command::PrepareReaderFence { target: 2, membership: StoredMembership::new(Some(initial.log_id), membership) };
+    assert!(store.apply([entry(1, EntryPayload::Normal(command))]).await.unwrap()[0].is_err());
+    assert!(store.run(|conn| get::<FencePrepare>(conn, "fence_prepare")).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn attestation_is_bound_to_preparation_and_survives_snapshot() {
+    let db = Database::new();
+    let mut store = Store::open(db.0.clone()).await.unwrap();
+    let membership = Membership::new(vec![std::collections::BTreeSet::from([1])], None);
+    let initial = entry(0, EntryPayload::Membership(membership.clone()));
+    store.apply([initial.clone()]).await.unwrap();
+    let prepare = FencePrepare { target: 2, log_id: entry(1, EntryPayload::Blank).log_id,
+        membership: StoredMembership::new(Some(initial.log_id), membership) };
+    store.apply([entry(1, EntryPayload::Normal(Command::PrepareReaderFence {
+        target: prepare.target, membership: prepare.membership.clone(),
+    }))]).await.unwrap();
+    let mutation = crate::admin::Mutation { request_id: "admin:1:attestation".into(),
+        action: crate::admin::Action::AttestUpgradeFence { prepare: prepare.clone(), externally_fenced: true },
+        applied_at: chrono::Utc::now().naive_utc() };
+    let recorded = store.apply([entry(2, EntryPayload::Normal(Command::Admin(mutation.clone())))]).await.unwrap().remove(0);
+    assert!(recorded.is_ok());
+    store.apply([entry(3, EntryPayload::Normal(Command::CancelReaderFence { prepare_log_id: prepare.log_id }))]).await.unwrap();
+    let retry = store.apply([entry(4, EntryPayload::Normal(Command::Admin(mutation.clone())))]).await.unwrap().remove(0);
+    assert_eq!(retry, recorded);
+    let mut stale = mutation;
+    stale.request_id = "admin:1:stale".into();
+    assert!(store.apply([entry(5, EntryPayload::Normal(Command::Admin(stale)))]).await.unwrap()[0].is_err());
+    let snapshot = store.build_snapshot().await.unwrap();
+    let target = Database::new();
+    let mut restored = Store::open(target.0.clone()).await.unwrap();
+    restored.install_snapshot(&snapshot.meta, snapshot.snapshot).await.unwrap();
+    assert_eq!(restored.run(|conn| Ok(crate::schema::administrator_results::table.count().get_result::<i64>(conn)?)).await.unwrap(), 2);
+    assert_eq!(restored.run(|conn| get::<u8>(conn, "reader_fence")).await.unwrap(), Some(INITIAL_READER_FENCE));
+}
+
+#[tokio::test]
+async fn fence_prepare_persists_and_membership_change_invalidates_it() {
+    let db = Database::new();
+    let mut store = Store::open(db.0.clone()).await.unwrap();
+    let membership = Membership::new(vec![std::collections::BTreeSet::from([1, 2])], None);
+    let initial = entry(0, EntryPayload::Membership(membership.clone()));
+    store.apply([initial.clone()]).await.unwrap();
+    let old = store.build_snapshot().await.unwrap();
+    let captured = StoredMembership::new(Some(initial.log_id), membership.clone());
+    let prepare = Command::PrepareReaderFence { target: 2, membership: captured.clone() };
+    assert!(store.apply([entry(1, EntryPayload::Normal(prepare.clone()))]).await.unwrap()[0].is_ok());
+    assert!(store.install_snapshot(&old.meta, old.snapshot).await.is_err());
+    assert!(store.run(|conn| get::<FencePrepare>(conn, "fence_prepare")).await.unwrap().is_some());
+    assert!(store.apply([entry(2, EntryPayload::Normal(prepare))]).await.unwrap()[0].is_err());
+    let snapshot = store.build_snapshot().await.unwrap();
+    let other = Database::new();
+    let mut restored = Store::open(other.0.clone()).await.unwrap();
+    restored.install_snapshot(&snapshot.meta, snapshot.snapshot).await.unwrap();
+    assert_eq!(restored.run(|conn| get::<FencePrepare>(conn, "fence_prepare")).await.unwrap().unwrap().membership, captured);
+    restored.apply([entry(3, EntryPayload::Membership(membership))]).await.unwrap();
+    assert!(restored.run(|conn| get::<FencePrepare>(conn, "fence_prepare")).await.unwrap().is_none());
+    assert!(restored.apply([entry(4, EntryPayload::Normal(Command::PrepareReaderFence { target: 2, membership: captured }))]).await.unwrap()[0].is_err());
+    let current = restored.applied_state().await.unwrap().1;
+    assert!(restored.apply([entry(5, EntryPayload::Normal(Command::PrepareReaderFence { target: 2, membership: current.clone() }))]).await.unwrap()[0].is_ok());
+    assert!(restored.apply([entry(6, EntryPayload::Normal(Command::CancelReaderFence { prepare_log_id: entry(1, EntryPayload::Blank).log_id }))]).await.unwrap()[0].is_err());
+    assert!(restored.run(|conn| get::<FencePrepare>(conn, "fence_prepare")).await.unwrap().is_some());
+    assert!(restored.apply([entry(7, EntryPayload::Normal(Command::CancelReaderFence { prepare_log_id: entry(5, EntryPayload::Blank).log_id }))]).await.unwrap()[0].is_ok());
+    assert!(restored.run(|conn| get::<FencePrepare>(conn, "fence_prepare")).await.unwrap().is_none());
+    assert!(restored.apply([entry(8, EntryPayload::Normal(Command::PrepareReaderFence { target: 2, membership: current }))]).await.unwrap()[0].is_ok());
+}
+
+#[tokio::test]
+async fn committed_unsupported_fence_blocks_startup_before_replay() {
+    let db = Database::new();
+    let store = Store::open(db.0.clone()).await.unwrap();
+    store.run(|conn| {
+        for index in 0..=70 {
+            let payload = if index == 70 {
+                EntryPayload::Normal(Command::ReaderFence { target: MAX_READER_FENCE + 1 })
+            } else {
+                EntryPayload::Blank
+            };
+            let entry = entry(index, payload);
+            diesel::sql_query("INSERT INTO raft_logs(idx,value) VALUES (?,?)")
+                .bind::<Text, _>(format!("{index:016x}"))
+                .bind::<Text, _>(serde_json::to_string(&entry)?).execute(conn)?;
+        }
+        put(conn, "committed", &Some(entry(69, EntryPayload::Blank).log_id))
+    }).await.unwrap();
+    assert!(preflight_application_version(&db.0).is_ok());
+    assert!(Store::open(db.0.clone()).await.is_ok());
+    store.run(|conn| {
+        diesel::sql_query("DELETE FROM raft_logs WHERE idx = '0000000000000000'").execute(conn)?;
+        Ok(())
+    }).await.unwrap();
+    assert!(preflight_application_version(&db.0).is_err());
+    store.run(|conn| {
+        let first = entry(0, EntryPayload::Blank);
+        diesel::sql_query("INSERT INTO raft_logs(idx,value) VALUES ('0000000000000000', ?)")
+            .bind::<Text, _>(serde_json::to_string(&first)?).execute(conn)?;
+        Ok(())
+    }).await.unwrap();
+    store.run(|conn| put(conn, "committed", &Some(entry(70, EntryPayload::Blank).log_id))).await.unwrap();
+    assert!(preflight_application_version(&db.0).is_err());
+    assert!(Store::open(db.0.clone()).await.is_err());
+    assert!(store.run(|conn| Ok(get::<Option<LogId<u64>>>(conn, "applied")?.flatten())).await.unwrap().is_none());
+    store.run(|conn| {
+        diesel::sql_query("DELETE FROM raft_logs WHERE idx = '0000000000000045'").execute(conn)?;
+        put(conn, "committed", &Some(entry(69, EntryPayload::Blank).log_id))
+    }).await.unwrap();
+    assert!(preflight_application_version(&db.0).is_err());
+    store.run(|conn| {
+        let applied = entry(1, EntryPayload::Blank).log_id;
+        let conflicting = LogId::new(openraft::CommittedLeaderId::new(3, 1), 1);
+        put(conn, "applied", &Some(applied))?;
+        put(conn, "committed", &Some(conflicting))
+    }).await.unwrap();
+    assert!(preflight_application_version(&db.0).is_err());
+}
+
+#[tokio::test]
+async fn supported_committed_fence_replays_on_raft_startup() {
+    use crate::raft_network::{Binding, Network};
+    let db = Database::new();
+    let store = Store::open(db.0.clone()).await.unwrap();
+    store.run(|conn| {
+        for index in 0..=70 {
+            let payload = if index == 70 {
+                EntryPayload::Normal(Command::ReaderFence { target: INITIAL_READER_FENCE })
+            } else {
+                EntryPayload::Blank
+            };
+            let entry = entry(index, payload);
+            diesel::sql_query("INSERT INTO raft_logs(idx,value) VALUES (?,?)")
+                .bind::<Text, _>(format!("{index:016x}"))
+                .bind::<Text, _>(serde_json::to_string(&entry)?).execute(conn)?;
+        }
+        put(conn, "committed", &Some(entry(70, EntryPayload::Blank).log_id))
+    }).await.unwrap();
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", listener.local_addr().unwrap().port()).parse().unwrap();
+    drop(listener);
+    let bindings = std::collections::BTreeMap::from([(1, Binding { peer: key.public().to_peer_id(), address: address.clone() })]);
+    let (network, _, attach, task) = Network::start(1, "replay-fence".into(), key,
+        libp2p::pnet::PreSharedKey::new([21; 32]), bindings, address).await.unwrap();
+    let node = openraft::Raft::<TypeConfig>::new(1, std::sync::Arc::new(openraft::Config::default().validate().unwrap()),
+        network, store.clone(), store.clone()).await.unwrap();
+    assert_eq!(store.run(|conn| get::<Option<LogId<u64>>>(conn, "applied")).await.unwrap(),
+        Some(Some(entry(70, EntryPayload::Blank).log_id)));
+    node.shutdown().await.unwrap();
+    drop(attach);
+    task.abort();
+}
+
+#[tokio::test]
+async fn reader_fence_command_is_monotonic_and_unsupported_batches_roll_back() {
+    let db = Database::new();
+    let mut store = Store::open(db.0.clone()).await.unwrap();
+    let result = store.apply([
+        entry(1, EntryPayload::Normal(Command::ReaderFence { target: INITIAL_READER_FENCE })),
+        entry(2, EntryPayload::Normal(Command::ReaderFence { target: 0 })),
+    ]).await.unwrap();
+    assert!(result[0].is_ok());
+    assert!(result[1].is_err());
+    let before = store.run(|conn| Ok((
+        get::<u8>(conn, "reader_fence")?,
+        get::<Option<LogId<u64>>>(conn, "applied")?,
+        crate::db::get_invites(conn)?.len(),
+    ))).await.unwrap();
+    assert!(store.apply([
+        entry(3, EntryPayload::Normal(invite("fence-rollback", 1))),
+        entry(4, EntryPayload::Normal(Command::ReaderFence { target: MAX_READER_FENCE + 1 })),
+        entry(5, EntryPayload::Blank),
+    ]).await.is_err());
+    let reopened = Store::open(db.0.clone()).await.unwrap();
+    let after = reopened.run(|conn| Ok((
+        get::<u8>(conn, "reader_fence")?,
+        get::<Option<LogId<u64>>>(conn, "applied")?,
+        crate::db::get_invites(conn)?.len(),
+    ))).await.unwrap();
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn snapshot_reader_fence_rejects_invalid_and_legacy_images() {
+    assert!(check_snapshot_fence(1, 1).is_ok());
+    assert!(check_snapshot_fence(1, 2).is_ok());
+    assert!(check_snapshot_fence(2, 1).is_err());
+    let source_db = Database::new();
+    let target_db = Database::new();
+    let mut source = Store::open(source_db.0.clone()).await.unwrap();
+    let mut target = Store::open(target_db.0.clone()).await.unwrap();
+    let mixed = EpochWindow::Mixed { epoch: 6, minimum_peer: 5 };
+    let stable = EpochWindow::Stable { epoch: 6 };
+    for (store, window) in [(&mut source, mixed.clone()), (&mut target, stable.clone())] {
+        assert!(store.apply([entry(1, EntryPayload::Normal(Command::EpochWindow(window)))]).await.unwrap()[0].is_ok());
+    }
+    let snapshot = source.build_snapshot().await.unwrap();
+    let image: serde_json::Value = serde_json::from_slice(snapshot.snapshot.0.get_ref()).unwrap();
+    assert_eq!(image["version"], 4);
+    assert_eq!(image["reader_fence"], INITIAL_READER_FENCE);
+    assert_eq!(image["epoch_window"], serde_json::to_value(&mixed).unwrap());
+    for fence in [None, Some(serde_json::json!(null)), Some(serde_json::json!(0)), Some(serde_json::json!(2))] {
+        let mut invalid = image.clone();
+        match fence {
+            Some(fence) => invalid["reader_fence"] = fence,
+            None => { invalid.as_object_mut().unwrap().remove("reader_fence"); },
+        }
+        assert!(install(&target, snapshot.meta.clone(), serde_json::to_vec(&invalid).unwrap()).await.is_err());
+        assert_eq!(target.run(|conn| get::<EpochWindow>(conn, "epoch_window")).await.unwrap(), Some(stable.clone()));
+    }
+    for mutation in 0..3 {
+        let mut invalid = image.clone();
+        match mutation {
+            0 => { invalid.as_object_mut().unwrap().remove("epoch_window"); },
+            1 => invalid["epoch_window"]["epoch"] = 4.into(),
+            _ => invalid["meta"]["last_log_id"] = serde_json::Value::Null,
+        }
+        assert!(install(&target, snapshot.meta.clone(), serde_json::to_vec(&invalid).unwrap()).await.is_err());
+        assert_eq!(target.run(read_window).await.unwrap(), Some(stable.clone()));
+    }
+    target.install_snapshot(&snapshot.meta, snapshot.snapshot).await.unwrap();
+    assert_eq!(target.run(read_window).await.unwrap(), Some(mixed));
+    assert_eq!(target.run(|conn| get::<u8>(conn, "reader_fence")).await.unwrap(), Some(INITIAL_READER_FENCE));
+    let empty_db = Database::new();
+    let mut empty = Store::open(empty_db.0.clone()).await.unwrap();
+    empty.apply([entry(2, EntryPayload::Blank)]).await.unwrap();
+    let empty_snapshot = empty.build_snapshot().await.unwrap();
+    target.install_snapshot(&empty_snapshot.meta, empty_snapshot.snapshot).await.unwrap();
+    assert_eq!(target.run(read_window).await.unwrap(), None);
+    drop(target);
+    assert_eq!(Store::open(target_db.0.clone()).await.unwrap().run(read_window).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn old_epoch_store_and_snapshot_are_rejected_even_with_fence() {
+    let db = Database::new();
+    let mut store = Store::open(db.0.clone()).await.unwrap();
+    let snapshot = store.build_snapshot().await.unwrap();
+    let mut old: serde_json::Value = serde_json::from_slice(snapshot.snapshot.0.get_ref()).unwrap();
+    old["application_version"] = 5.into();
+    assert!(install(&store, snapshot.meta, serde_json::to_vec(&old).unwrap()).await.is_err());
+    store.run(|conn| put(conn, "application_version", &5u8)).await.unwrap();
+    assert!(preflight_application_version(&db.0).is_err());
+    assert!(Store::open(db.0.clone()).await.is_err());
+}
+
+#[tokio::test]
+async fn reader_fence_preflight_and_reopen_fail_closed() {
+    let db = Database::new();
+    let mut store = Store::open(db.0.clone()).await.unwrap();
+    store.build_snapshot().await.unwrap();
+    for value in [None, Some("null"), Some("0"), Some("2"), Some("invalid")] {
+        store.run(move |conn| {
+            match value {
+                Some(value) => { diesel::sql_query("UPDATE raft_meta SET value = ? WHERE key = 'reader_fence'")
+                    .bind::<Text, _>(value).execute(conn)?; },
+                None => { diesel::sql_query("DELETE FROM raft_meta WHERE key = 'reader_fence'").execute(conn)?; },
+            }
+            Ok(())
+        }).await.unwrap();
+        assert!(preflight_application_version(&db.0).is_err());
+        assert!(Store::open(db.0.clone()).await.is_err());
+        assert!(store.build_snapshot().await.is_err());
+        assert!(store.get_current_snapshot().await.is_err());
+        let before = store.run(|conn| Ok((
+            get::<Option<LogId<u64>>>(conn, "applied")?,
+            get::<StoredMembership<u64, openraft::BasicNode>>(conn, "membership")?,
+            crate::db::get_invites(conn)?.len(),
+        ))).await.unwrap();
+        assert!(store.apply([entry(1, EntryPayload::Normal(invite("blocked", 1)))]).await.is_err());
+        assert!(store.apply([entry(1, EntryPayload::Membership(Membership::default()))]).await.is_err());
+        let after = store.run(|conn| Ok((
+            get::<Option<LogId<u64>>>(conn, "applied")?,
+            get::<StoredMembership<u64, openraft::BasicNode>>(conn, "membership")?,
+            crate::db::get_invites(conn)?.len(),
+        ))).await.unwrap();
+        assert_eq!(after, before);
+        store.run(|conn| put(conn, "reader_fence", &INITIAL_READER_FENCE)).await.unwrap();
+    }
+    assert!(preflight_application_version(&db.0).is_ok());
+    assert!(Store::open(db.0.clone()).await.is_ok());
+}
+
+#[tokio::test]
 async fn mesh_fec_snapshot_round_trip() {
     let db = Database::new();
     let mut store = Store::open(db.0.clone()).await.unwrap();
@@ -1187,14 +1509,34 @@ async fn offline_recovery_verifies_and_restores_fresh_application_without_local_
     let report = check(&file, "snapshot").unwrap();
     assert!(report.contains("local_vote=false"));
     assert!(!report.contains("code-1") && !report.contains(&signing));
-    for mutation in [0, 1, 2, 3, 4] {
+    let id_table = TABLES.iter().position(|(name, _)| *name == "management_ids").unwrap();
+    let receiver_db = Database::new();
+    let receiver = Store::open(receiver_db.0.clone()).await.unwrap();
+    let before = receiver.run(application_tables).await.unwrap();
+    for mutation in 0..3 {
+        let mut image: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let ids = image["tables"][id_table].as_array_mut().unwrap();
+        match mutation {
+            0 => ids.retain(|row| row[0] != "node"),
+            1 => ids.iter_mut().find(|row| row[0] == "node").unwrap()[1] = 0.into(),
+            _ => ids.push(ids[0].clone()),
+        }
+        let invalid = serde_json::to_vec(&image).unwrap();
+        std::fs::write(&file, &invalid).unwrap();
+        assert!(check(&file, "snapshot").is_err());
+        assert!(install(&receiver, snap.meta.clone(), invalid).await.is_err());
+        assert_eq!(receiver.run(application_tables).await.unwrap(), before);
+    }
+    for mutation in [0, 1, 2, 3, 4, 5, 6] {
         let mut image: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         match mutation {
-            0 => image["version"] = 2.into(),
+            0 => image["version"] = 1.into(),
             1 => image["tables"][0][0][0] = "replica_transport_key".into(),
             2 => image["meta"]["last_log_id"] = serde_json::Value::Null,
             3 => image["tables"][9][0][3] = "broken dedup".into(),
-            _ => image["tables"][0] = serde_json::json!([]),
+            4 => image["tables"][0] = serde_json::json!([]),
+            5 => image["reader_fence"] = 2.into(),
+            _ => { image.as_object_mut().unwrap().remove("reader_fence"); },
         }
         std::fs::write(&file, serde_json::to_vec(&image).unwrap()).unwrap();
         assert!(check(&file, "snapshot").is_err(), "mutation {mutation}");
