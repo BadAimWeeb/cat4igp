@@ -25,12 +25,25 @@ type Tunnel = {
   mtu: number;
   intents: Intent[];
 };
+type L2tpTunnel = {
+  id: number; construction: "static"; node_id_peer1: number; node_id_peer2: number;
+  endpoint_peer1: string; endpoint_peer2: string; udp_port_peer1: number; udp_port_peer2: number;
+  session_id_peer1: number; session_id_peer2: number; cookie_peer1: string; cookie_peer2: string;
+  security_mode: "pure" | "wireguard"; wireguard_tunnel_id: number | null; mtu: number;
+};
+type L2tpV2Tunnel = {
+  id: number; node_id_peer1: number; node_id_peer2: number;
+  endpoint_peer1: string; endpoint_peer2: string; udp_port_peer1: number; udp_port_peer2: number;
+  address_peer1: string; address_peer2: string; mtu: number; wireguard_tunnel_id?: number | null;
+};
 export type Inventory = {
   nodes: Node[];
   meshes: Mesh[];
   memberships: Membership[];
   invites: Invite[];
   tunnels: Tunnel[];
+  l2tp_tunnels: L2tpTunnel[];
+  l2tp_v2_tunnels: L2tpV2Tunnel[];
 };
 export const integer = (x: unknown): x is number =>
   typeof x === "number" && Number.isSafeInteger(x);
@@ -96,6 +109,23 @@ export function inventoryFrom(value: unknown): Inventory {
             : (i.kind === "legacy" || i.kind === "manual") &&
               i.mesh_id === null,
         ),
+    ) ||
+    !rows(data.l2tp_tunnels, (r) =>
+      integer(r.id) && r.construction === "static" &&
+      integer(r.node_id_peer1) && integer(r.node_id_peer2) &&
+      text(r.endpoint_peer1) && text(r.endpoint_peer2) &&
+      integer(r.udp_port_peer1) && integer(r.udp_port_peer2) &&
+      integer(r.session_id_peer1) && integer(r.session_id_peer2) &&
+      text(r.cookie_peer1) && text(r.cookie_peer2) &&
+      (r.security_mode === "pure" || r.security_mode === "wireguard") &&
+      nullableInteger(r.wireguard_tunnel_id) && integer(r.mtu),
+    ) ||
+    !rows(data.l2tp_v2_tunnels, (r) =>
+      integer(r.id) && integer(r.node_id_peer1) && integer(r.node_id_peer2) &&
+      text(r.endpoint_peer1) && text(r.endpoint_peer2) &&
+      integer(r.udp_port_peer1) && integer(r.udp_port_peer2) &&
+      text(r.address_peer1) && text(r.address_peer2) && integer(r.mtu) &&
+      (r.wireguard_tunnel_id === undefined || nullableInteger(r.wireguard_tunnel_id)),
     )
   )
     throw new Error("Invalid inventory response.");

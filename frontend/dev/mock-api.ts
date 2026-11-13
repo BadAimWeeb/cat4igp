@@ -7,7 +7,6 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 // @ts-ignore -- native Node API, also supported by Bun
 import { Buffer } from "node:buffer";
 import type { Inventory } from "../src/api/inventory.ts";
-import type { Replicas, EnrollmentCode } from "../src/api/replicas.ts";
 
 const positive = (v: unknown): v is number =>
   Number.isSafeInteger(v) && (v as number) > 0;
@@ -18,10 +17,6 @@ const name = (v: unknown): v is string =>
   !!v.trim() &&
   !/[\p{Cc}]/u.test(v) &&
   Buffer.byteLength(v) <= 256;
-const peer = (id: number) => `demo-peer-${id}`;
-const uuid = (v: unknown): v is string =>
-  typeof v === "string" &&
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
 const stamp = () => new Date().toISOString();
 type Reply = { status: number; body: Record<string, unknown> };
 type Receipt = Reply & {
@@ -61,7 +56,9 @@ export function createMockApi() {
       created_at: stamp(),
       last_seen: id === 3 ? null : stamp(),
     })),
-    meshes: [{ id: 1, name: "Demo mesh", auto_wireguard: true, mtu: 1420, fec: false }],
+    meshes: [
+      { id: 1, name: "Demo mesh", auto_wireguard: true, mtu: 1420, fec: false },
+    ],
     memberships: [
       { mesh_id: 1, node_id: 1 },
       { mesh_id: 1, node_id: 2 },
@@ -90,63 +87,14 @@ export function createMockApi() {
         ],
       },
     ],
-  };
-  const replicas: Replicas = {
-    admitted: { "1": peer(1), "2": peer(2), "3": peer(3) },
-    pending: [
-      {
-        node_id: 3,
-        peer_id: peer(3),
-        address: "/ip4/127.0.0.1/tcp/9003",
-        admitted_at_ms: now,
-      },
-    ],
-    roster: {
-      version: 1,
-      cluster_id: "demo-only",
-      revision: 1,
-      issued_at_ms: now,
-      expires_at_ms: now + 900000,
-      controllers: [
-        {
-          peer_id: peer(1),
-          addresses: [`/ip4/127.0.0.1/tcp/9001/p2p/${peer(1)}`],
-        },
-      ],
-      discovery_endpoints: [],
-    },
-    revocations: {},
-    observation:
-      "DEV MOCK: desired metadata only; not live convergence or reachability",
-    membership_observation: {
-      node_id: 1,
-      leader_id: 1,
-      membership: {
-        configs: [[1]],
-        nodes: {
-          "1": { addr: "/ip4/127.0.0.1/tcp/9001" },
-          "2": { addr: "/ip4/127.0.0.1/tcp/9002" },
-        },
-      },
-      last_applied: null,
-      replication: null,
-      scope: "DEV MOCK: static observations, no Raft or live replication",
-    },
+    l2tp_tunnels: [],
+    l2tp_v2_tunnels: [],
   };
   const sessions = new Map<string, number>();
   const receipts = new Map<string, Receipt>();
-  const bindings = new Map<number, [string, string]>();
   let meshId = 2,
-    inviteId = 2;
-  let code: EnrollmentCode = {
-    generation: 1,
-    code: "d".repeat(64),
-    activated_at_ms: now,
-    expires_at_ms: now + 900000,
-    previous: null,
-  };
-  const signingKey = "e".repeat(64);
-  const state = { inventory, replicas, sessions, receipts };
+    inviteId = 2, tunnelId = 2;
+  const state = { inventory, sessions, receipts };
   const node = (id: unknown) => {
     requireValue(positive(id));
     const n = inventory.nodes.find((n) => n.id === id);
@@ -193,6 +141,46 @@ export function createMockApi() {
     }
     const affected = new Set<number>();
     switch (b.action) {
+      case "create_l2tp_v2_tunnel": {
+        fields(b, ["action", "node_id_peer1", "node_id_peer2", "endpoint_peer1", "endpoint_peer2", "udp_port_peer1", "udp_port_peer2", "address_peer1", "address_peer2", "secret", "mtu", ...(Object.hasOwn(b, "wireguard_tunnel_id") ? ["wireguard_tunnel_id"] : [])]);
+        node(b.node_id_peer1); node(b.node_id_peer2);
+        requireValue(b.node_id_peer1 !== b.node_id_peer2);
+        for (const key of ["endpoint_peer1", "endpoint_peer2", "address_peer1", "address_peer2"]) requireValue(typeof b[key] === "string" && (b[key] as string).length > 0);
+        for (const key of ["udp_port_peer1", "udp_port_peer2"]) requireValue(positive(b[key]) && (b[key] as number) <= 65535);
+        requireValue(typeof b.secret === "string" && /^[0-9a-f]{32,128}$/.test(b.secret));
+        const wireguard = b.wireguard_tunnel_id ?? null;
+        if (wireguard !== null) requireValue(positive(wireguard) && inventory.tunnels.some(t => t.id === wireguard && ((t.node_id_peer1 === b.node_id_peer1 && t.node_id_peer2 === b.node_id_peer2) || (t.node_id_peer1 === b.node_id_peer2 && t.node_id_peer2 === b.node_id_peer1))));
+        requireValue(uint(b.mtu) && b.mtu >= 1280 && b.mtu <= (wireguard === null ? 1500 : 65000));
+        const { action: _, secret: _secret, ...values } = b;
+        inventory.l2tp_v2_tunnels.push({ ...values, wireguard_tunnel_id: wireguard, id: tunnelId++ } as Inventory["l2tp_v2_tunnels"][number]);
+        return { committed: true };
+      }
+      case "delete_l2tp_v2_tunnel": {
+        fields(b, ["action", "id"]);
+        requireValue(inventory.l2tp_v2_tunnels.some(t => t.id === b.id), 404, "L2TPv2 tunnel not found");
+        inventory.l2tp_v2_tunnels = inventory.l2tp_v2_tunnels.filter(t => t.id !== b.id);
+        return { committed: true };
+      }
+      case "create_l2tp_tunnel": {
+        fields(b, ["action", "node_id_peer1", "node_id_peer2", "endpoint_peer1", "endpoint_peer2", "udp_port_peer1", "udp_port_peer2", "session_id_peer1", "session_id_peer2", "cookie_peer1", "cookie_peer2", "security_mode", "wireguard_tunnel_id", "mtu"]);
+        node(b.node_id_peer1); node(b.node_id_peer2);
+        requireValue(b.node_id_peer1 !== b.node_id_peer2);
+        for (const key of ["endpoint_peer1", "endpoint_peer2"]) requireValue(typeof b[key] === "string" && (b[key] as string).length > 0 && (b[key] as string).length <= 45);
+        for (const key of ["udp_port_peer1", "udp_port_peer2"]) requireValue(positive(b[key]) && (b[key] as number) <= 65535);
+        for (const key of ["session_id_peer1", "session_id_peer2"]) requireValue(positive(b[key]) && (b[key] as number) <= 4294967295);
+        for (const key of ["cookie_peer1", "cookie_peer2"]) requireValue(typeof b[key] === "string" && /^[0-9a-f]{16}$/.test(b[key] as string));
+        requireValue(uint(b.mtu) && (b.mtu as number) >= 576 && (b.mtu as number) <= 65477);
+        requireValue((b.security_mode === "pure" && b.wireguard_tunnel_id === null) || (b.security_mode === "wireguard" && inventory.tunnels.some(t => t.id === b.wireguard_tunnel_id && ((t.node_id_peer1 === b.node_id_peer1 && t.node_id_peer2 === b.node_id_peer2) || (t.node_id_peer1 === b.node_id_peer2 && t.node_id_peer2 === b.node_id_peer1)))));
+        const { action: _, ...values } = b;
+        inventory.l2tp_tunnels.push({ ...values, id: tunnelId++, construction: "static" } as Inventory["l2tp_tunnels"][number]);
+        return { committed: true };
+      }
+      case "delete_l2tp_tunnel": {
+        fields(b, ["action", "id"]);
+        requireValue(inventory.l2tp_tunnels.some(t => t.id === b.id), 404, "L2TP tunnel not found");
+        inventory.l2tp_tunnels = inventory.l2tp_tunnels.filter(t => t.id !== b.id);
+        return { committed: true };
+      }
       case "rename_node": {
         fields(b, ["action", "id", "name"]);
         const n = node(b.id);
@@ -232,16 +220,18 @@ export function createMockApi() {
         requireValue(
           name(b.name) &&
             typeof b.auto_wireguard === "boolean" &&
-            typeof b.fec === "boolean" && (b.auto_wireguard || !b.fec) &&
+            typeof b.fec === "boolean" &&
+            (b.auto_wireguard || !b.fec) &&
             uint(b.mtu) &&
-            ((b.mtu >= 1280 && b.mtu <= 9000) || (!b.auto_wireguard && b.mtu === 0)),
+            ((b.mtu >= 1280 && b.mtu <= 9000) ||
+              (!b.auto_wireguard && b.mtu === 0)),
         );
         const id = meshId++;
         inventory.meshes.push({
           id,
           name: b.name as string,
           auto_wireguard: b.auto_wireguard as boolean,
-          mtu: b.auto_wireguard ? b.mtu as number : 0,
+          mtu: b.auto_wireguard ? (b.mtu as number) : 0,
           fec: b.fec as boolean,
         });
         return { committed: true, mesh_id: id };
@@ -249,10 +239,15 @@ export function createMockApi() {
       case "set_mesh_mtu": {
         fields(b, ["action", "id", "mtu"]);
         const m = mesh(b.id);
-        requireValue(m.auto_wireguard && uint(b.mtu) && b.mtu >= 1280 && b.mtu <= 9000);
+        requireValue(
+          m.auto_wireguard && uint(b.mtu) && b.mtu >= 1280 && b.mtu <= 9000,
+        );
         m.mtu = b.mtu as number;
         for (const t of inventory.tunnels)
-          if (t.mtu !== m.mtu && t.intents.some((i) => i.kind === "mesh" && i.mesh_id === m.id)) {
+          if (
+            t.mtu !== m.mtu &&
+            t.intents.some((i) => i.kind === "mesh" && i.mesh_id === m.id)
+          ) {
             t.mtu = m.mtu;
             affected.add(t.node_id_peer1);
             affected.add(t.node_id_peer2);
@@ -262,7 +257,9 @@ export function createMockApi() {
       case "set_mesh_fec": {
         fields(b, ["action", "id", "fec"]);
         const m = mesh(b.id);
-        requireValue(typeof b.fec === "boolean" && (m.auto_wireguard || !b.fec));
+        requireValue(
+          typeof b.fec === "boolean" && (m.auto_wireguard || !b.fec),
+        );
         m.fec = b.fec as boolean;
         for (const t of inventory.tunnels)
           if (t.intents.some((i) => i.kind === "mesh" && i.mesh_id === m.id)) {
@@ -319,6 +316,7 @@ export function createMockApi() {
           }
           return !remove;
         });
+        inventory.l2tp_v2_tunnels = inventory.l2tp_v2_tunnels.filter(t => t.node_id_peer1 !== b.id && t.node_id_peer2 !== b.id);
         break;
       }
       case "delete_mesh": {
@@ -371,148 +369,10 @@ export function createMockApi() {
     };
   }
 
-  function reconcile(b: Record<string, unknown>): Record<string, unknown> {
-    if (b.action === "enrollment_code") {
-      fields(b, ["action"]);
-      return { ...code };
-    }
-    if (b.action === "join_bundle") {
-      fields(b, ["action", "bootstrap"]);
-      requireValue(
-        typeof b.bootstrap === "string" &&
-          b.bootstrap.startsWith("/") &&
-          b.bootstrap.includes("/p2p/") &&
-          !/[\s\p{Cc}]/u.test(b.bootstrap),
-      );
-      return {
-        application_version: 6,
-        cluster_id: "demo-cluster",
-        signing_key: signingKey,
-        bootstrap: b.bootstrap,
-        minimum_revision: 1,
-        code: code.code,
-      };
-    }
-    if (b.action === "rotate_enrollment_code") {
-      fields(b, ["action", "expected_generation"]);
-      requireValue(uint(b.expected_generation));
-      if (b.expected_generation === code.generation - 1) return { ...code };
-      requireValue(b.expected_generation === code.generation);
-      const now = Date.now();
-      code = {
-        generation: code.generation + 1,
-        code: randomBytes(32).toString("hex"),
-        activated_at_ms: now,
-        expires_at_ms: now + 900000,
-        previous: [code.code, now + 60000],
-      };
-      return { ...code };
-    }
-    const id = b.node_id;
-    requireValue(positive(id));
-    requireValue(replicas.admitted[String(id)], 404, "Replica not found");
-    const membership = replicas.membership_observation.membership;
-    if (b.action === "grant_serving") {
-      fields(b, [
-        "action",
-        "node_id",
-        "expected_roster_revision",
-        "public_address",
-        "control_address",
-        "request_id",
-      ]);
-      requireValue(uuid(b.request_id), 400, "Invalid request ID");
-      const roster = replicas.roster!;
-      requireValue(
-        uint(b.expected_roster_revision) &&
-          b.expected_roster_revision === roster.revision &&
-          !replicas.revocations[String(id)] &&
-          membership.configs.every((c) => c.includes(id as number)),
-      );
-      const addresses = [b.public_address, b.control_address];
-      requireValue(
-        addresses.every(
-          (a) =>
-            typeof a === "string" &&
-            a.startsWith("/") &&
-            a.endsWith(`/p2p/${replicas.admitted[String(id)]}`) &&
-            !/[\s\p{Cc}]/u.test(a),
-        ) && addresses[0] !== addresses[1],
-      );
-      const binding = bindings.get(id as number);
-      requireValue(!binding || binding.every((a, i) => a === addresses[i]));
-      bindings.set(id as number, addresses as [string, string]);
-      roster.revision++;
-      roster.issued_at_ms = Date.now();
-      roster.expires_at_ms = roster.issued_at_ms + 900000;
-      roster.controllers = roster.controllers.filter(
-        (c) => c.peer_id !== replicas.admitted[String(id)],
-      );
-      roster.controllers.push({
-        peer_id: replicas.admitted[String(id)],
-        addresses: [b.control_address as string],
-      });
-      roster.discovery_endpoints = (roster.discovery_endpoints ?? []).filter(
-        (c) => c.peer_id !== replicas.admitted[String(id)],
-      );
-      roster.discovery_endpoints.push({
-        peer_id: replicas.admitted[String(id)],
-        addresses: [b.public_address as string],
-      });
-      return {
-        committed: true,
-        semantics: "durable request receipt; not lease renewal",
-        roster_revision: roster.revision,
-        issued_at_ms: roster.issued_at_ms,
-        expires_at_ms: roster.expires_at_ms,
-      };
-    }
-    fields(b, ["action", "node_id"]);
-    if (b.action === "revoke_replica") {
-      requireValue(id !== 1);
-      if (replicas.revocations[String(id)])
-        return {
-          reconciled: true,
-          semantics: "desired_state; no request receipt",
-        };
-      replicas.revocations[String(id)] = {
-        peer: replicas.admitted[String(id)],
-        complete: false,
-      };
-      replicas.pending = replicas.pending.filter((p) => p.node_id !== id);
-      membership.configs = membership.configs.map((c) =>
-        c.filter((n) => n !== id),
-      );
-      delete membership.nodes[String(id)];
-      const roster = replicas.roster!;
-      roster.controllers = roster.controllers.filter(
-        (c) => c.peer_id !== replicas.admitted[String(id)],
-      );
-      roster.discovery_endpoints = (roster.discovery_endpoints ?? []).filter(
-        (c) => c.peer_id !== replicas.admitted[String(id)],
-      );
-      roster.revision++;
-    } else {
-      requireValue(!replicas.revocations[String(id)]);
-      if (b.action === "activate_learner") {
-        membership.nodes[String(id)] ??= {
-          addr: `/ip4/127.0.0.1/tcp/${9000 + (id as number)}`,
-        };
-        replicas.pending = replicas.pending.filter((p) => p.node_id !== id);
-      } else if (b.action === "promote_learner") {
-        requireValue(membership.nodes[String(id)]);
-        for (const c of membership.configs)
-          if (!c.includes(id as number)) c.push(id as number);
-      } else throw new Rejection(400, "Unknown replica action");
-    }
-    // ponytail: desired metadata only; no live Raft/catch-up, revocation completion or serving simulation. Use real backend integration checks for those.
-    return { reconciled: true, semantics: "desired_state; no request receipt" };
-  }
-
   async function handle(req: IncomingMessage, res: ServerResponse) {
     const send = (
       status: number,
-      body: Record<string, unknown> | Inventory | Replicas,
+      body: Record<string, unknown> | Inventory,
     ) => {
       res.writeHead(status, {
         "Content-Type": "application/json",
@@ -527,10 +387,8 @@ export function createMockApi() {
         "/admin/logout": "POST",
         "/admin/me": "GET",
         "/admin/inventory": "GET",
-        "/admin/replicas": "GET",
         "/admin/actions": "POST",
         "/admin/invites": "POST",
-        "/admin/replicas/reconcile": "POST",
       };
       requireValue(routes[path], 404, "Unknown mock endpoint");
       requireValue(req.method === routes[path], 405, "Method not allowed");
@@ -546,11 +404,7 @@ export function createMockApi() {
       if (req.method === "GET") {
         send(
           200,
-          path === "/admin/me"
-            ? { subject: "administrator:1" }
-            : path === "/admin/inventory"
-              ? inventory
-              : replicas,
+          path === "/admin/me" ? { subject: "administrator:1" } : inventory,
         );
         return;
       }
@@ -616,24 +470,9 @@ export function createMockApi() {
         send(200, { success: true });
         return;
       }
-      const grant =
-        path === "/admin/replicas/reconcile" && b.action === "grant_serving";
-      const desired = path === "/admin/replicas/reconcile" && !grant;
-      if (path === "/admin/replicas/reconcile")
-        requireValue(
-          !req.headers["idempotency-key"],
-          400,
-          "Replica requests do not use Idempotency-Key",
-        );
-      if (desired) {
-        send(200, reconcile(b));
-        return;
-      }
-      const key = grant ? b.request_id : req.headers["idempotency-key"];
+      const key = req.headers["idempotency-key"];
       requireValue(
-        grant
-          ? uuid(key)
-          : typeof key === "string" && /^[\x21-\x7e]{1,100}$/.test(key),
+        typeof key === "string" && /^[\x21-\x7e]{1,100}$/.test(key),
         400,
         "Invalid retry key",
       );
@@ -646,7 +485,7 @@ export function createMockApi() {
       }
       let reply: Reply;
       try {
-        reply = { status: 200, body: grant ? reconcile(b) : mutate(path, b) };
+        reply = { status: 200, body: mutate(path, b) };
       } catch (e) {
         if (!(e instanceof Rejection)) throw e;
         reply = {

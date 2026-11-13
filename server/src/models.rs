@@ -42,22 +42,6 @@ pub struct NewNodeControlIdentity<'a> {
 }
 
 #[derive(Queryable, Selectable, Clone)]
-#[diesel(table_name = crate::schema::wireguard_static_key)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-pub struct WireguardStaticKey {
-    pub node_id: i32,
-    pub public_key: String,
-    pub created_at: chrono::NaiveDateTime,
-}
-
-#[derive(Insertable)]
-#[diesel(table_name = crate::schema::wireguard_static_key)]
-pub struct NewWireguardStaticKey<'a> {
-    pub node_id: i32,
-    pub public_key: &'a str,
-}
-
-#[derive(Queryable, Selectable, Clone)]
 #[diesel(table_name = crate::schema::wireguard_tunnels)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct WireguardTunnel {

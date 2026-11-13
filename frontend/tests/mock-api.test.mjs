@@ -3,7 +3,6 @@ import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { createMockApi } from "../dev/mock-api.ts";
 import { inventoryFrom } from "../src/api/inventory.ts";
-import { replicasFrom, prepareGrant } from "../src/api/replicas.ts";
 
 const api = createMockApi();
 const server = createServer(api.handle);
@@ -56,7 +55,31 @@ try {
   const inventory = inventoryFrom((await call("/admin/inventory")).data);
   assert.equal(inventory.nodes.length, 3);
   assert.doesNotMatch(JSON.stringify(inventory), /invite_code|demo-password/);
-  replicasFrom((await call("/admin/replicas")).data);
+  const l2tp = { action: "create_l2tp_tunnel", node_id_peer1: 1, node_id_peer2: 2, endpoint_peer1: "192.0.2.1", endpoint_peer2: "192.0.2.2", udp_port_peer1: 1701, udp_port_peer2: 1701, session_id_peer1: 1, session_id_peer2: 2, cookie_peer1: "0123456789abcdef", cookie_peer2: "fedcba9876543210", security_mode: "pure", wireguard_tunnel_id: null, mtu: 1500 };
+  await action(l2tp);
+  await action({ ...l2tp, security_mode: "wireguard", wireguard_tunnel_id: 1 });
+  let l2tpRows = inventoryFrom((await call("/admin/inventory")).data).l2tp_tunnels;
+  assert.deepEqual(l2tpRows.map(t => t.security_mode), ["pure", "wireguard"]);
+  await action({ action: "delete_l2tp_tunnel", id: l2tpRows[0].id });
+  l2tpRows = inventoryFrom((await call("/admin/inventory")).data).l2tp_tunnels;
+  assert.equal(l2tpRows.length, 1);
+  await action({ ...l2tp, cookie_peer1: "invalid" }, randomUUID(), 409);
+  await action({ ...l2tp, mtu: 65478 }, randomUUID(), 409);
+  const v2 = { action: "create_l2tp_v2_tunnel", node_id_peer1: 1, node_id_peer2: 2, endpoint_peer1: "192.0.2.1", endpoint_peer2: "192.0.2.2", udp_port_peer1: 1701, udp_port_peer2: 1702, address_peer1: "10.0.0.1", address_peer2: "10.0.0.2", secret: "a".repeat(32), mtu: 1500 };
+  await action(v2);
+  await action({ ...v2, mtu: 1501 }, randomUUID(), 409);
+  await action({ ...v2, wireguard_tunnel_id: 1, mtu: 65000 });
+  await action({ ...v2, wireguard_tunnel_id: 1, mtu: 65001 }, randomUUID(), 409);
+  await action({ ...v2, wireguard_tunnel_id: 999 }, randomUUID(), 409);
+  await action({ ...v2, node_id_peer2: 3, wireguard_tunnel_id: 1 }, randomUUID(), 409);
+  const v2Rows = inventoryFrom((await call("/admin/inventory")).data).l2tp_v2_tunnels;
+  assert.deepEqual(v2Rows.map(t => t.wireguard_tunnel_id), [null, 1]);
+  assert.deepEqual([inventory.tunnels[0].id, ...l2tpRows.map(t => t.id), ...v2Rows.map(t => t.id)], [1, 3, 4, 5]);
+  assert.equal(v2Rows[1].mtu, 65000);
+  assert.ok(v2Rows.every(t => !("secret" in t)));
+  await action({ action: "delete_l2tp_v2_tunnel", id: v2Rows[0].id });
+  await action({ action: "delete_l2tp_v2_tunnel", id: v2Rows[1].id });
+  await call("/admin/replicas", undefined, undefined, 404);
   await call("/admin/no-such-route", undefined, undefined, 404);
   await call("/admin/actions", "{", randomUUID(), 400);
   await call("/admin/actions", " ".repeat(4097), randomUUID(), 413);
@@ -102,13 +125,27 @@ try {
   const fecAction = { action: "set_mesh_fec", id: 1, fec: true };
   const fecResult = (await action(fecAction, fecKey)).data;
   assert.deepEqual((await action(fecAction, fecKey)).data, fecResult);
-  assert.equal(inventoryFrom((await call("/admin/inventory")).data).meshes[0].fec, true);
+  assert.equal(
+    inventoryFrom((await call("/admin/inventory")).data).meshes[0].fec,
+    true,
+  );
   await action({ ...fecAction, fec: false }, fecKey, 409);
   await action({ ...fecAction, fec: "true" }, randomUUID(), 409);
   await action({ ...fecAction, id: first.mesh_id }, randomUUID(), 409);
   await action({ ...fecAction, extra: true }, randomUUID(), 400);
-  const fecMesh = (await action({ ...create, name: "FEC", auto_wireguard: true, mtu: 1420, fec: true })).data;
-  assert.equal(api.state.inventory.meshes.find((m) => m.id === fecMesh.mesh_id).fec, true);
+  const fecMesh = (
+    await action({
+      ...create,
+      name: "FEC",
+      auto_wireguard: true,
+      mtu: 1420,
+      fec: true,
+    })
+  ).data;
+  assert.equal(
+    api.state.inventory.meshes.find((m) => m.id === fecMesh.mesh_id).fec,
+    true,
+  );
   await action({ ...create, fec: true }, randomUUID(), 409);
   await action({ action: "delete_mesh", id: fecMesh.mesh_id });
   await action({ action: "rename_node", id: 1, name: "renamed" });
@@ -199,108 +236,6 @@ try {
   assert.equal(api.state.inventory.tunnels.length, 0);
   await action({ action: "delete_node", id: 3 });
   inventoryFrom((await call("/admin/inventory")).data);
-
-  const endpoint = "/admin/replicas/reconcile";
-  const oldCode = (await call(endpoint, { action: "enrollment_code" })).data;
-  const rotation = {
-    action: "rotate_enrollment_code",
-    expected_generation: oldCode.generation,
-  };
-  const rotated = (await call(endpoint, rotation)).data;
-  assert.equal(rotated.generation, oldCode.generation + 1);
-  assert.deepEqual((await call(endpoint, rotation)).data, rotated);
-  await call(
-    endpoint,
-    { ...rotation, expected_generation: 50 },
-    undefined,
-    409,
-  );
-  await call(endpoint, { action: "enrollment_code" }, randomUUID(), 400);
-  // Join bundle: one desired-state request, validation of the bootstrap, and a
-  // copyable command with the node ID embedded. The bundle mirrors the real
-  // join::Bundle shape; the code is embedded in the command output only.
-  const { desiredState, joinCommand } = await import("../src/api/replicas.ts");
-  const bundleBootstrap = "/ip4/203.0.113.9/tcp/9000/p2p/demo-peer-1";
-  const currentCode = (await call(endpoint, { action: "enrollment_code" })).data;
-  const bundle = (await call(endpoint, { action: "join_bundle", bootstrap: bundleBootstrap })).data;
-  assert.equal(bundle.cluster_id, "demo-cluster");
-  assert.equal(bundle.minimum_revision, 1);
-  assert.equal(bundle.code, currentCode.code);
-  assert.equal(typeof bundle.signing_key, "string");
-  await assert.rejects(
-    desiredState({ action: "join_bundle", bootstrap: "no" }),
-  );
-  await assert.rejects(
-    desiredState({
-      action: "join_bundle",
-      bootstrap: bundleBootstrap.slice(0, -1),
-    }),
-  );
-  assert.match(joinCommand(bundle, 4), /--node-id 4/);
-  assert.match(joinCommand(bundle, 4), new RegExp(bundle.code));
-  await call(endpoint, { action: "join_bundle" }, undefined, 400);
-  await call(
-    endpoint,
-    { action: "join_bundle", bootstrap: "not-a-multiaddr" },
-    undefined,
-    409,
-  );
-  await call(
-    endpoint,
-    { action: "join_bundle", bootstrap: "/ip4/203.0.113.9/tcp/9000" },
-    undefined,
-    409,
-  );
-  await call(
-    endpoint,
-    {
-      action: "join_bundle",
-      bootstrap: bundleBootstrap,
-      extra: true,
-    },
-    undefined,
-    400,
-  );
-  await call(endpoint, { action: "promote_learner", node_id: 3 }, undefined, 409);
-  await call(endpoint, { action: "activate_learner", node_id: 3 });
-  await call(endpoint, { action: "promote_learner", node_id: 3 });
-  const replicas = replicasFrom((await call("/admin/replicas")).data);
-  assert.ok(replicas.membership_observation.membership.configs[0].includes(3));
-  const grant = prepareGrant(
-    replicas,
-    3,
-    "/ip4/203.0.113.3/tcp/443/p2p/demo-peer-3",
-    "/ip4/127.0.0.1/tcp/9003/p2p/demo-peer-3",
-  );
-  const receipt = (await call(endpoint, grant.body)).data;
-  assert.equal(receipt.semantics, "durable request receipt; not lease renewal");
-  assert.deepEqual((await call(endpoint, grant.body)).data, receipt);
-  await call(
-    endpoint,
-    { ...JSON.parse(grant.body), public_address: "/different" },
-    undefined,
-    409,
-  );
-  await call(
-    endpoint,
-    { ...JSON.parse(grant.body), request_id: randomUUID() },
-    undefined,
-    409,
-  );
-  await call(endpoint, { action: "revoke_replica", node_id: 3 });
-  const revokedRevision = api.state.replicas.roster.revision;
-  await call(endpoint, { action: "revoke_replica", node_id: 3 });
-  assert.equal(api.state.replicas.roster.revision, revokedRevision);
-  const after = replicasFrom((await call("/admin/replicas")).data);
-  assert.equal(after.revocations["3"].complete, false);
-  assert.ok(!after.roster.controllers.some((c) => c.peer_id === "demo-peer-3"));
-  assert.deepEqual((await call(endpoint, grant.body)).data, receipt);
-  await call(
-    endpoint,
-    { action: "activate_learner", node_id: 3 },
-    undefined,
-    409,
-  );
 
   const other = await call(
     "/admin/login",

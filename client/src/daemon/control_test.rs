@@ -509,6 +509,9 @@ async fn authorized_replica_noise_wire_failover() {
                                         node_id: 1,
                                         revision: 1,
                                         tunnels: vec![],
+                                        l2tp_tunnels: vec![],
+                                        l2tp_v2_tunnels: vec![],
+                                        l2tp_availability: None,
                                     },
                                 )
                                 .unwrap(),

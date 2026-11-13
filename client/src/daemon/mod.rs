@@ -17,7 +17,10 @@ use cat4igp_shared::{
 
 pub mod client;
 pub mod control;
+mod control_relay;
 mod daemon_memory;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use daemon_memory::l2tp_v2_policy;
 pub mod protocol;
 
 use protocol::{DaemonRequest, DaemonResponse, SharedSecret};
@@ -615,6 +618,21 @@ impl Daemon {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         println!("✓ Listening on socket: {:?}", self.config.daemon_socket);
 
+        if let Some(relay) = &self.config.control_relay {
+            if relay.listen.port() == 0 || relay.target.port() == 0 || relay.target.ip().is_unspecified()
+                || relay.target.ip().is_multicast() || relay.listen == relay.target
+            {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid control relay listen or target address"));
+            }
+            let relay_listener = tokio::net::TcpListener::bind(relay.listen).await?;
+            let target = relay.target;
+            self.tasks.lock().unwrap().spawn(async move {
+                if let Err(error) = control_relay::run(relay_listener, target).await {
+                    eprintln!("[daemon] control relay stopped: {error}");
+                }
+            });
+        }
+
         if let Err(error) = self.start_control_plane().await {
             eprintln!("[daemon] control plane start failed: {error}");
             self.memory.set_last_poll_error(Some(error)).await;
@@ -659,6 +677,10 @@ impl Daemon {
             std::mem::take(&mut *tasks)
         };
         tasks.shutdown().await;
+        #[cfg(target_os = "linux")]
+        if let Err(error) = self.memory.cleanup_l2tp().await {
+            eprintln!("[daemon] L2TP cleanup failed: {error}");
+        }
         if let Some(plane) = self.control_plane.lock().unwrap().take() {
             plane.stop();
         }
@@ -714,7 +736,7 @@ impl Daemon {
         if self.control_plane.lock().unwrap().is_some() {
             return Ok(());
         }
-        let plane = control::start(config, updates, Arc::clone(&self.server_config))?;
+        let plane = control::start(config.clone(), updates, Arc::clone(&self.server_config))?;
         *self.control_plane.lock().unwrap() = Some(plane);
         let daemon = self.clone_for_handler();
         tasks.spawn(async move {

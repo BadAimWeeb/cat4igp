@@ -2,7 +2,13 @@
 //! Raft RPCs, snapshots, and persisted state currently require the exact epoch.
 
 /// The application protocol epoch this binary implements.
-pub const APPLICATION_VERSION: u8 = 6;
+pub const APPLICATION_VERSION: u8 = 17;
+
+/// Explicitly admitted Raft peer epochs; version distance alone is not compatibility.
+pub fn raft_peer_compatible(observed: u8) -> bool {
+    // ponytail: current epoch only; add tested epochs within ten versions after all fences support them.
+    [APPLICATION_VERSION].contains(&observed) && APPLICATION_VERSION.abs_diff(observed) <= 10
+}
 
 /// Experimental range used to validate window metadata, not wire admission.
 pub const BACKWARD_COMPAT: u8 = 1;
@@ -30,5 +36,18 @@ pub fn replay_step(prev: Option<u8>, next: u8) -> bool {
     match prev {
         None => wire_compatible(next),
         Some(previous) => sync_compatible(previous, next),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raft_peers_require_explicit_admission() {
+        assert!(raft_peer_compatible(APPLICATION_VERSION));
+        for version in [0, APPLICATION_VERSION - 10, APPLICATION_VERSION - 1, APPLICATION_VERSION + 1, u8::MAX] {
+            assert!(!raft_peer_compatible(version));
+        }
     }
 }

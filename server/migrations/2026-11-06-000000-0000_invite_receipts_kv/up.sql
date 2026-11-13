@@ -1,0 +1,2 @@
+INSERT INTO application_kv(key,value) SELECT 'operator_invite_result/' || request_id, json_object('fingerprint',fingerprint,'result',result) FROM operator_invite_results;
+DROP TABLE operator_invite_results;

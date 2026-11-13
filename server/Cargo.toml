@@ -23,8 +23,6 @@ subtle = "2"
 argon2 = "0.5"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-# ponytail: SQLite storage-v2 adapter pinned; no HA runtime until transport/startup/write routing are wired.
-openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
 
 [dev-dependencies]
 wireguard-control = "1.7.1"

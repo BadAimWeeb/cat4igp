@@ -1,0 +1,3 @@
+CREATE TABLE control_answer_results (node_id INTEGER NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL, expires_at TIMESTAMP NOT NULL, PRIMARY KEY(node_id,request_id));
+INSERT INTO control_answer_results SELECT CAST(substr(rest,1,instr(rest,'/')-1) AS INTEGER),substr(rest,instr(rest,'/')+1),json_extract(value,'$.fingerprint'),json_extract(value,'$.result'),json_extract(value,'$.expires_at') FROM (SELECT substr(key,length('control_answer_result/')+1) AS rest,value FROM application_kv WHERE substr(key,1,length('control_answer_result/'))='control_answer_result/');
+DELETE FROM application_kv WHERE substr(key,1,length('control_answer_result/'))='control_answer_result/';

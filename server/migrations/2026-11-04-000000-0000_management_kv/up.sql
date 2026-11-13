@@ -1,0 +1,8 @@
+DROP TRIGGER management_node_id;
+DROP TRIGGER management_mesh_id;
+DROP TRIGGER management_tunnel_id;
+INSERT INTO application_kv SELECT 'management_id/' || kind, json(high_water) FROM management_ids;
+DROP TABLE management_ids;
+CREATE TRIGGER management_node_id AFTER INSERT ON nodes BEGIN SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM application_kv WHERE key='management_id/node' AND json_type(value)='integer' AND CAST(value AS INTEGER) BETWEEN 0 AND 2147483647) THEN RAISE(ABORT,'invalid management ID') END; UPDATE application_kv SET value = json(max(CAST(value AS INTEGER), NEW.id)) WHERE key = 'management_id/node'; END;
+CREATE TRIGGER management_mesh_id AFTER INSERT ON mesh_groups BEGIN SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM application_kv WHERE key='management_id/mesh' AND json_type(value)='integer' AND CAST(value AS INTEGER) BETWEEN 0 AND 2147483647) THEN RAISE(ABORT,'invalid management ID') END; UPDATE application_kv SET value = json(max(CAST(value AS INTEGER), NEW.id)) WHERE key = 'management_id/mesh'; END;
+CREATE TRIGGER management_tunnel_id AFTER INSERT ON wireguard_tunnels BEGIN SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM application_kv WHERE key='management_id/tunnel' AND json_type(value)='integer' AND CAST(value AS INTEGER) BETWEEN 0 AND 2147483647) THEN RAISE(ABORT,'invalid management ID') END; UPDATE application_kv SET value = json(max(CAST(value AS INTEGER), NEW.id)) WHERE key = 'management_id/tunnel'; END;

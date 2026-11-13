@@ -13,7 +13,7 @@ export class RequestError extends Error {
 }
 
 export type Pending = Readonly<{
-  endpoint: "/admin/actions" | "/admin/invites" | "/admin/replicas/reconcile";
+  endpoint: "/admin/actions" | "/admin/invites";
   body: string;
   key?: string;
   label: string;
@@ -99,23 +99,6 @@ export async function send(pending: Pending) {
     pending.body,
     pending.key,
   )) as Record<string, unknown> | null;
-  if (pending.endpoint === "/admin/replicas/reconcile") {
-    if (
-      !result ||
-      result.committed !== true ||
-      result.semantics !== "durable request receipt; not lease renewal" ||
-      !["roster_revision", "issued_at_ms", "expires_at_ms"].every(
-        (k) => Number.isSafeInteger(result[k]) && (result[k] as number) >= 0,
-      )
-    ) {
-      throw new RequestError(
-        "Unrecognized serving receipt; outcome is unknown. Retry the identical body/ID.",
-        200,
-        "unknown",
-      );
-    }
-    return result;
-  }
   const topology =
     pending.endpoint === "/admin/actions" &&
     [

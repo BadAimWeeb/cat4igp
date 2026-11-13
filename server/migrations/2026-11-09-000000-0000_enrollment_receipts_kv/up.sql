@@ -1,0 +1,3 @@
+CREATE UNIQUE INDEX enrollment_request_id_kv ON application_kv(json_extract(value,'$.request_id')) WHERE substr(key,1,26)='control_enrollment_result/' AND json_extract(value,'$.request_id') <> '';
+INSERT INTO application_kv(key,value) SELECT 'control_enrollment_result/' || peer_id,json_object('request_id',request_id,'fingerprint',fingerprint,'result',result) FROM control_enrollment_results;
+DROP TABLE control_enrollment_results;

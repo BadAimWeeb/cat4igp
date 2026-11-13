@@ -180,7 +180,9 @@ impl WireguardTunnelC {
         // byte 4 takes the last 8 bits of the tunnel ID
         bit_slice[4] = tunnel_id as u8;
 
-        // Bit 21 to bit 36 are reserved for future use. Leave 0 for now.
+        // Preserve existing names for 16-bit IDs; encode the remaining bits for global IDs.
+        bit_slice[5] = (tunnel_id >> 24) as u8;
+        bit_slice[6] = (tunnel_id >> 16) as u8;
 
         let pend = if fec.is_some() {
             Some(SocketAddr::new(
@@ -310,32 +312,15 @@ impl WireguardTunnelC {
         let llipv6 = crate::interface::generate_ipv6_lla_from_seed(ifname.as_bytes().to_vec());
         let current_addrs = crate::interface::get_addr(ifname.clone()).await?;
         let contain_current_addr = current_addrs.iter().find(|a| a.addr() == llipv6).is_some();
-        let filter_addrs: Vec<_> = current_addrs
-            .into_iter()
-            .filter(|a| a.addr() != llipv6)
-            .collect();
 
         if !contain_current_addr {
             crate::interface::add_addr(ifname.clone(), llipv6.into()).await?;
         }
 
-        for addr in filter_addrs {
-            crate::interface::del_addr(ifname.clone(), addr).await?;
+        if self.os_tun.get_mtu().await.is_ok_and(|mtu| mtu != self.mtu as u32) {
+            crate::interface::link_down(ifname.clone()).await?;
         }
-
-        let current_mtu = self.os_tun.get_mtu().await.ok();
-        if let Some(current_mtu) = current_mtu {
-            let current_mtu_i32 = current_mtu as i32;
-
-            if current_mtu_i32 != self.mtu {
-                // bring link down, then link up with new MTU
-                crate::interface::link_down(ifname.clone()).await?;
-                crate::interface::link_up_with_mtu(ifname.clone(), self.mtu as u32).await?;
-            }
-        } else {
-            // if we fail to get MTU, just try to bring link up with new MTU.
-            crate::interface::link_up_with_mtu(ifname.clone(), self.mtu as u32).await?;
-        }
+        crate::interface::link_up_with_mtu(ifname, self.mtu as u32).await?;
 
         Ok(())
     }
@@ -363,6 +348,21 @@ impl WireguardTunnelC {
     pub fn get_listen_port(&self) -> Option<u16> {
         self.os_tun.get_listen_port()
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[tokio::test]
+#[ignore = "requires an isolated network namespace and CAP_NET_ADMIN"]
+async fn matching_mtu_still_brings_wireguard_up() {
+    let output = std::process::Command::new("ip").args(["link", "add", "wgactivate", "type", "wireguard"]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(std::process::Command::new("ip").args(["link", "set", "wgactivate", "mtu", "1420"]).status().unwrap().success());
+    let os = crate::tunnel::wireguard::WireGuardTunnel::new("wgactivate".into(), String::new(), String::new(), None, None);
+    let mut tunnel = WireguardTunnelC::new(1, 2, false, 1420, os, None);
+    tunnel.ensure_up().await.unwrap();
+    let output = std::process::Command::new("ip").args(["-o", "link", "show", "wgactivate"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("UP"));
+    assert!(std::process::Command::new("ip").args(["link", "del", "wgactivate"]).status().unwrap().success());
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -436,4 +436,19 @@ async fn fec_toggle_releases_socket_and_updates_peer() {
     tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
         .await
         .unwrap();
+}
+
+#[test]
+fn wireguard_interface_names_include_full_tunnel_id() {
+    use crate::tunnel::shared::Tunnel;
+    let mut info = WireguardTunnelInfo {
+        tunnel_id: 1, peer_node_id: 2, public_key: String::new(), preferred_port: 0,
+        remote_endpoint: None, local_answered: cat4igp_shared::custom_type::WireguardAnswered::Unanswered,
+        remote_response: cat4igp_shared::custom_type::WireguardAnswered::Unanswered,
+        mtu: 1420, endpoint_ipv6: false, fec: false, faketcp: false, created_at: 0, updated_at: 0,
+    };
+    let first = WireguardTunnelC::gen_new_wg_tunnel(Arc::new(info.clone()), String::new(), None, 0, 0);
+    info.tunnel_id = 65537;
+    let second = WireguardTunnelC::gen_new_wg_tunnel(Arc::new(info), String::new(), None, 0, 0);
+    assert_ne!(first.get_interface_name(), second.get_interface_name());
 }

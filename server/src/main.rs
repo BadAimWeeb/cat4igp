@@ -1,5 +1,5 @@
 mod admin;
-mod cluster;
+mod tunnel;
 
 #[cfg(test)]
 extern crate rand08 as rand;
@@ -22,8 +22,6 @@ mod daemon {
 pub mod db;
 pub mod ext;
 pub mod models;
-pub mod raft_network;
-pub mod raft_storage;
 pub mod router;
 pub mod schema;
 
@@ -458,16 +456,6 @@ fn database_worker(
         let (peer, request, channel) = match job {
             DatabaseJob::Admin { operation, reply } => {
                 let result = match operation {
-                    admin::Operation::Replicas
-                    | admin::Operation::Replica(_)
-                    | admin::Operation::SignedFenceAttestation(..)
-                    | admin::Operation::SignedFenceLifecycle(..)
-                    | admin::Operation::CodeRead => {
-                        Err("cluster administration not available".into())
-                    }
-                    admin::Operation::Mutate(admin::Mutation { action: admin::Action::AttestUpgradeFence { .. }, .. }) => {
-                        Err("cluster administration not available".into())
-                    }
                     admin::Operation::Mutate(command) => admin::apply(&mut conn, &command)
                         .map_err(|_| "unavailable; outcome may be unknown".to_string())
                         .and_then(|result| result)
@@ -475,6 +463,10 @@ fn database_worker(
                             serde_json::from_str(value.as_deref().unwrap_or("null"))
                                 .map_err(|_| "unavailable".into())
                         }),
+                    admin::Operation::RevokeSession(id) => admin::revoke_session(&mut conn, &id)
+                        .map(|_| serde_json::Value::Null).map_err(|_| "unavailable".into()),
+                    operation @ (admin::Operation::Inventory | admin::Operation::Status) =>
+                        admin::local_inventory(&mut conn, operation).map_err(|_| "unavailable".into()),
                     operation => {
                         admin::read(&mut conn, operation).map_err(|_| "unavailable".into())
                     }
@@ -565,200 +557,10 @@ async fn main() -> Result<(), String> {
     dotenv().ok();
     tracing_subscriber::fmt::init();
     let args: Vec<_> = env::args_os().skip(1).collect();
-    if args.as_slice() == ["verify-recovery"] {
-        if env::var("CLUSTER_MAINTENANCE_STOPPED").as_deref() != Ok("true") {
-            return Err("offline verification requires CLUSTER_MAINTENANCE_STOPPED=true".into());
-        }
-        let required = |name| env::var(name).map_err(|_| format!("{name} required"));
-        let report = raft_storage::verify_recovery(
-            &required("RECOVERY_FILE")?, &required("RECOVERY_KIND")?,
-            &required("DISCOVERY_CLUSTER_ID")?, &required("DISCOVERY_SIGNING_KEY")?,
-            &required("RECOVERY_ENCRYPTION_KEY")?,
-        ).map_err(|_| "recovery verification rejected: schema, identity, snapshot or consensus inconsistency (no secrets reported)".to_string())?;
-        println!("{report}");
-        return Ok(());
-    }
-    if args.as_slice() == ["apply-transport-rotation"] {
-        return cluster::offline_transport();
-    }
-    if args.as_slice() == ["discover-replica"] || args.as_slice() == ["join-replica"] {
-        // One-command join: `join-replica --bundle <file>` reads the operator's
-        // join bundle (JSON) and derives every discovery/join parameter from it.
-        // Remaining flags: --address (advertised IP/TCP/p2p endpoint, required),
-        // --node-id (overrides bundle pre-assignment), --identity (identity file,
-        // default next to the config), --config (output path, default ./cluster.json).
-        let mut bundle_path: Option<String> = None;
-        let mut address: Option<String> = None;
-        let mut node_id: Option<u64> = None;
-        let mut identity_path: Option<String> = None;
-        let mut config_path: Option<String> = None;
-        let rest = &args[1..];
-        if rest.first().is_some_and(|a| a == "--bundle") {
-            let mut flags = rest.iter();
-            while let Some(flag) = flags.next() {
-                let Some(value) = flags.next() else {
-                    return Err(format!("missing value for {flag:?}"));
-                };
-                match flag.to_str() {
-                    Some("--bundle") => bundle_path = Some(value.to_string_lossy().into_owned()),
-                    Some("--address") => address = Some(value.to_string_lossy().into_owned()),
-                    Some("--node-id") => {
-                        node_id = Some(value.to_string_lossy().parse().map_err(|_| "invalid --node-id")?)
-                    }
-                    Some("--identity") => identity_path = Some(value.to_string_lossy().into_owned()),
-                    Some("--config") => config_path = Some(value.to_string_lossy().into_owned()),
-                    other => return Err(format!("unknown join flag {other:?}")),
-                }
-            }
-            let bundle_path = bundle_path.ok_or("--bundle <file> is required")?;
-            let bytes = std::fs::read(&bundle_path).map_err(|e| format!("cannot read bundle: {e}"))?;
-            let bundle: cat4igp_shared::discovery::join::Bundle =
-                serde_json::from_slice(&bytes).map_err(|e| format!("invalid bundle: {e}"))?;
-            bundle.validate().map_err(|e| e.to_string())?;
-            let address = address.ok_or("--address <ip/tcp/p2p/PEER_ID> is required")?;
-            let advertised: libp2p::Multiaddr =
-                address.parse().map_err(|_| "invalid --address")?;
-            let identity_path = identity_path.unwrap_or_else(|| {
-                let config = config_path.as_deref().unwrap_or("cluster.json");
-                format!("{}.identity", std::path::Path::new(config).with_extension("").to_string_lossy())
-            });
-            let config_path = config_path.unwrap_or_else(|| "cluster.json".into());
-            // Identity is created mode-0600 on first use; retries reuse it, so the
-            // PeerId stays stable across uncertain-result retries.
-            let key = crate::raft_network::replica_identity(std::path::Path::new(&identity_path))
-                .map_err(|e| e.to_string())?;
-            // Stable request ID persisted next to the identity: exact retries keep
-            // the committed admission, changed payloads fail closed.
-            let request_id_path = format!("{identity_path}.request-id");
-            let request_id = match std::fs::read_to_string(&request_id_path) {
-                Ok(id) => id.trim().to_string(),
-                Err(_) => {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    std::fs::write(&request_id_path, &id)
-                        .map_err(|e| format!("cannot persist request id: {e}"))?;
-                    id
-                }
-            };
-            let node_id = node_id.or(bundle.node_id).ok_or(
-                "no node ID: pass --node-id or ask the operator to pre-assign one in the bundle",
-            )?;
-            let request = cat4igp_shared::discovery::join::Request {
-                application_version: bundle.application_version,
-                cluster_id: bundle.cluster_id,
-                request_id,
-                node_id,
-                address: advertised.clone(),
-                code: bundle.code,
-            };
-            let pin = identity::PublicKey::try_decode_protobuf(&hex_decode(&bundle.signing_key)?)
-                .map_err(|e| e.to_string())?;
-            let response = cat4igp_shared::discovery::join::request(
-                &key,
-                &pin,
-                &[bundle.bootstrap],
-                bundle.minimum_revision,
-                request.clone(),
-            )
-            .await?;
-            // The learner listen address is the advertised endpoint without /p2p.
-            let mut listen = advertised.clone();
-            listen.pop();
-            cluster::save_join(&config_path, identity_path, listen, &request, &response)?;
-            println!(
-                "Committed learner bootstrap saved to {config_path}; start server with CLUSTER_CONFIG_FILE={config_path}, then explicitly activate learner."
-            );
-            return Ok(());
-        }
-        let pin = identity::PublicKey::try_decode_protobuf(&hex_decode(
-            &env::var("DISCOVERY_SIGNING_KEY").map_err(
-                |_| "DISCOVERY_SIGNING_KEY must be a trusted protobuf public key in hex",
-            )?,
-        )?)
-        .map_err(|e| e.to_string())?;
-        let bootstrap = env::var("DISCOVERY_BOOTSTRAP")
-            .map_err(|_| "DISCOVERY_BOOTSTRAP must be a trusted IP/TCP/p2p address")?
-            .parse()
-            .map_err(|_| "invalid discovery bootstrap")?;
-        let cluster =
-            env::var("DISCOVERY_CLUSTER_ID").map_err(|_| "DISCOVERY_CLUSTER_ID must be set")?;
-        let key = if args.as_slice() == ["join-replica"] {
-            let identity_path =
-                env::var("REPLICA_IDENTITY_FILE").map_err(|_| "REPLICA_IDENTITY_FILE required")?;
-            if !std::path::Path::new(&identity_path).is_file() {
-                return Err("join requires an existing distinct replica identity".into());
-            }
-            crate::raft_network::replica_identity(std::path::Path::new(
-                &env::var("REPLICA_IDENTITY_FILE").map_err(|_| "REPLICA_IDENTITY_FILE required")?,
-            ))
-            .map_err(|e| e.to_string())?
-        } else {
-            identity::Keypair::from_protobuf_encoding(&hex_decode(
-            &env::var("DISCOVERY_PRIVATE_KEY").map_err(|_| "DISCOVERY_PRIVATE_KEY must contain the persistent joining transport identity in hex")?,
-        )?).map_err(|e| e.to_string())?
-        };
-        let revision = env::var("DISCOVERY_MINIMUM_REVISION")
-            .map_err(|_| "DISCOVERY_MINIMUM_REVISION must be set")?
-            .parse()
-            .map_err(|_| "invalid discovery minimum revision")?;
-        if args.as_slice() == ["join-replica"] {
-            let request = cat4igp_shared::discovery::join::Request {
-                application_version: cat4igp_shared::discovery::join::APPLICATION_VERSION,
-                cluster_id: cluster,
-                request_id: env::var("REPLICA_JOIN_REQUEST_ID")
-                    .map_err(|_| "stable REPLICA_JOIN_REQUEST_ID required")?,
-                node_id: env::var("REPLICA_NODE_ID")
-                    .map_err(|_| "REPLICA_NODE_ID required")?
-                    .parse()
-                    .map_err(|_| "invalid replica NodeId")?,
-                address: env::var("REPLICA_ADDRESS")
-                    .map_err(|_| "REPLICA_ADDRESS required")?
-                    .parse()
-                    .map_err(|_| "invalid replica address")?,
-                code: env::var("REPLICA_JOIN_CODE").map_err(|_| "REPLICA_JOIN_CODE required")?,
-            };
-            let response = cat4igp_shared::discovery::join::request(
-                &key,
-                &pin,
-                &[bootstrap],
-                revision,
-                request.clone(),
-            )
-            .await?;
-            cluster::save_join(
-                &env::var("CLUSTER_CONFIG_FILE").map_err(|_| "CLUSTER_CONFIG_FILE required")?,
-                env::var("REPLICA_IDENTITY_FILE").map_err(|_| "REPLICA_IDENTITY_FILE required")?,
-                env::var("REPLICA_LISTEN_ADDRESS")
-                    .map_err(|_| "REPLICA_LISTEN_ADDRESS required")?
-                    .parse()
-                    .map_err(|_| "invalid learner listen address")?,
-                &request,
-                &response,
-            )?;
-            println!(
-                "Committed learner bootstrap saved; start server with CLUSTER_CONFIG_FILE, then explicitly activate learner."
-            );
-            return Ok(());
-        }
-        let proof = cat4igp_shared::discovery::transport::discover(
-            &key,
-            &pin,
-            &cluster,
-            cat4igp_shared::discovery::Role::Replica,
-            &[bootstrap],
-            revision,
-        )
-        .await?;
-        println!(
-            "{}",
-            String::from_utf8(cat4igp_shared::discovery::encode(&proof)?)
-                .map_err(|e| e.to_string())?
-        );
-        return Ok(());
-    }
     let manual = match args.as_slice() {
         [] => false,
         [command] if command == "migrate" => true,
-        _ => return Err("usage: cat4igp-server [migrate|discover-replica|join-replica]".into()),
+        _ => return Err("usage: cat4igp-server [migrate]".into()),
     };
     let apply = if manual {
         true
@@ -772,13 +574,12 @@ async fn main() -> Result<(), String> {
     };
     let database_url =
         env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set".to_string())?;
-    if !manual {
-        if let Ok(path) = env::var("CLUSTER_CONFIG_FILE") {
-            return cluster::serve(&path, database_url, apply).await;
-        }
-        if env::var_os("CLUSTER_CONFIG_FILE").is_some() {
-            return Err("CLUSTER_CONFIG_FILE must be UTF-8".into());
-        }
+    if env::var_os("CLUSTER_CONFIG_FILE").is_some() {
+        return Err("CLUSTER_CONFIG_FILE is no longer supported".into());
+    }
+    // ponytail: filesystem paths only for offline inspection; add safe URI handling before supporting URI migrations.
+    if database_url != ":memory:" {
+        db::preflight_raft_database(&database_url)?;
     }
     let mut conn = diesel::SqliteConnection::establish(&database_url)
         .map_err(|e| format!("Cannot open database: {e}"))?;
@@ -788,19 +589,6 @@ async fn main() -> Result<(), String> {
     if manual {
         return Ok(());
     }
-    let mut conn = diesel::SqliteConnection::establish(&database_url).map_err(|e| e.to_string())?;
-    use diesel::RunQueryDsl;
-    #[derive(diesel::QueryableByName)]
-    struct ClusterCount {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        count: i64,
-    }
-    let cluster = diesel::sql_query("SELECT count(*) AS count FROM raft_meta WHERE key = 'replica_binding' OR key = 'vote' OR key = 'applied'")
-        .get_result::<ClusterCount>(&mut conn).map_err(|e| e.to_string())?;
-    if cluster.count != 0 {
-        return Err("cluster database cannot run standalone; configure explicit recovery".into());
-    }
-    drop(conn);
     let (jobs, work) = tokio::sync::mpsc::channel(DATABASE_QUEUE_CAPACITY);
     let control_jobs = jobs.clone();
     let mut control = tokio::spawn(async move {

@@ -17,6 +17,18 @@ fn test_default_config() {
 }
 
 #[test]
+fn l2tp_requires_explicit_opt_in() {
+    let default = ClientConfig::default();
+    assert!(!default.tunnel_protocols.l2tp);
+    assert!(!default.allow_insecure_l2tp);
+    let mut config = toml::to_string(&default).unwrap();
+    config = config.replace("\nl2tp = false", "\nl2tp = true");
+    let parsed: ClientConfig = toml::from_str(&config).unwrap();
+    assert!(parsed.tunnel_protocols.l2tp);
+    assert!(!parsed.allow_insecure_l2tp);
+}
+
+#[test]
 fn packaged_configs_parse() {
     for (sample, data_dir) in [
         (

@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn l2tp_capability_report_binds_identity_network_and_nonce() {
+    let key = identity::Keypair::generate_ed25519();
+    let peer = key.public().to_peer_id();
+    let mut report = L2tpCapabilityReport { version: 1, network_id: "network".into(), node_id: 7,
+        peer_id: peer.to_string(), nonce: "ab".repeat(32), supported: vec![] };
+    let signature = report.sign(&key).unwrap();
+    assert!(report.verify(&key.public(), "network", 7, &peer, &"ab".repeat(32), &signature));
+    assert!(!report.verify(&key.public(), "other", 7, &peer, &"ab".repeat(32), &signature));
+    assert!(!report.verify(&key.public(), "network", 8, &peer, &"ab".repeat(32), &signature));
+    assert!(!report.verify(&key.public(), "network", 7, &peer, &"cd".repeat(32), &signature));
+    report.supported.push("unimplemented".into());
+    assert!(report.sign(&key).is_err());
+    assert!(!report.verify(&key.public(), "network", 7, &peer, &"ab".repeat(32), &signature));
+    assert!(serde_json::from_str::<L2tpCapabilityReport>(r#"{"version":1,"network_id":"network","node_id":7,"peer_id":"x","nonce":"x","supported":[],"extra":true}"#).is_err());
+}
+
+#[test]
 fn rejects_expired_or_malformed_messages() {
     let meta = MessageMeta {
         message_id: "a".repeat(32),
@@ -45,6 +62,24 @@ fn topology_topics_are_versioned_and_recipient_specific() {
 }
 
 #[test]
+fn l2tp_status_is_fail_closed_for_legacy_snapshots() {
+    let legacy = r#"{"node_id":1,"revision":1,"tunnels":[]}"#;
+    let snapshot: TopologySnapshot = serde_json::from_str(legacy).unwrap();
+    assert!(snapshot.l2tp_availability.is_none());
+    assert!(snapshot.l2tp_v2_tunnels.is_empty());
+    assert_eq!(serde_json::to_string(&snapshot).unwrap(), legacy);
+    let current = r#"{"node_id":1,"revision":1,"tunnels":[],"l2tp_availability":{"v2":false,"v3":false}}"#;
+    let snapshot: TopologySnapshot = serde_json::from_str(current).unwrap();
+    let availability = snapshot.l2tp_availability.unwrap();
+    assert!(!availability.v2 && !availability.v3);
+    assert!(serde_json::from_str::<TopologySnapshot>(r#"{"node_id":1,"revision":1,"tunnels":[],"l2tp_availability":{"v2":false}}"#).is_err());
+    let info = L2tpV2TunnelInfo { tunnel_id: 1, peer_node_id: 2, wireguard_tunnel_id: None, local_endpoint: "192.0.2.1".into(), remote_endpoint: "192.0.2.2".into(), local_port: 1701, remote_port: 1702, local_address: "10.0.0.1".into(), remote_address: "10.0.0.2".into(), secret: "private".into(), mtu: 1400, initiator: true };
+    assert!(!format!("{info:?}").contains("private"));
+    let snapshot: TopologySnapshot = serde_json::from_value(serde_json::json!({"node_id":1,"revision":1,"tunnels":[],"l2tp_v2_tunnels":[info]})).unwrap();
+    assert_eq!(snapshot.l2tp_v2_tunnels[0].secret, "private");
+}
+
+#[test]
 fn encrypted_snapshot_rejects_tampering() {
     let signing = identity::Keypair::generate_ed25519();
     let private = x25519_dalek::StaticSecret::random_from_rng(rand08::rngs::OsRng);
@@ -53,6 +88,9 @@ fn encrypted_snapshot_rejects_tampering() {
         node_id: 7,
         revision: 1,
         tunnels: Vec::new(),
+        l2tp_tunnels: Vec::new(),
+        l2tp_v2_tunnels: Vec::new(),
+        l2tp_availability: None,
     };
     let envelope = seal_topology_snapshot(
         &signing,

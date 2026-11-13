@@ -7,14 +7,12 @@ import {
   type Pending,
 } from "./api/request";
 import { inventoryFrom, integer, type Inventory } from "./api/inventory";
-import { Replicas } from "./pages/Replicas";
-import { type ReplicaAction } from "./api/replicas";
 import { IconAction } from "./components/Controls";
 import { Login } from "./pages/Login";
 import { Nodes, RenameNode } from "./pages/Nodes";
 import { Meshes, CreateMesh } from "./pages/Meshes";
 import { Memberships, type MembershipScope } from "./pages/Memberships";
-import { Tunnels } from "./pages/Tunnels";
+import { Tunnels, L2tpTunnels, L2tpV2Tunnels } from "./pages/Tunnels";
 import { Invites, CreateInvite, InviteCode } from "./pages/Invites";
 import { preferredMode, themeKey, type Mode } from "./theme";
 import {
@@ -83,7 +81,7 @@ const makeTheme = (mode: Mode) =>
   });
 
 const inventoryTabs = ["Nodes", "Meshes", "Invites", "Tunnels"] as const;
-const tabs = [...inventoryTabs, "Replicas"] as const;
+const tabs = inventoryTabs;
 type Tab = (typeof tabs)[number];
 
 function checkedName(name: string) {
@@ -125,8 +123,6 @@ export function App() {
   }>();
   // ponytail: one memory-only pending action; add secure durable recovery if reload survival is required.
   const [pending, setPending] = useState<Pending>();
-  const [replicaUnknown, setReplicaUnknown] = useState<ReplicaAction>();
-  const [replicaRefresh, setReplicaRefresh] = useState(0);
   const [code, setCode] = useState("");
   const heading = useRef<HTMLHeadingElement>(null);
   const lock = useRef(false);
@@ -208,7 +204,9 @@ export function App() {
   }
   useEffect(() => {
     void resume();
-    return () => { inventoryGeneration.current++; };
+    return () => {
+      inventoryGeneration.current++;
+    };
   }, []);
   useEffect(() => {
     if (session === "in") void refresh();
@@ -217,14 +215,14 @@ export function App() {
     heading.current?.focus();
   }, [session, tab, scope]);
   useEffect(() => {
-    if (!pending && !replicaUnknown) return;
+    if (!pending) return;
     const warn = (event: BeforeUnloadEvent) => {
       event.preventDefault();
       event.returnValue = "";
     };
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
-  }, [pending, replicaUnknown]);
+  }, [pending]);
 
   async function login(event: FormEvent<HTMLFormElement>) {
     const form = event.currentTarget;
@@ -306,26 +304,12 @@ export function App() {
       setPending(undefined);
       if (action.endpoint === "/admin/invites")
         setCode(result.invite_code as string);
-      setNotice(
-        action.endpoint === "/admin/replicas/reconcile"
-          ? `Historical serving receipt: revision ${result.roster_revision} · issued ${result.issued_at_ms} · expires ${result.expires_at_ms} (Unix ms). Not current serving status; replay does not renew the lease.`
-          : `${action.label} committed.`,
-      );
-      if (action.endpoint === "/admin/replicas/reconcile")
-        setReplicaRefresh((v) => v + 1);
+      setNotice(`${action.label} committed.`);
       await refresh();
     } catch (e) {
       if (e instanceof RequestError && e.outcome === "rejected")
         setPending(undefined);
-      failed(
-        action.endpoint === "/admin/replicas/reconcile" &&
-          e instanceof RequestError &&
-          e.status === 409
-          ? new Error(
-              "Serving grant rejected (409): stale roster revision or binding/gateway/voter prerequisite conflict. Refresh replicas, inspect the binding, then explicitly submit a new intent. No new UUID/revision was allocated automatically.",
-            )
-          : e,
-      );
+      failed(e);
     } finally {
       lock.current = false;
       setBusy(false);
@@ -336,7 +320,7 @@ export function App() {
     payload: object,
     label: string,
   ) {
-    if (pending || replicaUnknown || lock.current) return;
+    if (pending || lock.current) return;
     try {
       const action = prepare(endpoint, payload, label);
       setPending(action);
@@ -345,23 +329,24 @@ export function App() {
       failed(e);
     }
   }
-  function grant(action: Pending) {
-    if (pending || replicaUnknown || lock.current) return;
-    setPending(action);
-    void attempt(action);
-  }
   function cancel() {
     if (busy) return;
-    ask("Forget this retry", "This does NOT undo a committed action. A new submission uses a new UUID/key and could duplicate creation or issue a new serving lease. Refresh inventory first.", () => {
-      if (lock.current) return;
-      setPending(undefined);
-      setNotice("Retry forgotten, not rolled back. Inspect inventory before submitting a new action.");
-      setError("");
-    });
+    ask(
+      "Forget this retry",
+      "This does NOT undo a committed action. A new submission uses a new UUID/key and could duplicate creation or issue a new serving lease. Refresh inventory first.",
+      () => {
+        if (lock.current) return;
+        setPending(undefined);
+        setNotice(
+          "Retry forgotten, not rolled back. Inspect inventory before submitting a new action.",
+        );
+        setError("");
+      },
+    );
   }
   function rename(event: FormEvent<HTMLFormElement>, id: number) {
     const values = fields(event);
-    if (pending || replicaUnknown || lock.current || loading) return;
+    if (pending || lock.current || loading) return;
     try {
       const name = checkedName(String(values.get("name")));
       start(
@@ -413,7 +398,9 @@ export function App() {
         max_uses !== null &&
         (!integer(max_uses) || max_uses < 1 || max_uses > 2147483647)
       )
-        throw new Error("Maximum uses must be 0 (unlimited), blank, or an integer from 1 to 2147483647.");
+        throw new Error(
+          "Maximum uses must be 0 (unlimited), blank, or an integer from 1 to 2147483647.",
+        );
       if (
         join_mesh !== null &&
         (!integer(join_mesh) || !data?.meshes.some((m) => m.id === join_mesh))
@@ -453,13 +440,13 @@ export function App() {
     );
   }
   function confirmed(payload: object, label: string, warning: string) {
-    if (pending || replicaUnknown || lock.current || loading) return;
+    if (pending || lock.current || loading) return;
     ask(label, warning, () => start("/admin/actions", payload, label));
   }
   function ask(label: string, warning: string, proceed: () => void) {
     setConfirmation({ label, warning, proceed });
   }
-  const disabled = busy || !!pending || !!replicaUnknown || loading;
+  const disabled = busy || !!pending || loading;
   const meshName = (id: number | null) =>
     id === null
       ? "Any mesh"
@@ -499,16 +486,8 @@ export function App() {
                   }}
                 >
                   <ListItemText primary={t} />
-                  <span
-                    className="view-count"
-                    aria-label={
-                      t === "Replicas" ? "High availability" : `${t} count`
-                    }
-                  >
-                    {t === "Replicas"
-                      ? "HA"
-                      : (data?.[t.toLowerCase() as keyof Inventory].length ??
-                        "—")}
+                  <span className="view-count" aria-label={`${t} count`}>
+                    {data?.[t.toLowerCase() as keyof Inventory].length ?? "—"}
                   </span>
                 </ListItemButton>
               </ListItem>
@@ -595,11 +574,9 @@ export function App() {
                 {pending.label}
               </h2>
               <p>
-                The outcome may be unknown.{" "}
-                {pending.endpoint === "/admin/replicas/reconcile"
-                  ? "Retry sends the frozen JSON body with the same request_id and expected roster revision, without Idempotency-Key. A durable historical receipt never renews the lease or proves current serving."
-                  : "Retry sends the identical body and idempotency key; it will not intentionally create a second operation."}{" "}
-                Identity: administrator:1.{" "}
+                The outcome may be unknown. Retry sends the identical body and
+                idempotency key; it will not intentionally create a second
+                operation. Identity: administrator:1.{" "}
                 {session !== "in" && "Sign in as the same administrator first."}
               </p>
               <p>
@@ -621,12 +598,6 @@ export function App() {
               </div>
             </Paper>
           )}
-          {replicaUnknown && tab !== "Replicas" && (
-            <p role="status">
-              An unresolved desired-state operation blocks new writes. Open
-              Replicas to inspect and manually resume or dismiss it.
-            </p>
-          )}
           {session === "checking" ? (
             <p role="status">Checking your session…</p>
           ) : session === "out" ? (
@@ -638,27 +609,12 @@ export function App() {
                   <Paper className="metric" key={t}>
                     <span>{t}</span>
                     <strong>
-                      {data?.[t.toLowerCase() as keyof Inventory].length ?? "—"}
+                      {data ? (t === "Tunnels" ? data.tunnels.length + data.l2tp_tunnels.length + data.l2tp_v2_tunnels.length : data[t.toLowerCase() as "nodes" | "meshes" | "invites"].length) : "—"}
                     </strong>
                   </Paper>
                 ))}
               </div>
-              {tab === "Replicas" && (
-                <Replicas
-                  blocked={busy || !!pending}
-                  lock={lock}
-                  setBusy={setBusy}
-                  failed={failed}
-                  grant={grant}
-                  refreshVersion={replicaRefresh}
-                  unknown={replicaUnknown}
-                  setUnknown={setReplicaUnknown}
-                  ask={ask}
-                />
-              )}
-              {loading && (
-                <p role="status">Loading quorum-confirmed inventory…</p>
-              )}
+              {loading && <p role="status">Loading server inventory…</p>}
               {!loading && !data && (
                 <Paper component="section" className="panel">
                   <h2>Inventory unavailable</h2>
@@ -667,7 +623,7 @@ export function App() {
                   </p>
                 </Paper>
               )}
-              {data && tab !== "Replicas" && (
+              {data && (
                 <>
                   <Paper
                     component="section"
@@ -707,20 +663,20 @@ export function App() {
                         meshName={meshName}
                         manage={(id) => setScope({ kind: "mesh", id })}
                         edit={(mesh) => setEditing({ ...mesh, kind: "mesh" })}
-                        setMtu={(id, mtu) => start(
-                          "/admin/actions",
-                          { action: "set_mesh_mtu", id, mtu },
-                          `Update WireGuard MTU for ${meshName(id)}`,
-                        )}
+                        setMtu={(id, mtu) =>
+                          start(
+                            "/admin/actions",
+                            { action: "set_mesh_mtu", id, mtu },
+                            `Update WireGuard MTU for ${meshName(id)}`,
+                          )
+                        }
                       />
                     ) : tab === "Tunnels" ? (
-                      <Tunnels
-                        tunnels={data.tunnels}
-                        disabled={disabled}
-                        confirmed={confirmed}
-                        meshName={meshName}
-                        nodeName={nodeName}
-                      />
+                      <>
+                        <Tunnels tunnels={data.tunnels} disabled={disabled} confirmed={confirmed} meshName={meshName} nodeName={nodeName} />
+                        <L2tpTunnels data={data} disabled={disabled} confirmed={confirmed} nodeName={nodeName} />
+                        <L2tpV2Tunnels data={data} disabled={disabled} confirmed={confirmed} nodeName={nodeName} />
+                      </>
                     ) : tab === "Invites" ? (
                       <Invites
                         invites={data.invites}
@@ -752,8 +708,8 @@ export function App() {
               <section className="upcoming">
                 <span className="tag">NOT AVAILABLE</span>
                 <p>
-                  Replica admission submission, transport rotation, observed
-                  health, and password management are not available here.
+                  Distributed server administration, transport rotation, observed
+                    health, and password management are not available in standalone mode.
                 </p>
               </section>
             </>
@@ -777,19 +733,32 @@ export function App() {
         fullWidth
         maxWidth="sm"
       >
-        <DialogTitle id="confirmation-title">{confirmation?.label}?</DialogTitle>
+        <DialogTitle id="confirmation-title">
+          {confirmation?.label}?
+        </DialogTitle>
         <DialogContent>
-          <DialogContentText id="confirmation-warning" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+          <DialogContentText
+            id="confirmation-warning"
+            sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+          >
             {confirmation?.warning}
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button autoFocus onClick={() => setConfirmation(undefined)}>Cancel</Button>
-          <Button variant="contained" disabled={busy || loading} onClick={() => {
-            const proceed = confirmation?.proceed;
-            setConfirmation(undefined);
-            proceed?.();
-          }}>Confirm</Button>
+          <Button autoFocus onClick={() => setConfirmation(undefined)}>
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            disabled={busy || loading}
+            onClick={() => {
+              const proceed = confirmation?.proceed;
+              setConfirmation(undefined);
+              proceed?.();
+            }}
+          >
+            Confirm
+          </Button>
         </DialogActions>
       </Dialog>
     </ThemeProvider>

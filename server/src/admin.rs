@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::schema::{
-    administrator, administrator_results, control_answer_results, control_enrollment_results,
-    invites, mesh_group_memberships, mesh_groups, node_control_identities, node_revocations, nodes,
-    operator_invite_results, tunnel_intents, wireguard_static_key, wireguard_tunnels,
+    application_kv,
+    invites, mesh_group_memberships, mesh_groups, node_control_identities, nodes,
+    tunnel_intents, wireguard_tunnels,
 };
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::{
@@ -29,42 +29,11 @@ const LIFE: u64 = 900;
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum Operation {
     Account,
+    SessionRevoked(String),
+    RevokeSession(String),
     Inventory,
     Status,
-    Replicas,
-    CodeRead,
-    Replica(ReplicaAction),
     Mutate(Mutation),
-    SignedFenceAttestation(SignedFenceEnvelope, String),
-    SignedFenceLifecycle(SignedLifecycleEnvelope, String),
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum ReplicaAction {
-    EnrollmentCode,
-    RotateEnrollmentCode {
-        expected_generation: u64,
-    },
-    JoinBundle {
-        bootstrap: libp2p::Multiaddr,
-    },
-    ActivateLearner {
-        node_id: u64,
-    },
-    PromoteLearner {
-        node_id: u64,
-    },
-    RevokeReplica {
-        node_id: u64,
-    },
-    GrantServing {
-        node_id: u64,
-        expected_roster_revision: u64,
-        public_address: libp2p::Multiaddr,
-        control_address: libp2p::Multiaddr,
-        request_id: String,
-    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -72,74 +41,6 @@ pub(crate) struct Mutation {
     pub request_id: String,
     pub action: Action,
     pub applied_at: chrono::NaiveDateTime,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SignedFenceAttestation {
-    pub(crate) cluster_id: String,
-    pub(crate) subject: String,
-    pub(crate) request_id: String,
-    pub(crate) prepare: crate::raft_storage::FencePrepare,
-    pub(crate) externally_fenced: bool,
-    pub(crate) issued_at: u64,
-    pub(crate) expires_at: u64,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SignedFenceEnvelope {
-    pub(crate) body: SignedFenceAttestation,
-    pub(crate) signature: Vec<u8>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SignedLifecycle {
-    pub(crate) cluster_id: String,
-    pub(crate) subject: String,
-    pub(crate) request_id: String,
-    pub(crate) action: crate::raft_storage::FenceLifecycle,
-    pub(crate) issued_at: u64,
-    pub(crate) expires_at: u64,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SignedLifecycleEnvelope {
-    pub(crate) body: SignedLifecycle,
-    pub(crate) signature: Vec<u8>,
-}
-
-pub(crate) fn verify_lifecycle(body: &SignedLifecycle, signature: &[u8], key: &libp2p::identity::PublicKey, cluster: &str, now: u64) -> bool {
-    key.clone().try_into_ed25519().is_ok() && signature.len() == 64
-        && !cluster.is_empty() && cluster.len() <= 128 && body.cluster_id == cluster
-        && body.subject == "administrator:1" && body.request_id.starts_with("admin:1:")
-        && body.request_id.len() > 8 && body.request_id.len() <= 108 && body.request_id.is_ascii()
-        && body.issued_at <= now && body.expires_at > now
-        && body.expires_at.checked_sub(body.issued_at).is_some_and(|duration| duration <= 300)
-        && serde_json::to_vec(&("cat4igp/admin/fence-lifecycle/v1", body)).is_ok_and(|bytes| bytes.len() <= 64 * 1024 && key.verify(&bytes, signature))
-}
-
-pub(crate) fn verify_fence_attestation(
-    body: &SignedFenceAttestation,
-    signature: &[u8],
-    key: &libp2p::identity::PublicKey,
-    cluster_id: &str,
-    now: u64,
-) -> bool {
-    if key.clone().try_into_ed25519().is_err() || signature.len() != 64
-        || cluster_id.is_empty() || cluster_id.len() > 128 || body.cluster_id != cluster_id
-        || body.subject != "administrator:1" || !body.request_id.starts_with("admin:1:")
-        || body.request_id.len() <= "admin:1:".len() || body.request_id.len() > 108
-        || !body.request_id.is_ascii() || !body.externally_fenced
-        || body.issued_at > now || body.expires_at <= now
-        || body.expires_at.checked_sub(body.issued_at).is_none_or(|lifetime| lifetime > 300)
-    {
-        return false;
-    }
-    serde_json::to_vec(&("cat4igp/admin/fence-attestation/v1", body))
-        .is_ok_and(|bytes| bytes.len() <= 64 * 1024 && key.verify(&bytes, signature))
 }
 
 impl std::fmt::Debug for Mutation {
@@ -151,12 +52,6 @@ impl std::fmt::Debug for Mutation {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Action {
-    // ponytail: records an assertion only; require all-member fencing before activation.
-    AttestUpgradeFence {
-        #[serde(deserialize_with = "deserialize_prepare")]
-        prepare: crate::raft_storage::FencePrepare,
-        externally_fenced: bool,
-    },
     Bootstrap {
         username: String,
         password_hash: String,
@@ -205,12 +100,27 @@ pub(crate) enum Action {
         tunnel_id: i32,
         kind: IntentKind,
     },
+    CreateL2tpTunnel {
+        node_id_peer1: i32, node_id_peer2: i32,
+        endpoint_peer1: String, endpoint_peer2: String,
+        udp_port_peer1: u16, udp_port_peer2: u16,
+        session_id_peer1: u32, session_id_peer2: u32,
+        cookie_peer1: String, cookie_peer2: String,
+        security_mode: String, wireguard_tunnel_id: Option<i32>, mtu: i32,
+    },
+    DeleteL2tpTunnel { id: i32 },
+    CreateL2tpV2Tunnel {
+        node_id_peer1: i32, node_id_peer2: i32,
+        endpoint_peer1: String, endpoint_peer2: String,
+        udp_port_peer1: u16, udp_port_peer2: u16,
+        address_peer1: String, address_peer2: String,
+        secret: String, mtu: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wireguard_tunnel_id: Option<i32>,
+    },
+    DeleteL2tpV2Tunnel { id: i32 },
 }
 
-fn deserialize_prepare<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<crate::raft_storage::FencePrepare, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    serde_json::from_value(value).map_err(serde::de::Error::custom)
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -275,18 +185,24 @@ fn invalidate_invites(
     let codes = invites::table
         .select(invites::code.nullable())
         .into_boxed()
-        .filter(selection);
-    diesel::update(
-        operator_invite_results::table
-            .filter(json_functions::text(operator_invite_results::result, "$.Ok").eq_any(codes)),
-    )
-    .set(operator_invite_results::result.eq(serde_json::to_string(
-        &Result::<String, String>::Err(reason.into()),
-    )?))
-    .execute(conn)?;
+        .filter(selection).load::<Option<String>>(conn)?;
+    let result = serde_json::to_string(&Result::<String, String>::Err(reason.into()))?;
+    for code in codes.into_iter().flatten() {
+        diesel::sql_query("UPDATE application_kv SET value=json_set(value,'$.result',?) WHERE substr(key,1,23)='operator_invite_result/' AND json_extract(json_extract(value,'$.result'),'$.Ok')=?")
+            .bind::<Text, _>(&result).bind::<Text, _>(code).execute(conn)?;
+    }
     diesel::delete(invites::table.filter(deletion)).execute(conn)?;
     Ok(())
 }
+
+fn tunnel_ports_in_use(conn: &mut diesel::SqliteConnection, peers: [(i32, u16); 2]) -> Result<bool, Error> {
+    let used = |node1: i32, port1: i32, node2: i32, port2: i32| {
+        peers.iter().any(|&(node, port)| (node == node1 && i32::from(port) == port1) || (node == node2 && i32::from(port) == port2))
+    };
+    Ok(crate::db::all_l2tp_rows(conn)?.iter().any(|r| used(r.node_id_peer1, r.udp_port_peer1, r.node_id_peer2, r.udp_port_peer2))
+        || crate::db::l2tp_v2_rows(conn)?.iter().any(|r| used(r.node_id_peer1, r.udp_port_peer1, r.node_id_peer2, r.udp_port_peer2)))
+}
+
 
 fn topology_mutation(
     conn: &mut diesel::SqliteConnection,
@@ -311,10 +227,65 @@ fn topology_mutation(
             && diesel::select(exists(wireguard_tunnels::table.find(tunnel_id)))
                 .get_result::<bool>(conn)?))
         .then_some("tunnel not found"),
+        Action::CreateL2tpTunnel { node_id_peer1, node_id_peer2, .. } | Action::CreateL2tpV2Tunnel { node_id_peer1, node_id_peer2, .. } => (node_id_peer1 == node_id_peer2 || *node_id_peer1 <= 0 || *node_id_peer2 <= 0 || !diesel::select(exists(nodes::table.find(node_id_peer1))).get_result::<bool>(conn)? || !diesel::select(exists(nodes::table.find(node_id_peer2))).get_result::<bool>(conn)?).then_some("node not found or identical"),
+        Action::DeleteL2tpTunnel { id } => (!crate::db::l2tp_rows(conn)?.iter().any(|row| row.id == *id)).then_some("L2TP tunnel not found"),
+        Action::DeleteL2tpV2Tunnel { id } => (!crate::db::l2tp_v2_rows(conn)?.iter().any(|row| row.id == *id)).then_some("L2TPv2 tunnel not found"),
         _ => return Err("not a topology mutation".into()),
     };
     if let Some(message) = missing {
         return Ok(Err(message.into()));
+    }
+    if let Action::CreateL2tpV2Tunnel { node_id_peer1, node_id_peer2, endpoint_peer1, endpoint_peer2, udp_port_peer1, udp_port_peer2, address_peer1, address_peer2, secret, mtu, wireguard_tunnel_id } = &command.action {
+        let ipv4 = |s: &str| s.parse::<std::net::Ipv4Addr>().ok().filter(|v| !v.is_unspecified() && !v.is_multicast() && !v.is_broadcast() && !v.is_loopback() && !v.is_link_local() && v.octets()[0] != 0 && v.octets()[0] < 240);
+        let (a, b) = (ipv4(endpoint_peer1), ipv4(endpoint_peer2));
+        let (p, q) = (ipv4(address_peer1), ipv4(address_peer2));
+        if a.is_none() || b.is_none() || a == b || p.is_none() || q.is_none() || p == q || *udp_port_peer1 == 0 || *udp_port_peer2 == 0 || !(1280..=if wireguard_tunnel_id.is_some() { 65000 } else { 1500 }).contains(mtu) || secret.is_empty() || secret.len() > 255 || !secret.bytes().all(|b| (b'!'..=b'~').contains(&b) && !matches!(b, b'"' | b'\\' | b'#')) {
+            return Ok(Err("invalid L2TPv2 endpoints, PPP addresses, secret or MTU".into()));
+        }
+        if let Some(id) = wireguard_tunnel_id {
+            if !crate::tunnel::supports_underlay(conn, *id, (*node_id_peer1, *node_id_peer2), "wireguard")? { return Ok(Err("WireGuard tunnel must connect the same nodes".into())); }
+            let endpoints = [a.unwrap(), b.unwrap()];
+            if crate::db::l2tp_v2_rows(conn)?.iter().filter(|r| r.wireguard_tunnel_id.is_some()).any(|r| [&r.endpoint_peer1, &r.endpoint_peer2].iter().any(|s| s.parse::<std::net::Ipv4Addr>().ok().is_some_and(|ip| endpoints.contains(&ip))))
+                || crate::db::all_l2tp_rows(conn)?.iter().filter(|r| r.wireguard_tunnel_id.is_some()).any(|r| [&r.endpoint_peer1, &r.endpoint_peer2].iter().any(|s| s.parse::<std::net::Ipv4Addr>().ok().is_some_and(|ip| endpoints.contains(&ip)))) {
+                return Ok(Err("WireGuard L2TP address already in use".into()));
+            }
+            let outer = wireguard_tunnels::table.select((wireguard_tunnels::endpoint_peer1, wireguard_tunnels::endpoint_peer2)).load::<(Option<String>, Option<String>)>(conn)?;
+            if outer.iter().flat_map(|(x,y)| [x,y]).flatten().filter_map(|s| s.parse::<std::net::SocketAddr>().ok()).any(|s| matches!(s.ip(), std::net::IpAddr::V4(ip) if endpoints.contains(&ip))) {
+                return Ok(Err("WireGuard L2TP address conflicts with an outer endpoint".into()));
+            }
+        }
+        if tunnel_ports_in_use(conn, [(*node_id_peer1, *udp_port_peer1), (*node_id_peer2, *udp_port_peer2)])? { return Ok(Err("L2TP UDP port already used on node".into())); }
+    }
+    if let Action::CreateL2tpTunnel { node_id_peer1, node_id_peer2, endpoint_peer1, endpoint_peer2, udp_port_peer1, udp_port_peer2, session_id_peer1, session_id_peer2, cookie_peer1, cookie_peer2, security_mode, wireguard_tunnel_id, mtu } = &command.action {
+        let address = |s: &str| s.parse::<std::net::IpAddr>().ok().filter(|ip| match ip {
+            std::net::IpAddr::V4(v) => !v.is_unspecified() && !v.is_multicast() && !v.is_broadcast() && !v.is_loopback(),
+            std::net::IpAddr::V6(v) => !v.is_unspecified() && !v.is_multicast() && !v.is_loopback() && !v.is_unicast_link_local() && v.to_ipv4_mapped().is_none(),
+        });
+        let a = address(endpoint_peer1); let b = address(endpoint_peer2);
+        let cookie = |s: &str| s.len() == 16 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if a.is_none() || b.is_none() || a == b || a.unwrap().is_ipv4() != b.unwrap().is_ipv4() || *udp_port_peer1 == 0 || *udp_port_peer2 == 0 || *session_id_peer1 == 0 || *session_id_peer2 == 0 || !cookie(cookie_peer1) || !cookie(cookie_peer2) || !(576..=65477).contains(mtu) {
+            return Ok(Err("invalid L2TP endpoints, session, cookie or MTU".into()));
+        }
+        if tunnel_ports_in_use(conn, [(*node_id_peer1, *udp_port_peer1), (*node_id_peer2, *udp_port_peer2)])? { return Ok(Err("L2TP UDP port already used on node".into())); }
+        match (security_mode.as_str(), wireguard_tunnel_id) {
+            ("pure", None) => {},
+            ("wireguard", Some(id)) => {
+                if crate::db::l2tp_v2_rows(conn)?.iter().filter(|r| r.wireguard_tunnel_id.is_some()).any(|r| [&r.endpoint_peer1, &r.endpoint_peer2].iter().any(|s| s.parse::<std::net::IpAddr>().ok().is_some_and(|ip| Some(ip) == a || Some(ip) == b))) {
+                    return Ok(Err("WireGuard L2TP address already in use".into()));
+                }
+                for row in crate::db::all_l2tp_rows(conn)?.iter().filter(|row| row.security_mode == "wireguard") {
+                    for (ip, node) in [(a, *node_id_peer1), (b, *node_id_peer2)] {
+                        for (other, owner) in [(&row.endpoint_peer1, row.node_id_peer1), (&row.endpoint_peer2, row.node_id_peer2)] {
+                            if other.parse::<std::net::IpAddr>().ok() == ip && (owner != node || row.wireguard_tunnel_id != Some(*id)) {
+                                return Ok(Err("WireGuard L2TP address belongs to another node or tunnel".into()));
+                            }
+                        }
+                    }
+                }
+                if !crate::tunnel::supports_underlay(conn, *id, (*node_id_peer1, *node_id_peer2), "wireguard")? { return Ok(Err("WireGuard tunnel must connect the same nodes".into())); }
+            },
+            _ => return Ok(Err("invalid L2TP security mode".into())),
+        }
     }
     if let Action::SetMeshFec { id, fec: true } = &command.action {
         if !mesh_groups::table.find(id).select(mesh_groups::auto_wireguard).first::<bool>(conn)? {
@@ -364,6 +335,32 @@ fn topology_mutation(
         })
         .collect::<Result<Vec<_>, Error>>()?;
     match &command.action {
+        Action::CreateL2tpV2Tunnel { node_id_peer1, node_id_peer2, endpoint_peer1, endpoint_peer2, udp_port_peer1, udp_port_peer2, address_peer1, address_peer2, secret, mtu, wireguard_tunnel_id } => {
+            let id = crate::db::next_management_id(conn, "tunnel")?;
+            diesel::sql_query("INSERT INTO l2tpv2_tunnels VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+                .bind::<Integer,_>(id).bind::<Integer,_>(node_id_peer1).bind::<Integer,_>(node_id_peer2)
+                .bind::<Text,_>(endpoint_peer1).bind::<Text,_>(endpoint_peer2)
+                .bind::<Integer,_>(i32::from(*udp_port_peer1)).bind::<Integer,_>(i32::from(*udp_port_peer2))
+                .bind::<Text,_>(address_peer1).bind::<Text,_>(address_peer2).bind::<Text,_>(secret).bind::<Integer,_>(mtu).bind::<Nullable<Integer>,_>(wireguard_tunnel_id).execute(conn)?;
+        }
+        Action::DeleteL2tpV2Tunnel { id } => {
+            diesel::sql_query("DELETE FROM l2tpv2_tunnels WHERE id=?").bind::<Integer,_>(id).execute(conn)?;
+        }
+        Action::CreateL2tpTunnel { node_id_peer1, node_id_peer2, endpoint_peer1, endpoint_peer2, udp_port_peer1, udp_port_peer2, session_id_peer1, session_id_peer2, cookie_peer1, cookie_peer2, security_mode, wireguard_tunnel_id, mtu } => {
+            let id = crate::db::next_management_id(conn, "tunnel")?;
+            diesel::sql_query("INSERT INTO l2tpv3_tunnels VALUES (?,'static',?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                .bind::<Integer,_>(id).bind::<Integer,_>(node_id_peer1).bind::<Integer,_>(node_id_peer2)
+                .bind::<Text,_>(endpoint_peer1).bind::<Text,_>(endpoint_peer2)
+                .bind::<Integer,_>(i32::from(*udp_port_peer1)).bind::<Integer,_>(i32::from(*udp_port_peer2))
+                .bind::<diesel::sql_types::BigInt,_>(i64::from(*session_id_peer1)).bind::<diesel::sql_types::BigInt,_>(i64::from(*session_id_peer2))
+                .bind::<Text,_>(cookie_peer1).bind::<Text,_>(cookie_peer2).bind::<Text,_>(security_mode)
+                .bind::<Nullable<Integer>,_>(wireguard_tunnel_id).bind::<Integer,_>(mtu).execute(conn)?;
+            diesel::insert_into(application_kv::table).values((application_kv::key.eq(format!("l2tp_active/{id}")), application_kv::value.eq("true"))).execute(conn)?;
+        }
+        Action::DeleteL2tpTunnel { id } => {
+            diesel::delete(application_kv::table.find(format!("l2tp_active/{id}"))).execute(conn)?;
+            diesel::sql_query("DELETE FROM l2tpv3_tunnels WHERE id=?").bind::<Integer,_>(id).execute(conn)?;
+        }
         Action::SetMeshFec { id, fec } => {
             diesel::update(mesh_groups::table.find(id))
                 .set(mesh_groups::auto_wireguard_fec.eq(fec))
@@ -439,48 +436,13 @@ fn topology_mutation(
             diesel::delete(mesh_groups::table.find(id)).execute(conn)?;
         }
         Action::DeleteNode { id } => {
-            diesel::insert_or_ignore_into(node_revocations::table)
-                .values(
-                    node_control_identities::table
-                        .filter(node_control_identities::node_id.eq(id))
-                        .select((
-                            node_control_identities::peer_id,
-                            node_control_identities::node_id,
-                            command
-                                .applied_at
-                                .into_sql::<diesel::sql_types::Timestamp>(),
-                        )),
-                )
-                .into_columns((
-                    node_revocations::peer_id,
-                    node_revocations::node_id,
-                    node_revocations::revoked_at,
-                ))
-                .execute(conn)?;
-            // Enrollment results contain the original identity even for pre-control legacy records.
-            diesel::insert_or_ignore_into(node_revocations::table)
-                .values(
-                    control_enrollment_results::table
-                        .filter(
-                            json_functions::integer(
-                                control_enrollment_results::result,
-                                "$.Enrolled.node_id",
-                            )
-                            .eq(id),
-                        )
-                        .select((
-                            control_enrollment_results::peer_id,
-                            id.into_sql::<Integer>(),
-                            command
-                                .applied_at
-                                .into_sql::<diesel::sql_types::Timestamp>(),
-                        )),
-                )
-                .into_columns((
-                    node_revocations::peer_id,
-                    node_revocations::node_id,
-                    node_revocations::revoked_at,
-                ))
+            diesel::sql_query("DELETE FROM application_kv WHERE key IN (SELECT 'l2tp_active/' || id FROM l2tpv3_tunnels WHERE node_id_peer1=? OR node_id_peer2=?)").bind::<Integer,_>(id).bind::<Integer,_>(id).execute(conn)?;
+            diesel::sql_query("DELETE FROM l2tpv3_tunnels WHERE node_id_peer1=? OR node_id_peer2=?").bind::<Integer,_>(id).bind::<Integer,_>(id).execute(conn)?;
+            diesel::sql_query("DELETE FROM l2tpv2_tunnels WHERE node_id_peer1=? OR node_id_peer2=?").bind::<Integer,_>(id).bind::<Integer,_>(id).execute(conn)?;
+            // Enrollment receipts retain identities from before control identities existed.
+            diesel::sql_query("INSERT OR IGNORE INTO application_kv(key,value) SELECT 'node_revocation/' || peer_id, json_object('node_id', ?, 'revoked_at', ?) FROM node_control_identities WHERE node_id = ? UNION ALL SELECT 'node_revocation/' || substr(key,27), json_object('node_id', ?, 'revoked_at', ?) FROM application_kv WHERE substr(key,1,26)='control_enrollment_result/' AND json_extract(json_extract(value,'$.result'), '$.Enrolled.node_id') = ?")
+                .bind::<Integer, _>(id).bind::<diesel::sql_types::Timestamp, _>(command.applied_at).bind::<Integer, _>(id)
+                .bind::<Integer, _>(id).bind::<diesel::sql_types::Timestamp, _>(command.applied_at).bind::<Integer, _>(id)
                 .execute(conn)?;
             let tunnels = wireguard_tunnels::table.filter(
                 wireguard_tunnels::node_id_peer1
@@ -498,11 +460,10 @@ fn topology_mutation(
                 mesh_group_memberships::table.filter(mesh_group_memberships::node_id.eq(id)),
             )
             .execute(conn)?;
-            diesel::delete(wireguard_static_key::table.find(id)).execute(conn)?;
-            diesel::delete(
-                control_answer_results::table.filter(control_answer_results::node_id.eq(id)),
-            )
-            .execute(conn)?;
+            diesel::delete(application_kv::table.find(format!("wireguard_key/{id}"))).execute(conn)?;
+            let prefix = format!("control_answer_result/{id}/");
+            diesel::sql_query("DELETE FROM application_kv WHERE substr(key,1,length(?))=?")
+                .bind::<Text, _>(&prefix).bind::<Text, _>(&prefix).execute(conn)?;
             diesel::delete(node_control_identities::table.find(id)).execute(conn)?;
             diesel::delete(nodes::table.find(id)).execute(conn)?;
         }
@@ -524,6 +485,7 @@ fn topology_mutation(
         tunnel_intents::table.filter(tunnel_intents::tunnel_id.eq(wireguard_tunnels::id)),
     ))))
     .execute(conn)?;
+    crate::tunnel::remove_orphaned(conn)?;
     let mut affected = Vec::new();
     for (id, old) in before {
         if crate::db::control_identity_for_node(conn, id)
@@ -541,16 +503,32 @@ fn topology_mutation(
     )))
 }
 
+pub(crate) fn local_inventory(conn: &mut diesel::SqliteConnection, operation: Operation) -> Result<serde_json::Value, Error> {
+    if !matches!(operation, Operation::Inventory | Operation::Status) { return Err("not a local inventory read".into()); }
+    conn.transaction(|conn| read(conn, operation))
+}
+
 pub(crate) fn read(
     conn: &mut diesel::SqliteConnection,
     operation: Operation,
 ) -> Result<serde_json::Value, Error> {
     match operation {
-        Operation::Account => Ok(administrator::table.find(1)
-            .select((administrator::username, administrator::password_hash))
-            .first::<(String, String)>(conn).optional()?
-            .map(|(username, password_hash)| serde_json::json!({"username":username,"password_hash":password_hash}))
-            .unwrap_or(serde_json::Value::Null)),
+        Operation::SessionRevoked(id) => {
+            if !valid_session_id(&id) { return Err("invalid session ID".into()); }
+            Ok(serde_json::json!(application_kv::table.find(format!("session_revocation/{id}"))
+                .select(application_kv::key).first::<String>(conn).optional()?.is_some()))
+        }
+        Operation::Account => {
+            #[derive(Deserialize, Serialize)]
+            #[serde(deny_unknown_fields)]
+            struct Account { username: String, password_hash: String }
+            let value = application_kv::table.find("administrator/1")
+                .select(application_kv::value).first::<String>(conn).optional()?;
+            match value {
+                Some(value) => Ok(serde_json::to_value(serde_json::from_str::<Account>(&value)?)?),
+                None => Ok(serde_json::Value::Null),
+            }
+        }
         Operation::Inventory => {
             // Read timestamps as text to preserve SQLite's existing wire format, not Chrono's ISO format.
             let nodes = nodes::table.select((nodes::id, nodes::name,
@@ -586,57 +564,30 @@ pub(crate) fn read(
                     serde_json::json!({"id":id,"node_id_peer1":node_id_peer1,"node_id_peer2":node_id_peer2,
                         "endpoint_peer1":endpoint_peer1,"endpoint_peer2":endpoint_peer2,"ipv6":ipv6,"mtu":mtu,
                         "intents":intents.remove(&id).unwrap_or_default()})).collect::<Vec<_>>();
-            Ok(serde_json::json!({"nodes":nodes,"meshes":meshes,"memberships":memberships,"invites":invites,"tunnels":tunnels}))
+            Ok(serde_json::json!({"nodes":nodes,"meshes":meshes,"memberships":memberships,"invites":invites,"tunnels":tunnels,"l2tp_tunnels":crate::db::l2tp_rows(conn)?,"l2tp_v2_tunnels":crate::db::l2tp_v2_rows(conn)?}))
         }
         Operation::Status => {
-            use diesel::OptionalExtension;
-            let admitted = crate::db::get_setting(conn, "controller_admitted")
-                .optional()?
-                .map(|v| serde_json::from_str::<serde_json::Value>(&v))
-                .transpose()?
-                .unwrap_or(serde_json::json!({}));
-            let revoked = crate::db::get_setting(conn, "replica_revocations")
-                .optional()?
-                .map(|v| serde_json::from_str::<serde_json::Value>(&v))
-                .transpose()?
-                .unwrap_or(serde_json::json!({}));
-            Ok(
-                serde_json::json!({"application_version":cat4igp_shared::discovery::join::APPLICATION_VERSION,"replicas":admitted,"revocations":revoked,"observation":"committed inventory; not reachability"}),
-            )
-        }
-        Operation::Replicas => {
-            use diesel::OptionalExtension;
-            let admitted: BTreeMap<u64, libp2p::PeerId> =
-                crate::db::get_setting(conn, "controller_admitted")
-                    .optional()?
-                    .map(|s| serde_json::from_str(&s))
-                    .transpose()?
-                    .unwrap_or_default();
-            let pending: Vec<crate::cluster::Admission> =
-                crate::db::get_setting(conn, "replica_pending_admissions")
-                    .optional()?
-                    .map(|s| serde_json::from_str(&s))
-                    .transpose()?
-                    .unwrap_or_default();
-            let roster: Option<
-                cat4igp_shared::discovery::Signed<cat4igp_shared::discovery::ControllerRoster>,
-            > = crate::db::get_setting(conn, "controller_roster")
-                .optional()?
-                .map(|s| serde_json::from_str(&s))
-                .transpose()?;
             Ok(serde_json::json!({
-                "admitted": admitted,
-                "pending": pending.iter().map(|a| serde_json::json!({"node_id":a.request.node_id,"peer_id":a.source,"address":a.request.address,"admitted_at_ms":a.at_ms})).collect::<Vec<_>>(),
-                "roster": roster.map(|r| r.body),
-                "revocations": crate::cluster::read_revocations(conn)?,
-                "observation": "leader-linearized committed inventory; not reachability"
+                "application_version": cat4igp_shared::compat::APPLICATION_VERSION,
+                "observation": "local applied inventory"
             }))
         }
-        Operation::Replica(_) | Operation::CodeRead => {
-            Err("cluster administration not available".into())
-        }
-        Operation::Mutate(_) | Operation::SignedFenceAttestation(..) | Operation::SignedFenceLifecycle(..) => Err("not a read".into()),
+        Operation::RevokeSession(_) | Operation::Mutate(_) => Err("not a read".into()),
     }
+}
+
+pub(crate) fn valid_session_id(id: &str) -> bool {
+    uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id)
+}
+
+pub(crate) fn revoke_session(conn: &mut diesel::SqliteConnection, id: &str) -> Result<(), Error> {
+    if !valid_session_id(id) { return Err("invalid session ID".into()); }
+    // ponytail: tombstones do not expire; add GC only with a verified cluster clock bound.
+    diesel::insert_or_ignore_into(application_kv::table).values((
+        application_kv::key.eq(format!("session_revocation/{id}")),
+        application_kv::value.eq("true"),
+    )).execute(conn)?;
+    Ok(())
 }
 
 pub(crate) fn serving_receipt(
@@ -644,18 +595,16 @@ pub(crate) fn serving_receipt(
     request_id: &str,
     fingerprint: &str,
 ) -> Result<Option<Result<Option<String>, String>>, Error> {
-    let previous = administrator_results::table
-        .find(request_id)
-        .select((
-            administrator_results::fingerprint,
-            administrator_results::result,
-        ))
-        .first::<(String, String)>(conn)
-        .optional()?;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Receipt { fingerprint: String, result: String }
+    let previous = application_kv::table.find(format!("administrator_result/{request_id}"))
+        .select(application_kv::value).first::<String>(conn).optional()?
+        .map(|value| serde_json::from_str::<Receipt>(&value)).transpose()?;
     previous
-        .map(|(saved_fingerprint, result)| {
-            Ok(if saved_fingerprint == fingerprint {
-                serde_json::from_str(&result)?
+        .map(|receipt| {
+            Ok(if receipt.fingerprint == fingerprint {
+                serde_json::from_str(&receipt.result)?
             } else {
                 Err("idempotency key conflict".into())
             })
@@ -663,38 +612,12 @@ pub(crate) fn serving_receipt(
         .transpose()
 }
 
-pub(crate) fn apply_serving_grant(
-    conn: &mut diesel::SqliteConnection,
-    request_id: &str,
-    fingerprint: &str,
-    expected_revision: u64,
-    roster: &cat4igp_shared::discovery::Signed<cat4igp_shared::discovery::ControllerRoster>,
-) -> Result<Result<Option<String>, String>, Error> {
-    conn.transaction::<_, Error, _>(|conn| {
-        if let Some(result) = serving_receipt(conn, request_id, fingerprint)? {
-            return Ok(result);
-        }
-        let current = crate::cluster::read_authority(conn)?.roster;
-        let result = if current.as_ref().map(|r| r.body.revision) != Some(expected_revision) {
-            Err("roster revision conflict".into())
-        } else {
-            crate::cluster::apply_roster(conn, roster)?.map(|_| {
-                Some(serde_json::json!({
-                "committed":true, "roster_revision":roster.body.revision,
-                "issued_at_ms":roster.body.issued_at_ms, "expires_at_ms":roster.body.expires_at_ms,
-                "semantics":"durable request receipt; not lease renewal"
-            }).to_string())
-            })
-        };
-        diesel::insert_into(administrator_results::table)
-            .values((
-                administrator_results::request_id.eq(request_id),
-                administrator_results::fingerprint.eq(fingerprint),
-                administrator_results::result.eq(serde_json::to_string(&result)?),
-            ))
-            .execute(conn)?;
-        Ok(result)
-    })
+pub(crate) fn save_receipt(conn: &mut diesel::SqliteConnection, request_id: &str, fingerprint: &str, result: &Result<Option<String>, String>) -> Result<(), Error> {
+    diesel::insert_into(application_kv::table).values((
+        application_kv::key.eq(format!("administrator_result/{request_id}")),
+        application_kv::value.eq(serde_json::json!({"fingerprint":fingerprint,"result":serde_json::to_string(result)?}).to_string()),
+    )).execute(conn)?;
+    Ok(())
 }
 
 pub(crate) fn apply(
@@ -716,14 +639,6 @@ pub(crate) fn apply(
             !name.trim().is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)
         };
         let result = match &command.action {
-            Action::AttestUpgradeFence { prepare, externally_fenced } => {
-                let current: Option<crate::raft_storage::FencePrepare> = crate::raft_storage::get(conn, "fence_prepare")?;
-                if !externally_fenced || current.as_ref() != Some(prepare) {
-                    Err("external fence attestation requires the current preparation".into())
-                } else {
-                    Ok(Some(serde_json::json!({"recorded":true,"subject":"administrator:1","prepare":prepare,"semantics":"operator assertion; not activation authorization"}).to_string()))
-                }
-            }
             Action::Bootstrap {
                 username,
                 password_hash,
@@ -733,11 +648,10 @@ pub(crate) fn apply(
                 } else if read(conn, Operation::Account)? != serde_json::Value::Null {
                     Err("administrator already exists".into())
                 } else {
-                    diesel::insert_into(administrator::table)
+                    diesel::insert_into(application_kv::table)
                         .values((
-                            administrator::id.eq(1),
-                            administrator::username.eq(username),
-                            administrator::password_hash.eq(password_hash),
+                            application_kv::key.eq("administrator/1"),
+                            application_kv::value.eq(serde_json::json!({"username":username,"password_hash":password_hash}).to_string()),
                         ))
                         .execute(conn)?;
                     Ok(Some("{\"committed\":true}".into()))
@@ -816,13 +730,7 @@ pub(crate) fn apply(
             }
             _ => topology_mutation(conn, command)?,
         };
-        diesel::insert_into(administrator_results::table)
-            .values((
-                administrator_results::request_id.eq(&command.request_id),
-                administrator_results::fingerprint.eq(fingerprint),
-                administrator_results::result.eq(serde_json::to_string(&result)?),
-            ))
-            .execute(conn)?;
+        save_receipt(conn, &command.request_id, &fingerprint, &result)?;
         Ok(result)
     })
 }
@@ -848,17 +756,6 @@ pub(crate) struct Keys {
     audience: String,
     active: String,
     keys: BTreeMap<String, String>,
-    #[serde(default)]
-    attestation_public_key: Option<String>,
-}
-
-pub(crate) fn attestation_key(keys: &Keys) -> Result<Option<libp2p::identity::PublicKey>, Error> {
-    keys.attestation_public_key.as_ref().map(|encoded| {
-        if encoded.len() > 256 { return Err("attestation key too large".into()); }
-        let key = libp2p::identity::PublicKey::try_decode_protobuf(&crate::hex_decode(encoded)?)?;
-        if key.clone().try_into_ed25519().is_err() { return Err("attestation key must be Ed25519".into()); }
-        Ok(key)
-    }).transpose()
 }
 
 pub(crate) fn load_keys() -> Result<Option<Arc<Keys>>, String> {
@@ -896,6 +793,7 @@ fn protected_file(path: &str) -> Result<Vec<u8>, Error> {
 #[derive(Serialize, Deserialize)]
 struct Claims {
     sub: String,
+    jti: String,
     iss: String,
     aud: String,
     iat: u64,
@@ -903,16 +801,15 @@ struct Claims {
 }
 
 #[cfg(test)]
-pub(crate) fn test_attestation_credentials(key: &libp2p::identity::PublicKey) -> (Arc<Keys>, String) {
+pub(crate) fn test_credentials() -> (Arc<Keys>, String) {
     let keys = Keys {
         origin: "https://controller.example".into(), issuer: "test".into(), audience: "browser".into(),
         active: "a".into(), keys: BTreeMap::from([("a".into(), "01234567890123456789012345678901".into())]),
-        attestation_public_key: Some(crate::hex_encode(&key.encode_protobuf())),
     };
     let now = chrono::Utc::now().timestamp() as u64;
     let mut header = Header::new(Algorithm::HS256);
     header.kid = Some("a".into());
-    let claims = Claims { sub: "administrator:1".into(), iss: keys.issuer.clone(), aud: keys.audience.clone(), iat: now, exp: now + LIFE };
+    let claims = Claims { sub: "administrator:1".into(), jti: uuid::Uuid::new_v4().to_string(), iss: keys.issuer.clone(), aud: keys.audience.clone(), iat: now, exp: now + LIFE };
     let token = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(keys.keys["a"].as_bytes())).unwrap();
     (Arc::new(keys), token)
 }
@@ -941,16 +838,16 @@ fn cookie(headers: &HeaderMap) -> Option<&str> {
     found
 }
 
-pub(crate) fn verify(keys: &Keys, token: &str, now: u64) -> bool {
-    if token.is_empty() || token.len() > 4096 { return false; }
+pub(crate) fn session_id(keys: &Keys, token: &str, now: u64) -> Option<String> {
+    if token.is_empty() || token.len() > 4096 { return None; }
     let Ok(header) = jsonwebtoken::decode_header(token) else {
-        return false;
+        return None;
     };
     if header.alg != Algorithm::HS256 {
-        return false;
+        return None;
     }
     let Some(secret) = header.kid.as_ref().and_then(|id| keys.keys.get(id)) else {
-        return false;
+        return None;
     };
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_issuer(&[&keys.issuer]);
@@ -963,13 +860,16 @@ pub(crate) fn verify(keys: &Keys, token: &str, now: u64) -> bool {
         &DecodingKey::from_secret(secret.as_bytes()),
         &validation,
     ) else {
-        return false;
+        return None;
     };
-    data.claims.sub == "administrator:1"
+    (data.claims.sub == "administrator:1"
+        && valid_session_id(&data.claims.jti)
         && data.claims.iat <= now
         && data.claims.exp > now
-        && data.claims.exp.checked_sub(data.claims.iat) == Some(LIFE)
+        && data.claims.exp.checked_sub(data.claims.iat) == Some(LIFE)).then_some(data.claims.jti)
 }
+
+pub(crate) fn verify(keys: &Keys, token: &str, now: u64) -> bool { session_id(keys, token, now).is_some() }
 
 async fn guard(State(web): State<Web>, request: Request, next: Next) -> Response {
     if !matches!(
@@ -997,11 +897,15 @@ async fn guard(State(web): State<Web>, request: Request, next: Next) -> Response
             "application/json required",
         );
     }
-    if request.uri().path() != "/login"
-        && !cookie(request.headers())
-            .is_some_and(|token| verify(&web.keys, token, chrono::Utc::now().timestamp() as u64))
-    {
-        return failure(StatusCode::UNAUTHORIZED, "unauthorized");
+    if request.uri().path() != "/login" {
+        let Some(id) = cookie(request.headers()).and_then(|token| session_id(&web.keys, token, chrono::Utc::now().timestamp() as u64)) else {
+            return failure(StatusCode::UNAUTHORIZED, "unauthorized");
+        };
+        match send(&web.jobs, Operation::SessionRevoked(id)).await {
+            Ok(serde_json::Value::Bool(false)) => {},
+            Ok(serde_json::Value::Bool(true)) => return failure(StatusCode::UNAUTHORIZED, "unauthorized"),
+            _ => return failure(StatusCode::SERVICE_UNAVAILABLE, "authorization unavailable"),
+        }
     }
     let mut response = next.run(request).await;
     response.headers_mut().insert(
@@ -1077,6 +981,7 @@ async fn login(State(web): State<Web>, Json(login): Json<Login>) -> Response {
     header.kid = Some(web.keys.active.clone());
     let claims = Claims {
         sub: "administrator:1".into(),
+        jti: uuid::Uuid::new_v4().to_string(),
         iss: web.keys.issuer.clone(),
         aud: web.keys.audience.clone(),
         iat: now,
@@ -1099,6 +1004,16 @@ async fn login(State(web): State<Web>, Json(login): Json<Login>) -> Response {
         .into_response()
 }
 
+async fn logout(State(web): State<Web>, headers: HeaderMap) -> Response {
+    let Some(id) = cookie(&headers).and_then(|token| session_id(&web.keys, token, chrono::Utc::now().timestamp() as u64)) else {
+        return failure(StatusCode::UNAUTHORIZED, "unauthorized");
+    };
+    if send(&web.jobs, Operation::RevokeSession(id)).await.is_err() {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "logout outcome unknown");
+    }
+    ([(header::SET_COOKIE, format!("{COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"))], StatusCode::NO_CONTENT).into_response()
+}
+
 async fn inventory(State(web): State<Web>) -> Response {
     match send(&web.jobs, Operation::Inventory).await {
         Ok(value) => Json(value).into_response(),
@@ -1117,64 +1032,6 @@ async fn status(State(web): State<Web>) -> Response {
             "authoritative state unavailable",
         ),
     }
-}
-
-async fn replicas(State(web): State<Web>) -> Response {
-    replica_response(send(&web.jobs, Operation::Replicas).await)
-}
-
-fn replica_response(result: Result<serde_json::Value, String>) -> Response {
-    match result {
-        Ok(value) => Json(value).into_response(),
-        Err(error) if error.starts_with("unavailable") => failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "outcome unknown; inspect inventory before resuming the same desired state",
-        ),
-        Err(error) => failure(StatusCode::CONFLICT, &error),
-    }
-}
-
-async fn replica_action(
-    State(web): State<Web>,
-    headers: HeaderMap,
-    Json(action): Json<ReplicaAction>,
-) -> Response {
-    // Serving grants carry a durable, administrator-scoped body request ID.
-    if headers.contains_key("Idempotency-Key") {
-        return failure(
-            StatusCode::BAD_REQUEST,
-            "Idempotency-Key unsupported; this is a desired-state reconciliation API",
-        );
-    }
-    if matches!(
-        action,
-        ReplicaAction::ActivateLearner { node_id: 0 }
-            | ReplicaAction::PromoteLearner { node_id: 0 }
-            | ReplicaAction::RevokeReplica { node_id: 0 }
-    ) {
-        return failure(StatusCode::BAD_REQUEST, "node_id must be positive");
-    }
-    if let ReplicaAction::GrantServing {
-        node_id,
-        request_id,
-        public_address,
-        control_address,
-        ..
-    } = &action
-    {
-        if *node_id == 0
-            || request_id.is_empty()
-            || request_id.len() > 100
-            || !request_id.is_ascii()
-            || public_address == control_address
-        {
-            return failure(
-                StatusCode::BAD_REQUEST,
-                "invalid serving grant or request_id (1..100 ASCII bytes)",
-            );
-        }
-    }
-    replica_response(send(&web.jobs, Operation::Replica(action)).await)
 }
 
 async fn invite(
@@ -1207,10 +1064,6 @@ async fn mutate(
     if matches!(action, Action::Bootstrap { .. }) {
         return failure(StatusCode::FORBIDDEN, "bootstrap is local only");
     }
-    if matches!(action, Action::AttestUpgradeFence { .. }) {
-        // ponytail: unsigned attestations disabled; enable after leader verifies administrator signatures.
-        return failure(StatusCode::SERVICE_UNAVAILABLE, "signed attestation not yet available");
-    }
     let Some(key) = headers
         .get("Idempotency-Key")
         .and_then(|v| v.to_str().ok())
@@ -1240,33 +1093,7 @@ async fn mutate(
     }
 }
 
-async fn signed_fence_attestation(
-    State(web): State<Web>,
-    headers: HeaderMap,
-    Json(envelope): Json<SignedFenceEnvelope>,
-) -> Response {
-    let Some(key) = headers.get("Idempotency-Key").and_then(|value| value.to_str().ok())
-        .filter(|key| !key.is_empty() && key.len() <= 100 && key.is_ascii()) else {
-        return failure(StatusCode::BAD_REQUEST, "Idempotency-Key required (1..100 ASCII bytes)");
-    };
-    if envelope.body.request_id != format!("admin:1:{key}") || envelope.signature.len() != 64 {
-        return failure(StatusCode::BAD_REQUEST, "invalid attestation envelope");
-    }
-    let Some(session) = cookie(&headers) else { return failure(StatusCode::UNAUTHORIZED, "unauthorized"); };
-    match send(&web.jobs, Operation::SignedFenceAttestation(envelope, session.to_owned())).await {
-        Ok(value) => Json(value).into_response(),
-        Err(error) if error.starts_with("unavailable") => failure(StatusCode::SERVICE_UNAVAILABLE, "outcome unknown; retry with same key and payload"),
-        Err(error) => failure(StatusCode::CONFLICT, &error),
-    }
-}
-
-async fn signed_fence_lifecycle() -> Response {
-    // ponytail: lifecycle disabled until safe activation and recovery are implemented.
-    failure(StatusCode::SERVICE_UNAVAILABLE, "upgrade lifecycle is disabled")
-}
-
 fn validate_keys(keys: &Keys) -> Result<(), Error> {
-    attestation_key(&keys)?;
     let uri: axum::http::Uri = keys.origin.parse()?;
     if uri.scheme_str() != Some("https")
         || uri.authority().is_none()
@@ -1341,26 +1168,11 @@ fn web_router(jobs: crate::DatabaseSender, keys: impl Into<Arc<Keys>>) -> Router
             "/me",
             get(|| async { Json(serde_json::json!({"subject":"administrator:1"})) }),
         )
-        .route(
-            "/logout",
-            post(|| async {
-                (
-                    [(
-                        header::SET_COOKIE,
-                        format!("{COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"),
-                    )],
-                    StatusCode::NO_CONTENT,
-                )
-            }),
-        )
+        .route("/logout", post(logout))
         .route("/inventory", get(inventory))
         .route("/status", get(status))
-        .route("/replicas", get(replicas))
-        .route("/replicas/reconcile", post(replica_action))
         .route("/invites", post(invite))
         .route("/actions", post(mutate))
-        .route("/upgrade/attestation", post(signed_fence_attestation))
-        .route("/upgrade/lifecycle", post(signed_fence_lifecycle))
         .layer(axum::middleware::from_fn_with_state(web.clone(), guard))
         .layer(axum::extract::DefaultBodyLimit::max(4096))
         .with_state(web)
@@ -1380,7 +1192,6 @@ pub(crate) async fn test_gateway(
                 audience: "browser".into(),
                 active: "test".into(),
                 keys: BTreeMap::from([("test".into(), "a".repeat(32))]),
-                attestation_public_key: None,
             },
         ),
     );
@@ -1439,7 +1250,7 @@ mod tests {
         assert_eq!(
             read(&mut conn, Operation::Inventory).unwrap(),
             serde_json::json!({
-                "nodes":[],"meshes":[],"memberships":[],"invites":[],"tunnels":[]
+                "nodes":[],"meshes":[],"memberships":[],"invites":[],"tunnels":[],"l2tp_tunnels":[],"l2tp_v2_tunnels":[]
             })
         );
         conn.batch_execute(r#"
@@ -1455,12 +1266,12 @@ mod tests {
                 (1,1,2,NULL,'[2001:db8::2]:1234',1,1420),(2,2,2,'192.0.2.1:42',NULL,0,1280);
             INSERT INTO tunnel_intents VALUES(1,'mesh',1),(1,'manual',0),(1,'legacy',0);
             INSERT INTO node_control_identities(node_id,peer_id,signing_key,encryption_key) VALUES(1,'current','signing','encryption');
-            INSERT INTO wireguard_static_key(node_id,public_key) VALUES(2,'peer-key');
-            INSERT INTO control_enrollment_results VALUES
-                ('current','','f','{"Enrolled":{"node_id":1}}'),
-                ('legacy','','f','{"Enrolled":{"node_id":1}}'),
-                ('other','','f','{"Enrolled":{"node_id":2}}'),
-                ('rejected','','f','{"Rejected":"no"}');
+            INSERT INTO application_kv VALUES('wireguard_key/2',json_object('public_key','peer-key','created_at','2026-01-01'));
+            INSERT INTO application_kv VALUES
+                ('control_enrollment_result/current',json_object('request_id','','fingerprint','f','result','{"Enrolled":{"node_id":1}}')),
+                ('control_enrollment_result/legacy',json_object('request_id','','fingerprint','f','result','{"Enrolled":{"node_id":1}}')),
+                ('control_enrollment_result/other',json_object('request_id','','fingerprint','f','result','{"Enrolled":{"node_id":2}}')),
+                ('control_enrollment_result/rejected',json_object('request_id','','fingerprint','f','result','{"Rejected":"no"}'));
         "#).unwrap();
         let inventory = read(&mut conn, Operation::Inventory).unwrap();
         assert_eq!(
@@ -1502,12 +1313,8 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(apply(&mut conn, &command).unwrap(), result);
         assert_eq!(
-            node_revocations::table
-                .select(node_revocations::peer_id)
-                .order(node_revocations::peer_id)
-                .load::<String>(&mut conn)
-                .unwrap(),
-            ["current", "legacy"]
+            [crate::db::identity_revoked(&mut conn, "current").unwrap(), crate::db::identity_revoked(&mut conn, "legacy").unwrap()],
+            [true, true]
         );
         let remaining = read(&mut conn, Operation::Inventory).unwrap();
         assert_eq!(remaining["nodes"].as_array().unwrap().len(), 1);
@@ -1646,14 +1453,8 @@ mod tests {
                         read(&mut conn, Operation::Inventory).unwrap()
                     }
                     Operation::Status => read(&mut conn, Operation::Status).unwrap(),
-                    Operation::SignedFenceAttestation(_, session) | Operation::SignedFenceLifecycle(_, session) => {
-                        assert!(session.starts_with("eyJ"));
-                        serde_json::json!({"recorded": true})
-                    }
-                    Operation::Replicas | Operation::Replica(_) | Operation::CodeRead => {
-                        let _ = reply.send(Err("cluster administration not available".into()));
-                        continue;
-                    }
+                    Operation::SessionRevoked(id) => read(&mut conn, Operation::SessionRevoked(id)).unwrap(),
+                    Operation::RevokeSession(id) => { revoke_session(&mut conn, &id).unwrap(); serde_json::Value::Null },
                     Operation::Mutate(command) => {
                         calls.2 += 1;
                         let value = apply(&mut conn, &command).unwrap().unwrap().unwrap();
@@ -1731,62 +1532,6 @@ mod tests {
         assert!(!set_cookie.contains("Domain="));
         let cookie = set_cookie.split(';').next().unwrap();
         let auth = format!("Cookie: {cookie}\r\n");
-        let envelope = SignedFenceEnvelope {
-            body: SignedFenceAttestation {
-                cluster_id: "test".into(), subject: "administrator:1".into(), request_id: "admin:1:attest".into(),
-                prepare: crate::raft_storage::FencePrepare { target: 2, log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 4), membership: Default::default() },
-                externally_fenced: true, issued_at: 1, expires_at: 2,
-            }, signature: vec![0; 64],
-        };
-        let body = serde_json::to_string(&envelope).unwrap();
-        assert_eq!(request(first, "POST", "upgrade/attestation", &format!("{json}Idempotency-Key: attest\r\n"), &body).await.0, 401);
-        assert_eq!(request(first, "POST", "upgrade/attestation", &format!("{json}{auth}Idempotency-Key: wrong\r\n"), &body).await.0, 400);
-        assert_eq!(request(first, "POST", "upgrade/attestation", &format!("{json}{auth}Idempotency-Key: attest\r\n"), &body).await.0, 200);
-        let lifecycle = SignedLifecycleEnvelope {
-            body: SignedLifecycle { cluster_id: "test".into(), subject: "administrator:1".into(), request_id: "admin:1:prepare".into(),
-                action: crate::raft_storage::FenceLifecycle::Prepare { target: 2 }, issued_at: 1, expires_at: 2 }, signature: vec![0; 64],
-        };
-        let body = serde_json::to_string(&lifecycle).unwrap();
-        assert_eq!(request(first, "POST", "upgrade/lifecycle", &format!("{json}Idempotency-Key: prepare\r\n"), &body).await.0, 401);
-        assert_eq!(request(first, "POST", "upgrade/lifecycle", &format!("{json}{auth}Idempotency-Key: wrong\r\n"), &body).await.0, 503);
-        assert_eq!(request(first, "POST", "upgrade/lifecycle", &format!("{json}{auth}Idempotency-Key: prepare\r\n"), &body).await.0, 503);
-        assert_eq!(request(first, "GET", "replicas", &auth, "").await.0, 409);
-        assert_eq!(
-            request(
-                second,
-                "POST",
-                "replicas/reconcile",
-                &format!("{json}{auth}"),
-                r#"{"action":"enrollment_code"}"#
-            )
-            .await
-            .0,
-            409
-        );
-        assert_eq!(
-            request(
-                second,
-                "POST",
-                "replicas/reconcile",
-                &format!("{json}{auth}Idempotency-Key: unsupported\r\n"),
-                r#"{"action":"enrollment_code"}"#
-            )
-            .await
-            .0,
-            400
-        );
-        assert_eq!(
-            request(
-                second,
-                "POST",
-                "replicas/reconcile",
-                &auth,
-                r#"{"action":"enrollment_code"}"#
-            )
-            .await
-            .0,
-            403
-        );
         assert_eq!(
             request(
                 first,
@@ -1868,6 +1613,8 @@ mod tests {
         )
         .await;
         assert_eq!(logout.0, 204);
+        assert_eq!(request(overlap, "GET", "me", &new_auth, "").await.0, 401);
+        assert_eq!(request(overlap, "GET", "me", &auth, "").await.0, 200);
         assert!(logout.1.contains(&format!(
             "{COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"
         )));
@@ -1900,7 +1647,7 @@ mod tests {
         assert!(
             uncertain
                 .2
-                .contains("outcome unknown; retry with same key and payload")
+                .contains("authorization unavailable")
         );
 
         for server in [server1, server2, server3, server4, server5] {
@@ -1916,40 +1663,6 @@ mod tests {
     }
 
     #[test]
-    fn signed_attestation_binds_action_and_expiry() {
-        let key = libp2p::identity::Keypair::generate_ed25519();
-        let mut keys = Keys { origin: "https://controller.example".into(), issuer: "test".into(),
-            audience: "browser".into(), active: "a".into(), keys: BTreeMap::new(), attestation_public_key: None };
-        assert!(attestation_key(&keys).unwrap().is_none());
-        keys.attestation_public_key = Some(crate::hex_encode(&key.public().encode_protobuf()));
-        assert_eq!(attestation_key(&keys).unwrap().unwrap(), key.public());
-        keys.attestation_public_key = Some("invalid".into());
-        assert!(attestation_key(&keys).is_err());
-        let mut body = SignedFenceAttestation {
-            cluster_id: "cluster".into(), subject: "administrator:1".into(),
-            request_id: "admin:1:request".into(),
-            prepare: crate::raft_storage::FencePrepare {
-                target: 2, log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 4),
-                membership: Default::default(),
-            },
-            externally_fenced: true, issued_at: 100, expires_at: 200,
-        };
-        let bytes = serde_json::to_vec(&("cat4igp/admin/fence-attestation/v1", &body)).unwrap();
-        let signature = key.sign(&bytes).unwrap();
-        assert!(verify_fence_attestation(&body, &signature, &key.public(), "cluster", 150));
-        assert!(!verify_fence_attestation(&body, &signature, &key.public(), "other", 150));
-        assert!(!verify_fence_attestation(&body, &signature, &key.public(), "cluster", 200));
-        body.prepare.target = 3;
-        assert!(!verify_fence_attestation(&body, &signature, &key.public(), "cluster", 150));
-        body.prepare.target = 2;
-        body.request_id.push('x');
-        assert!(!verify_fence_attestation(&body, &signature, &key.public(), "cluster", 150));
-        body.request_id.pop();
-        body.externally_fenced = false;
-        assert!(!verify_fence_attestation(&body, &signature, &key.public(), "cluster", 150));
-    }
-
-    #[test]
     fn sessions_and_atomic_replay() {
         let now = chrono::Utc::now().timestamp() as u64;
         let keys = Keys {
@@ -1958,12 +1671,12 @@ mod tests {
             audience: "browser".into(),
             active: "a".into(),
             keys: BTreeMap::from([("a".into(), "01234567890123456789012345678901".into())]),
-            attestation_public_key: None,
         };
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some("a".into());
         let mut claims = Claims {
             sub: "administrator:1".into(),
+            jti: uuid::Uuid::new_v4().to_string(),
             iss: "test".into(),
             aud: "browser".into(),
             iat: now,

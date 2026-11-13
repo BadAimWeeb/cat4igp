@@ -21,6 +21,10 @@ pub struct ClientConfig {
     /// Enabled tunnel protocols
     pub tunnel_protocols: TunnelProtocols,
 
+    /// Allow unencrypted L2TP links; cookies do not authenticate traffic.
+    #[serde(default)]
+    pub allow_insecure_l2tp: bool,
+
     /// Optional public IPv4 hostname for responding to connection requests
     #[serde(default, deserialize_with = "optional_hostname")]
     pub public_hostname_ipv4: Option<String>,
@@ -39,6 +43,16 @@ pub struct ClientConfig {
     /// Private control network identifier shared with the controller.
     #[serde(default = "default_control_network_id")]
     pub control_network_id: String,
+
+    /// Optional fixed-destination control traffic relay.
+    #[serde(default)]
+    pub control_relay: Option<ControlRelay>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlRelay {
+    pub listen: std::net::SocketAddr,
+    pub target: std::net::SocketAddr,
 }
 
 /// Port range configuration
@@ -69,7 +83,8 @@ impl PortRange {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelProtocols {
     pub wireguard: bool,
-    // Future tunnel types can be added here
+    #[serde(default)]
+    pub l2tp: bool,
 }
 
 impl Default for ClientConfig {
@@ -81,11 +96,16 @@ impl Default for ClientConfig {
                 min: 51820,
                 max: 52000,
             },
-            tunnel_protocols: TunnelProtocols { wireguard: true },
+            tunnel_protocols: TunnelProtocols {
+                wireguard: true,
+                l2tp: false,
+            },
+            allow_insecure_l2tp: false,
             public_hostname_ipv4: None,
             public_hostname_ipv6: None,
             control_bootstrap_addresses: Vec::new(),
             control_private_network_key: None,
+            control_relay: None,
             control_network_id: default_control_network_id(),
         }
     }
@@ -94,6 +114,7 @@ impl Default for ClientConfig {
 fn default_control_network_id() -> String {
     "default".to_string()
 }
+
 
 fn optional_hostname<'de, D: serde::Deserializer<'de>>(
     deserializer: D,

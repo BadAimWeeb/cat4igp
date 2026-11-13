@@ -1,0 +1,24 @@
+-- Existing L2TP IDs cannot safely return to independently allocated namespaces.
+CREATE TEMP TABLE tunnel_id_downgrade_guard (ok INTEGER NOT NULL CHECK(ok=1));
+INSERT INTO tunnel_id_downgrade_guard SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM l2tpv2_tunnels UNION ALL SELECT 1 FROM l2tpv3_tunnels UNION ALL SELECT 1 FROM tunnel_dependencies) THEN 1 ELSE 0 END;
+DROP TABLE tunnel_id_downgrade_guard;
+INSERT INTO application_kv(key,value) SELECT 'management_id/l2tp',value FROM application_kv WHERE key='management_id/tunnel' ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+INSERT INTO application_kv(key,value) SELECT 'management_id/l2tpv2',value FROM application_kv WHERE key='management_id/tunnel' ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+DROP TRIGGER tunnel_registry_wireguard_insert;
+DROP TRIGGER tunnel_registry_v2_insert;
+DROP TRIGGER tunnel_registry_v3_insert;
+DROP TRIGGER tunnel_registry_wireguard_delete;
+DROP TRIGGER tunnel_registry_v2_delete;
+DROP TRIGGER tunnel_registry_v3_delete;
+DROP TRIGGER tunnel_registry_wireguard_update;
+DROP TRIGGER tunnel_registry_v2_update;
+DROP TRIGGER tunnel_registry_v3_update;
+DROP TRIGGER tunnel_dependency_v2_insert;
+DROP TRIGGER tunnel_dependency_v3_insert;
+DROP TRIGGER tunnel_dependency_v2_update;
+DROP TRIGGER tunnel_dependency_v3_update;
+DROP TRIGGER tunnel_dependency_v2_delete;
+DROP TRIGGER tunnel_dependency_v3_delete;
+DROP TABLE tunnel_dependencies;
+DROP TABLE tunnel_id_registry;
+CREATE TRIGGER management_tunnel_id AFTER INSERT ON wireguard_tunnels BEGIN SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM application_kv WHERE key='management_id/tunnel' AND json_type(value)='integer' AND CAST(value AS INTEGER) BETWEEN 0 AND 2147483647) THEN RAISE(ABORT,'invalid management ID') END; UPDATE application_kv SET value=json(max(CAST(value AS INTEGER),NEW.id)) WHERE key='management_id/tunnel'; END;

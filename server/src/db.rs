@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
-pub(crate) fn verify_schema(conn: &mut SqliteConnection) -> Result<(), String> {
+fn check_schema(conn: &mut SqliteConnection, allow_pending: bool) -> Result<(), String> {
     use diesel::migration::MigrationSource;
     let expected =
         <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS)
@@ -22,8 +22,65 @@ pub(crate) fn verify_schema(conn: &mut SqliteConnection) -> Result<(), String> {
         .map_err(|_| "cannot read backup schema")?
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
-    if actual != expected {
+    if !actual.is_subset(&expected) || (!allow_pending && actual != expected) {
         return Err("backup schema differs from this binary; coordinated upgrade required".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_schema(conn: &mut SqliteConnection) -> Result<(), String> {
+    check_schema(conn, false)
+}
+
+/// Inspect legacy consensus tables before SQLite is configured or migrations run.
+/// Empty tables are part of the historical standalone schema; any stored state is
+/// rejected because this binary has no safe way to recover or apply it.
+pub(crate) fn preflight_raft_database(path: &str) -> Result<(), String> {
+    if path.is_empty() || path.starts_with("file:") || path.starts_with("sqlite:") {
+        return Err("raft database preflight requires a filesystem path".into());
+    }
+    let path = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("raft database preflight failed".into()),
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let encoded = path
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect::<String>();
+    let mut conn = SqliteConnection::establish(&format!("file:{encoded}?mode=ro"))
+        .map_err(|_| "raft database preflight failed".to_string())?;
+    #[derive(diesel::QueryableByName)]
+    struct Table {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    let tables = diesel::sql_query(
+        "SELECT name FROM sqlite_schema WHERE name IN ('raft_meta', 'raft_logs') ORDER BY name",
+    )
+    .load::<Table>(&mut conn)
+    .map_err(|_| "raft database preflight failed".to_string())?;
+    if tables.is_empty() {
+        return Ok(());
+    }
+    if tables.len() != 2 {
+        return Err("cluster compatibility preflight rejected incomplete consensus metadata".into());
+    }
+    let count = diesel::sql_query(
+        "SELECT (SELECT count(*) FROM raft_meta) + (SELECT count(*) FROM raft_logs) AS count",
+    )
+    .get_result::<Count>(&mut conn)
+    .map_err(|_| "raft database preflight failed".to_string())?;
+    if count.count != 0 {
+        return Err("cluster compatibility preflight rejected raft database; existing consensus state would be lost".into());
     }
     Ok(())
 }
@@ -43,6 +100,7 @@ pub fn migrate(conn: &mut SqliteConnection, apply: bool) -> Result<(), String> {
         return verify_schema(conn);
     }
     // ponytail: one migration writer; coordinate externally before multi-instance upgrades.
+    check_schema(conn, true)?;
     let versions = conn
         .run_pending_migrations(MIGRATIONS)
         .map_err(|e| e.to_string())?;
@@ -90,8 +148,8 @@ pub(crate) fn identity_revoked(
         n: i64,
     }
     Ok(
-        diesel::sql_query("SELECT COUNT(*) AS n FROM node_revocations WHERE peer_id=?")
-            .bind::<diesel::sql_types::Text, _>(peer)
+        diesel::sql_query("SELECT COUNT(*) AS n FROM application_kv WHERE key=?")
+            .bind::<diesel::sql_types::Text, _>(format!("node_revocation/{peer}"))
             .get_result::<Count>(conn)?
             .n
             != 0,
@@ -108,9 +166,9 @@ pub(crate) fn next_management_id(
         id: i32,
     }
     diesel::sql_query(
-        "SELECT high_water+1 AS id FROM management_ids WHERE kind=? AND high_water<2147483647",
+        "SELECT CAST(value AS INTEGER)+1 AS id FROM application_kv WHERE key=? AND CASE WHEN json_valid(value) THEN json_type(value)='integer' AND CAST(value AS INTEGER) BETWEEN 0 AND 2147483646 ELSE 0 END",
     )
-    .bind::<diesel::sql_types::Text, _>(kind)
+    .bind::<diesel::sql_types::Text, _>(format!("management_id/{kind}"))
     .get_result::<Id>(conn)
     .map(|r| r.id)
 }
@@ -149,8 +207,8 @@ pub fn apply_invite(
         serde_json::to_string(&(command.expires_at, command.max_uses, command.join_mesh)).unwrap();
     // The Raft adapter supplies the outer immediate transaction; nested calls use savepoints.
     conn.transaction(|conn| {
-        if let Some(previous) = diesel::sql_query("SELECT fingerprint, result FROM operator_invite_results WHERE request_id = ?")
-            .bind::<Text, _>(&command.request_id).get_result::<Previous>(conn).optional()? {
+        if let Some(previous) = diesel::sql_query("SELECT json_extract(value,'$.fingerprint') AS fingerprint, json_extract(value,'$.result') AS result FROM application_kv WHERE key = ?")
+            .bind::<Text, _>(format!("operator_invite_result/{}", command.request_id)).get_result::<Previous>(conn).optional()? {
             return Ok(if previous.fingerprint == fingerprint {
                 serde_json::from_str(&previous.result).map_err(|e| diesel::result::Error::DeserializationError(Box::new(e)))?
             } else { Err("request ID reused with different invite settings".into()) });
@@ -171,8 +229,8 @@ pub fn apply_invite(
                 max_uses.eq(command.max_uses), override_join_mesh.eq(command.join_mesh))).execute(conn)?;
         }
         // ponytail: lifetime retries retain one row/request; prune only with an explicit retry-window contract.
-        diesel::sql_query("INSERT INTO operator_invite_results (request_id, fingerprint, result) VALUES (?, ?, ?)")
-            .bind::<Text, _>(&command.request_id).bind::<Text, _>(&fingerprint)
+        diesel::sql_query("INSERT INTO application_kv (key, value) VALUES (?, json_object('fingerprint', ?, 'result', ?))")
+            .bind::<Text, _>(format!("operator_invite_result/{}", command.request_id)).bind::<Text, _>(&fingerprint)
             .bind::<Text, _>(serde_json::to_string(&result).unwrap()).execute(conn)?;
         Ok(result)
     })
@@ -391,40 +449,15 @@ pub fn get_node_list(
         .load::<crate::models::Node>(conn)
 }
 
-pub fn update_wireguard_pubkey(
-    conn: &mut SqliteConnection,
-    node_id_val: i32,
-    pubkey: &str,
-) -> Result<(), diesel::result::Error> {
-    use crate::schema::wireguard_static_key;
-    use crate::schema::wireguard_static_key::dsl::*;
-
-    let new_pk = crate::models::NewWireguardStaticKey {
-        node_id: node_id_val,
-        public_key: pubkey,
-    };
-
-    diesel::insert_into(wireguard_static_key::table)
-        .values(&new_pk)
-        .on_conflict(node_id)
-        .do_update()
-        .set(public_key.eq(pubkey))
-        .execute(conn)?;
-    Ok(())
-}
-
 pub fn get_wireguard_pubkey(
     conn: &mut SqliteConnection,
     node_id_val: i32,
 ) -> Result<String, diesel::result::Error> {
-    use crate::schema::wireguard_static_key::dsl::*;
-
-    let key_record = wireguard_static_key
-        .filter(node_id.eq(node_id_val))
-        .select(public_key)
-        .first::<String>(conn)?;
-
-    Ok(key_record)
+    #[derive(QueryableByName)]
+    struct Key { #[diesel(sql_type = diesel::sql_types::Text)] public_key: String }
+    diesel::sql_query("SELECT json_extract(value,'$.public_key') AS public_key FROM application_kv WHERE key=?")
+        .bind::<diesel::sql_types::Text, _>(format!("wireguard_key/{node_id_val}"))
+        .get_result::<Key>(conn).map(|key| key.public_key)
 }
 
 pub fn create_wireguard_tunnel(
@@ -513,6 +546,55 @@ pub fn get_wireguard_answers(
     Ok(results)
 }
 
+#[derive(Clone, serde::Serialize, diesel::QueryableByName)]
+pub(crate) struct L2tpRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)] pub construction: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub node_id_peer1: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub node_id_peer2: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)] pub endpoint_peer1: String,
+    #[diesel(sql_type = diesel::sql_types::Text)] pub endpoint_peer2: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub udp_port_peer1: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub udp_port_peer2: i32,
+    #[diesel(sql_type = diesel::sql_types::BigInt)] pub session_id_peer1: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)] pub session_id_peer2: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)] pub cookie_peer1: String,
+    #[diesel(sql_type = diesel::sql_types::Text)] pub cookie_peer2: String,
+    #[diesel(sql_type = diesel::sql_types::Text)] pub security_mode: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)] pub wireguard_tunnel_id: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub mtu: i32,
+}
+
+pub(crate) fn l2tp_rows(conn: &mut SqliteConnection) -> Result<Vec<L2tpRow>, diesel::result::Error> {
+    diesel::sql_query("SELECT l.* FROM l2tpv3_tunnels l JOIN application_kv k ON k.key='l2tp_active/' || l.id ORDER BY l.id").load(conn)
+}
+
+pub(crate) fn all_l2tp_rows(conn: &mut SqliteConnection) -> Result<Vec<L2tpRow>, diesel::result::Error> {
+    diesel::sql_query("SELECT * FROM l2tpv3_tunnels ORDER BY id").load(conn)
+}
+
+#[derive(Clone, serde::Serialize, diesel::QueryableByName)]
+pub(crate) struct L2tpV2Row {
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub id: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub node_id_peer1: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub node_id_peer2: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)] pub endpoint_peer1: String,
+    #[diesel(sql_type = diesel::sql_types::Text)] pub endpoint_peer2: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub udp_port_peer1: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub udp_port_peer2: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)] pub address_peer1: String,
+    #[diesel(sql_type = diesel::sql_types::Text)] pub address_peer2: String,
+    #[serde(skip_serializing)]
+    #[diesel(sql_type = diesel::sql_types::Text)] pub secret: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)] pub mtu: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)] pub wireguard_tunnel_id: Option<i32>,
+}
+
+pub(crate) fn l2tp_v2_rows(conn: &mut SqliteConnection) -> Result<Vec<L2tpV2Row>, diesel::result::Error> {
+    diesel::sql_query("SELECT * FROM l2tpv2_tunnels ORDER BY id").load(conn)
+}
+
 /// The transport-independent desired WireGuard state for one node.
 pub fn topology_snapshot(
     conn: &mut SqliteConnection,
@@ -576,11 +658,42 @@ pub fn topology_snapshot(
             })
         })
         .collect::<Result<Vec<_>, diesel::result::Error>>()?;
+    let l2tp_tunnels = l2tp_rows(conn)?.into_iter().filter(|t| t.node_id_peer1 == node_id_val || t.node_id_peer2 == node_id_val).map(|t| {
+        let first = t.node_id_peer1 == node_id_val;
+        cat4igp_shared::control::L2tpTunnelInfo {
+            tunnel_id: t.id, peer_node_id: if first { t.node_id_peer2 } else { t.node_id_peer1 },
+            local_endpoint: if first { t.endpoint_peer1.clone() } else { t.endpoint_peer2.clone() },
+            remote_endpoint: if first { t.endpoint_peer2 } else { t.endpoint_peer1 },
+            local_port: if first { t.udp_port_peer1 as u16 } else { t.udp_port_peer2 as u16 },
+            remote_port: if first { t.udp_port_peer2 as u16 } else { t.udp_port_peer1 as u16 },
+            local_session_id: if first { t.session_id_peer1 as u32 } else { t.session_id_peer2 as u32 },
+            remote_session_id: if first { t.session_id_peer2 as u32 } else { t.session_id_peer1 as u32 },
+            local_cookie: if first { t.cookie_peer1.clone() } else { t.cookie_peer2.clone() },
+            remote_cookie: if first { t.cookie_peer2 } else { t.cookie_peer1 },
+            security_mode: t.security_mode, wireguard_tunnel_id: t.wireguard_tunnel_id, mtu: t.mtu,
+        }
+    }).collect();
+    let l2tp_v2_tunnels = l2tp_v2_rows(conn)?.into_iter().filter(|t| t.node_id_peer1 == node_id_val || t.node_id_peer2 == node_id_val).map(|t| {
+        let first = t.node_id_peer1 == node_id_val;
+        cat4igp_shared::control::L2tpV2TunnelInfo {
+            tunnel_id: t.id, peer_node_id: if first { t.node_id_peer2 } else { t.node_id_peer1 },
+            local_endpoint: if first { t.endpoint_peer1.clone() } else { t.endpoint_peer2.clone() },
+            remote_endpoint: if first { t.endpoint_peer2 } else { t.endpoint_peer1 },
+            local_port: if first { t.udp_port_peer1 as u16 } else { t.udp_port_peer2 as u16 },
+            remote_port: if first { t.udp_port_peer2 as u16 } else { t.udp_port_peer1 as u16 },
+            local_address: if first { t.address_peer1.clone() } else { t.address_peer2.clone() },
+            remote_address: if first { t.address_peer2 } else { t.address_peer1 },
+            secret: t.secret, mtu: t.mtu as u32, initiator: first, wireguard_tunnel_id: t.wireguard_tunnel_id,
+        }
+    }).collect();
 
     Ok(cat4igp_shared::control::TopologySnapshot {
         node_id: node_id_val,
         revision,
         tunnels,
+        l2tp_tunnels,
+        l2tp_v2_tunnels,
+        l2tp_availability: None,
     })
 }
 
@@ -732,7 +845,7 @@ pub fn apply_enrollment(
     ),
     diesel::result::Error,
 > {
-    use crate::schema::{invites, node_control_identities, nodes, wireguard_static_key};
+    use crate::schema::{invites, node_control_identities, nodes};
     use cat4igp_shared::control::ControlResponse;
     use diesel::sql_types::Text;
     let request = &command.request;
@@ -762,8 +875,8 @@ pub fn apply_enrollment(
         if identity_revoked(conn, &request.client_peer_id)? {
             return Ok((ControlResponse::Rejected("identity permanently revoked".into()), vec![]));
         }
-        if let Some(previous) = diesel::sql_query("SELECT peer_id, request_id, fingerprint, result FROM control_enrollment_results WHERE peer_id = ? OR (request_id = ? AND request_id <> '') ORDER BY peer_id LIMIT 1")
-            .bind::<Text, _>(&request.client_peer_id)
+        if let Some(previous) = diesel::sql_query("SELECT substr(key,27) AS peer_id, json_extract(value,'$.request_id') AS request_id, json_extract(value,'$.fingerprint') AS fingerprint, json_extract(value,'$.result') AS result FROM application_kv WHERE substr(key,1,26)='control_enrollment_result/' AND (key = ? OR (json_extract(value,'$.request_id') = ? AND json_extract(value,'$.request_id') <> '')) ORDER BY key LIMIT 1")
+            .bind::<Text, _>(format!("control_enrollment_result/{}", request.client_peer_id))
             .bind::<Text, _>(&request.request_id)
             .get_result::<EnrollmentResult>(conn).optional()? {
             return Ok((if previous.peer_id == request.client_peer_id && previous.request_id == request.request_id && previous.fingerprint == fingerprint {
@@ -817,7 +930,10 @@ pub fn apply_enrollment(
             diesel::update(invites::table.find(inv.id)).set(invites::used_count.eq(invites::used_count + 1)).execute(conn)?;
             diesel::insert_into(nodes::table).values((nodes::id.eq(command.node_id), nodes::name.eq(&request.node_name), nodes::auth_key.eq(&command.auth_key), nodes::created_at.eq(command.applied_at))).execute(conn)?;
             diesel::insert_into(node_control_identities::table).values((node_control_identities::node_id.eq(command.node_id), node_control_identities::peer_id.eq(&request.client_peer_id), node_control_identities::signing_key.eq(&request.client_signing_key), node_control_identities::encryption_key.eq(&request.client_encryption_key), node_control_identities::created_at.eq(command.applied_at), node_control_identities::updated_at.eq(command.applied_at))).execute(conn)?;
-            diesel::insert_into(wireguard_static_key::table).values((wireguard_static_key::node_id.eq(command.node_id), wireguard_static_key::public_key.eq(&request.wireguard_public_key), wireguard_static_key::created_at.eq(command.applied_at))).execute(conn)?;
+            diesel::sql_query("INSERT INTO application_kv(key,value) VALUES(?,json_object('public_key',?,'created_at',?))")
+                .bind::<diesel::sql_types::Text, _>(format!("wireguard_key/{}", command.node_id))
+                .bind::<diesel::sql_types::Text, _>(&request.wireguard_public_key)
+                .bind::<diesel::sql_types::Timestamp, _>(command.applied_at).execute(conn)?;
             if let Some((id, mesh_id)) = command.allocation.membership {
                 diesel::insert_into(crate::schema::mesh_group_memberships::table).values((
                     crate::schema::mesh_group_memberships::id.eq(id),
@@ -848,8 +964,8 @@ pub fn apply_enrollment(
         } else {
             ControlResponse::Rejected("enrollment rejected".into())
         };
-        diesel::sql_query("INSERT INTO control_enrollment_results (peer_id, request_id, fingerprint, result) VALUES (?, ?, ?, ?)")
-            .bind::<Text, _>(&request.client_peer_id).bind::<Text, _>(&request.request_id)
+        diesel::sql_query("INSERT INTO application_kv (key, value) VALUES (?, json_object('request_id', ?, 'fingerprint', ?, 'result', ?))")
+            .bind::<Text, _>(format!("control_enrollment_result/{}", request.client_peer_id)).bind::<Text, _>(&request.request_id)
             .bind::<Text, _>(&fingerprint).bind::<Text, _>(serde_json::to_string(&response).map_err(json_error)?)
             .execute(conn)?;
         Ok((response, snapshots))
@@ -877,7 +993,7 @@ pub fn apply_answer(
     conn: &mut SqliteConnection,
     command: &AnswerCommand,
 ) -> Result<String, diesel::result::Error> {
-    use diesel::sql_types::{Integer, Text, Timestamp};
+    use diesel::sql_types::{Text, Timestamp};
     if command.request_id.is_empty() || command.request_id.len() > 256 {
         return Ok("invalid request ID".into());
     }
@@ -885,12 +1001,11 @@ pub fn apply_answer(
     let fingerprint = serde_json::to_string(&command.answer)
         .map_err(|e| diesel::result::Error::SerializationError(Box::new(e)))?;
     conn.transaction(|conn| {
-        diesel::sql_query("DELETE FROM control_answer_results WHERE expires_at <= ?")
+        diesel::sql_query("DELETE FROM application_kv WHERE substr(key,1,22)='control_answer_result/' AND json_extract(value,'$.expires_at') <= ?")
             .bind::<Timestamp, _>(command.applied_at)
             .execute(conn)?;
-        if let Some(previous) = diesel::sql_query("SELECT fingerprint, result FROM control_answer_results WHERE node_id = ? AND request_id = ?")
-            .bind::<Integer, _>(command.node_id)
-            .bind::<Text, _>(&command.request_id)
+        if let Some(previous) = diesel::sql_query("SELECT json_extract(value,'$.fingerprint') AS fingerprint, json_extract(value,'$.result') AS result FROM application_kv WHERE key = ?")
+            .bind::<Text, _>(format!("control_answer_result/{}/{}", command.node_id, command.request_id))
             .get_result::<AnswerResult>(conn).optional()?
         {
             return Ok(if previous.fingerprint == fingerprint {
@@ -912,9 +1027,12 @@ pub fn apply_answer(
                     Some(endpoint) => tunnel_endpoint_ipv6(conn, command.answer.tunnel_id)? != endpoint.is_ipv6(),
                     None => false,
                 };
+                let underlay_conflict = if let Some(ip) = command.answer.endpoint.as_deref().and_then(|s| s.parse::<std::net::SocketAddr>().ok()).map(|s| s.ip()) {
+                    l2tp_v2_rows(conn)?.iter().filter(|r| r.wireguard_tunnel_id.is_some()).any(|r| [&r.endpoint_peer1, &r.endpoint_peer2].iter().any(|s| s.parse::<std::net::IpAddr>().ok() == Some(ip)))
+                } else { false };
                 if command.answer.decline_type.is_some_and(|value| !matches!(value, 2 | 3)) {
                     "invalid decline type".to_string()
-                } else if invalid_endpoint || wrong_family {
+                } else if invalid_endpoint || wrong_family || underlay_conflict {
                     "invalid tunnel endpoint".to_string()
                 } else {
                     answer_wireguard_tunnel(conn, command.answer.tunnel_id, command.node_id,
@@ -931,9 +1049,8 @@ pub fn apply_answer(
         // ponytail: 24-hour durable answer retries; extend with replicated client retry contracts before HA rollout.
         let expires_at = command.applied_at.checked_add_signed(chrono::Duration::hours(24))
             .ok_or(diesel::result::Error::RollbackTransaction)?;
-        diesel::sql_query("INSERT INTO control_answer_results (node_id, request_id, fingerprint, result, expires_at) VALUES (?, ?, ?, ?, ?)")
-            .bind::<Integer, _>(command.node_id)
-            .bind::<Text, _>(&command.request_id)
+        diesel::sql_query("INSERT INTO application_kv (key, value) VALUES (?, json_object('fingerprint', ?, 'result', ?, 'expires_at', ?))")
+            .bind::<Text, _>(format!("control_answer_result/{}/{}", command.node_id, command.request_id))
             .bind::<Text, _>(&fingerprint)
             .bind::<Text, _>(&result)
             .bind::<Timestamp, _>(expires_at)
@@ -948,10 +1065,9 @@ pub(crate) fn accepted_answer_recipients(
     request: &str,
     answer: &cat4igp_shared::control::TunnelAnswer,
 ) -> Result<Vec<i32>, diesel::result::Error> {
-    use diesel::sql_types::{Integer, Text};
-    let previous = diesel::sql_query("SELECT fingerprint, result FROM control_answer_results WHERE node_id = ? AND request_id = ?")
-        .bind::<Integer, _>(node)
-        .bind::<Text, _>(request)
+    use diesel::sql_types::Text;
+    let previous = diesel::sql_query("SELECT json_extract(value,'$.fingerprint') AS fingerprint, json_extract(value,'$.result') AS result FROM application_kv WHERE key = ?")
+        .bind::<Text, _>(format!("control_answer_result/{node}/{request}"))
         .get_result::<AnswerResult>(conn).optional()?;
     let fingerprint = serde_json::to_string(answer)
         .map_err(|e| diesel::result::Error::SerializationError(Box::new(e)))?;

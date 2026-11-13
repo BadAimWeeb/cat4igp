@@ -10,10 +10,23 @@ use crate::config::ClientConfig;
 use crate::network::ports::PortRange;
 
 pub mod wireguard;
+#[cfg(target_os = "linux")]
+mod l2tp;
+#[cfg(target_os = "linux")]
+mod l2tp_v2;
+#[cfg(target_os = "linux")]
+pub(crate) mod l2tp_v2_policy;
 
 #[derive(Clone)]
 pub struct DaemonMemory {
     wireguard: Arc<Mutex<HashMap<i32, wireguard::WireguardTunnelC>>>,
+    #[cfg(target_os = "linux")]
+    l2tp: Arc<Mutex<HashMap<i32, l2tp::ActiveL2tp>>>,
+    #[cfg(target_os = "linux")]
+    l2tp_v2: Arc<Mutex<HashMap<i32, l2tp_v2::ActiveL2tpV2>>>,
+    l2tp_enabled: bool,
+    allow_insecure_l2tp: bool,
+    l2tp_excluded_ports: (u16, u16),
     pub(crate) port_mgmt: Arc<PortRange>,
     reserved_ports: Arc<Mutex<HashMap<i32, u16>>>,
     advertised_endpoints: Arc<Mutex<HashMap<i32, String>>>,
@@ -22,9 +35,24 @@ pub struct DaemonMemory {
 }
 
 impl DaemonMemory {
+    #[cfg(target_os = "linux")]
+    pub(super) async fn cleanup_l2tp(&self) -> Result<(), String> {
+        self.cleanup_l2tp_v2().await?;
+        self.remove_stale_l2tp(&cat4igp_shared::control::TopologySnapshot {
+            node_id: 0, revision: 0, tunnels: Vec::new(), l2tp_tunnels: Vec::new(), l2tp_v2_tunnels: Vec::new(), l2tp_availability: None,
+        }).await
+    }
+
     pub fn new(client_config: ClientConfig) -> Self {
         Self {
             wireguard: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(target_os = "linux")]
+            l2tp: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(target_os = "linux")]
+            l2tp_v2: Arc::new(Mutex::new(HashMap::new())),
+            l2tp_enabled: client_config.tunnel_protocols.l2tp,
+            allow_insecure_l2tp: client_config.allow_insecure_l2tp,
+            l2tp_excluded_ports: (client_config.port_range.min, client_config.port_range.max),
             port_mgmt: Arc::new(PortRange::new(
                 client_config.port_range.min,
                 client_config.port_range.max,
@@ -47,8 +75,20 @@ impl DaemonMemory {
         local_private_key: &str,
     ) -> Result<(), String> {
         self.set_wireguard_tunnels(snapshot.clone()).await;
-        self.reconcile_wireguard_tunnels(&snapshot, local_private_key)
-            .await
+        #[cfg(target_os = "linux")]
+        self.remove_stale_l2tp(&snapshot).await?;
+        #[cfg(target_os = "linux")]
+        self.remove_stale_l2tp_v2(&snapshot).await?;
+        self.reconcile_wireguard_tunnels(&snapshot, local_private_key).await?;
+        #[cfg(target_os = "linux")]
+        self.reconcile_l2tp(&snapshot).await?;
+        #[cfg(target_os = "linux")]
+        self.reconcile_l2tp_v2(&snapshot).await?;
+        #[cfg(not(target_os = "linux"))]
+        if !snapshot.l2tp_tunnels.is_empty() || !snapshot.l2tp_v2_tunnels.is_empty() {
+            return Err("L2TP requires Linux".into());
+        }
+        Ok(())
     }
 
     pub async fn set_last_poll_error(&self, error: Option<String>) {
@@ -235,6 +275,9 @@ async fn empty_snapshot_releases_inactive_reservations() {
                 node_id: 1,
                 revision: 1,
                 tunnels: vec![],
+                l2tp_tunnels: vec![],
+                l2tp_v2_tunnels: vec![],
+                l2tp_availability: None,
             },
             "",
         )

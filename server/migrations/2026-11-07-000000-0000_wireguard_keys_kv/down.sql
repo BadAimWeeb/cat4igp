@@ -1,0 +1,3 @@
+CREATE TABLE wireguard_static_key (node_id INTEGER NOT NULL PRIMARY KEY, public_key TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);
+INSERT INTO wireguard_static_key SELECT CAST(substr(key,15) AS INTEGER),json_extract(value,'$.public_key'),json_extract(value,'$.created_at') FROM application_kv WHERE substr(key,1,14)='wireguard_key/';
+DELETE FROM application_kv WHERE substr(key,1,14)='wireguard_key/';

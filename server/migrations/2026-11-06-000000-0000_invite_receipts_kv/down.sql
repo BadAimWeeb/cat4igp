@@ -1,0 +1,3 @@
+CREATE TABLE operator_invite_results (request_id TEXT PRIMARY KEY NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL);
+INSERT INTO operator_invite_results SELECT substr(key,length('operator_invite_result/')+1),json_extract(value,'$.fingerprint'),json_extract(value,'$.result') FROM application_kv WHERE substr(key,1,length('operator_invite_result/'))='operator_invite_result/';
+DELETE FROM application_kv WHERE substr(key,1,length('operator_invite_result/'))='operator_invite_result/';

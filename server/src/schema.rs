@@ -65,14 +65,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    wireguard_static_key (node_id) {
-        node_id -> Integer,
-        public_key -> Text,
-        created_at -> Timestamp,
-    }
-}
-
-diesel::table! {
     wireguard_tunnels (id) {
         id -> Integer,
         node_id_peer1 -> Integer,
@@ -91,53 +83,9 @@ diesel::table! {
 }
 
 diesel::table! {
-    administrator (id) {
-        id -> Integer,
-        username -> Text,
-        password_hash -> Text,
-    }
-}
-
-diesel::table! {
-    administrator_results (request_id) {
-        request_id -> Text,
-        fingerprint -> Text,
-        result -> Text,
-    }
-}
-
-diesel::table! {
-    operator_invite_results (request_id) {
-        request_id -> Text,
-        fingerprint -> Text,
-        result -> Text,
-    }
-}
-
-diesel::table! {
-    control_enrollment_results (peer_id) {
-        peer_id -> Text,
-        request_id -> Text,
-        fingerprint -> Text,
-        result -> Text,
-    }
-}
-
-diesel::table! {
-    control_answer_results (node_id, request_id) {
-        node_id -> Integer,
-        request_id -> Text,
-        fingerprint -> Text,
-        result -> Text,
-        expires_at -> Timestamp,
-    }
-}
-
-diesel::table! {
-    node_revocations (peer_id) {
-        peer_id -> Text,
-        node_id -> Integer,
-        revoked_at -> Timestamp,
+    application_kv (key) {
+        key -> Text,
+        value -> Text,
     }
 }
 
@@ -150,12 +98,7 @@ diesel::table! {
 }
 
 diesel::allow_tables_to_appear_in_same_query!(
-    administrator,
-    administrator_results,
-    operator_invite_results,
-    control_enrollment_results,
-    control_answer_results,
-    node_revocations,
+    application_kv,
     tunnel_intents,
     invites,
     mesh_group_memberships,
@@ -163,6 +106,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     node_control_identities,
     nodes,
     settings,
-    wireguard_static_key,
     wireguard_tunnels,
 );

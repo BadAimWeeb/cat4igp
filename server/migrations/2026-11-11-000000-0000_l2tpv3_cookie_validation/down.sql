@@ -1,0 +1,2 @@
+DROP TRIGGER l2tpv3_cookie_insert;
+DROP TRIGGER l2tpv3_cookie_update;

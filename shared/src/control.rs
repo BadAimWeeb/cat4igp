@@ -11,6 +11,42 @@ use sha2::Sha256;
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
 
+// ponytail: empty-capability reports only; add tested backend tuples and a leader-fenced exchange before provisioning.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct L2tpCapabilityReport {
+    pub version: u8,
+    pub network_id: String,
+    pub node_id: i32,
+    pub peer_id: String,
+    pub nonce: String,
+    pub supported: Vec<String>,
+}
+
+impl L2tpCapabilityReport {
+    fn signing_bytes(&self) -> Result<Vec<u8>, &'static str> {
+        if self.version != 1 || self.network_id.is_empty() || self.network_id.len() > 128
+            || self.node_id <= 0 || self.peer_id.len() > 128
+            || self.peer_id.parse::<libp2p::PeerId>().is_err()
+            || self.nonce.len() != 64 || !self.nonce.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            || !self.supported.is_empty() {
+            return Err("invalid L2TP capability report");
+        }
+        serde_json::to_vec(&("cat4igp/l2tp-capabilities/v1", self)).map_err(|_| "invalid L2TP capability report")
+    }
+
+    pub fn sign(&self, key: &identity::Keypair) -> Result<Vec<u8>, &'static str> {
+        if key.public().to_peer_id().to_string() != self.peer_id { return Err("capability identity mismatch"); }
+        key.sign(&self.signing_bytes()?).map_err(|_| "capability signing failed")
+    }
+
+    pub fn verify(&self, key: &identity::PublicKey, network_id: &str, node_id: i32, peer: &libp2p::PeerId, nonce: &str, signature: &[u8]) -> bool {
+        self.network_id == network_id && self.node_id == node_id && self.peer_id == peer.to_string()
+            && self.nonce == nonce && key.to_peer_id() == *peer && signature.len() <= 512
+            && self.signing_bytes().is_ok_and(|bytes| key.verify(&bytes, signature))
+    }
+}
+
 pub fn topology_topic(network_id: &str, node_id: i32) -> String {
     format!("/cat4igp/topology/v1/{network_id}/{node_id}")
 }
@@ -311,11 +347,67 @@ pub struct WireguardTunnelInfo {
     pub updated_at: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct L2tpTunnelInfo {
+    pub tunnel_id: i32,
+    pub peer_node_id: i32,
+    pub local_endpoint: String,
+    pub remote_endpoint: String,
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub local_session_id: u32,
+    pub remote_session_id: u32,
+    pub local_cookie: String,
+    pub remote_cookie: String,
+    pub security_mode: String,
+    pub wireguard_tunnel_id: Option<i32>,
+    pub mtu: i32,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct L2tpV2TunnelInfo {
+    pub tunnel_id: i32,
+    pub peer_node_id: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireguard_tunnel_id: Option<i32>,
+    pub local_endpoint: String,
+    pub remote_endpoint: String,
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub local_address: String,
+    pub remote_address: String,
+    pub secret: String,
+    pub mtu: u32,
+    pub initiator: bool,
+}
+
+impl std::fmt::Debug for L2tpV2TunnelInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("L2tpV2TunnelInfo")
+            .field("tunnel_id", &self.tunnel_id)
+            .field("peer_node_id", &self.peer_node_id)
+            .field("secret", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct L2tpAvailability {
+    pub v2: bool,
+    pub v3: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TopologySnapshot {
     pub node_id: i32,
     pub revision: i64,
     pub tunnels: Vec<WireguardTunnelInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub l2tp_tunnels: Vec<L2tpTunnelInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub l2tp_v2_tunnels: Vec<L2tpV2TunnelInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l2tp_availability: Option<L2tpAvailability>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
