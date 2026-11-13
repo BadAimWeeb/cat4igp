@@ -1,8 +1,7 @@
 use base32::Alphabet::Crockford;
 use cat4igp_libfec as FEC;
-use cat4igp_shared::control::WireguardTunnelInfo;
-use std::net::SocketAddr;
-use std::{error::Error, sync::Arc};
+use cat4igp_shared::{control::{TopologySnapshot, WireguardTunnelInfo}, custom_type::WireguardAnswered};
+use std::{collections::HashSet, error::Error, net::SocketAddr, sync::Arc};
 
 use crate::daemon::daemon_memory::DaemonMemory;
 use crate::tunnel::shared::Tunnel as _;
@@ -347,6 +346,125 @@ impl WireguardTunnelC {
 
     pub fn get_listen_port(&self) -> Option<u16> {
         self.os_tun.get_listen_port()
+    }
+}
+
+impl DaemonMemory {
+    pub async fn reconcile_wireguard_tunnels(
+        &self,
+        snapshot: &TopologySnapshot,
+        local_private_key: &str,
+    ) -> Result<(), String> {
+        let mut active = self.wireguard.lock().await;
+        let desired_ids: HashSet<i32> = snapshot
+            .tunnels
+            .iter()
+            .filter(|t| {
+                matches!(t.local_answered, WireguardAnswered::Answered)
+                    && matches!(t.remote_response, WireguardAnswered::Answered)
+            })
+            .map(|t| t.tunnel_id)
+            .collect();
+        let memory_arc = Arc::new(self.clone());
+
+        // Removals run before fallible creations; failed teardown stays tracked for the next poll.
+        let stale_ids: Vec<i32> = active
+            .keys()
+            .copied()
+            .filter(|id| !desired_ids.contains(id))
+            .collect();
+        let mut removal_error = None;
+        for id in stale_ids {
+            if let Some(stale) = active.get_mut(&id) {
+                let teardown = stale.teardown().await.map_err(|error| error.to_string());
+                match teardown {
+                    Ok(()) => {
+                        active.remove(&id);
+                        self.release_tunnel_port(id).await;
+                        self.advertised_endpoints.lock().await.remove(&id);
+                    }
+                    Err(error) => {
+                        removal_error = Some(format!("failed to teardown tunnel {id}: {error}"))
+                    }
+                }
+            }
+        }
+        let snapshot_ids: HashSet<i32> = snapshot.tunnels.iter().map(|t| t.tunnel_id).collect();
+        let unused: Vec<i32> = self
+            .reserved_ports
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .filter(|id| !snapshot_ids.contains(id) && !active.contains_key(id))
+            .collect();
+        for id in unused {
+            self.release_tunnel_port(id).await;
+            self.advertised_endpoints.lock().await.remove(&id);
+        }
+
+        for tunnel in &snapshot.tunnels {
+            let is_ready = matches!(tunnel.local_answered, WireguardAnswered::Answered)
+                && matches!(tunnel.remote_response, WireguardAnswered::Answered);
+            if !is_ready {
+                continue;
+            }
+
+            let tunnel_arc = Arc::new(tunnel.clone());
+            if let Some(existing) = active.get_mut(&tunnel.tunnel_id) {
+                existing
+                    .update_from_rest(tunnel_arc, memory_arc.clone())
+                    .await
+                    .map_err(|e| format!("failed to update tunnel {}: {}", tunnel.tunnel_id, e))?;
+                existing.activate().await.map_err(|e| {
+                    format!("failed to activate tunnel {}: {}", tunnel.tunnel_id, e)
+                })?;
+                continue;
+            }
+
+            let new_tunnel_result = WireguardTunnelC::new_from_rest(
+                tunnel_arc,
+                local_private_key.to_string(),
+                memory_arc.clone(),
+            )
+            .await
+            .map(|(tunnel, _)| tunnel)
+            .map_err(|error| error.to_string());
+            let mut new_tunnel = match new_tunnel_result {
+                Ok(tunnel) => tunnel,
+                Err(error) => {
+                    self.release_tunnel_port(tunnel.tunnel_id).await;
+                    return Err(format!(
+                        "failed to create tunnel {}: {error}",
+                        tunnel.tunnel_id
+                    ));
+                }
+            };
+
+            let activation_result = new_tunnel
+                .activate()
+                .await
+                .map_err(|error| error.to_string());
+            if let Err(error) = activation_result {
+                // A partially created interface must remain tracked if cleanup fails.
+                if new_tunnel.teardown().await.is_err() {
+                    active.insert(tunnel.tunnel_id, new_tunnel);
+                } else {
+                    self.release_tunnel_port(tunnel.tunnel_id).await;
+                    self.advertised_endpoints
+                        .lock()
+                        .await
+                        .remove(&tunnel.tunnel_id);
+                }
+                return Err(format!(
+                    "failed to setup tunnel {}: {error}",
+                    tunnel.tunnel_id
+                ));
+            }
+            active.insert(tunnel.tunnel_id, new_tunnel);
+        }
+
+        removal_error.map_or(Ok(()), Err)
     }
 }
 

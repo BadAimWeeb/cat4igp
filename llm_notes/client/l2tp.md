@@ -1,5 +1,13 @@
 # L2TPv3 Ethernet
 
+The client keeps separate active maps for WireGuard, L2TPv3 and L2TPv2,
+with reconciliation next to each backend in `client/src/daemon/daemon_memory/`.
+All three consume the same verified or cached topology snapshot. The common
+actuator removes stale L2TP dependents before changing WireGuard, then creates
+or updates WireGuard before creating its L2TP dependents. Failed cleanup stays
+tracked for retry; cached topology permits best-effort offline restoration.
+
+
 Linux clients support static L2TPv3 Ethernet over UDP, either directly or over a
 controller-managed WireGuard tunnel. Both endpoints must enable
 `[tunnel_protocols] l2tp = true` and have `/dev/net/tun` and `CAP_NET_ADMIN`.

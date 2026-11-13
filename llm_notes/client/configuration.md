@@ -19,6 +19,17 @@ Legacy `register --server ... --invite ...` and existing configs remain supporte
 This is singleton trusted enrollment against one standalone server. The client uses
 the configured server and pinned identity for control traffic.
 
+The daemon retains the last accepted topology and local UDP port assignments in
+its private state directory and attempts to restore tunnels at startup even if
+the controller is unreachable. It retries restoration while offline. This is
+best effort: changed peer endpoints, NAT mappings, local interfaces, policy,
+or unavailable tunnel dependencies can prevent connectivity. Deletions,
+revocations and new configuration cannot reach an isolated client until it
+reconnects; protect the cache and remove access through network controls when
+immediate revocation is required. The cache contains tunnel secrets and must be
+included in protected backups of the client state directory.
+
+
 ## Fixed-target client control relay
 
 An operator can configure a reachable client as a TCP relay to one fixed

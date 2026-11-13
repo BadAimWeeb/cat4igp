@@ -1,7 +1,6 @@
 use cat4igp_shared::control::TopologySnapshot;
-use cat4igp_shared::custom_type::WireguardAnswered;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::Arc,
 };
 use tokio::sync::{Mutex, RwLock};
@@ -30,7 +29,6 @@ pub struct DaemonMemory {
     pub(crate) port_mgmt: Arc<PortRange>,
     reserved_ports: Arc<Mutex<HashMap<i32, u16>>>,
     advertised_endpoints: Arc<Mutex<HashMap<i32, String>>>,
-    wireguard_tunnels: Arc<RwLock<Option<TopologySnapshot>>>,
     last_poll_error: Arc<RwLock<Option<String>>>,
 }
 
@@ -59,14 +57,10 @@ impl DaemonMemory {
             )),
             reserved_ports: Arc::new(Mutex::new(HashMap::new())),
             advertised_endpoints: Arc::new(Mutex::new(HashMap::new())),
-            wireguard_tunnels: Arc::new(RwLock::new(None)),
             last_poll_error: Arc::new(RwLock::new(None)),
         }
     }
 
-    pub async fn set_wireguard_tunnels(&self, wireguard_tunnels: TopologySnapshot) {
-        *self.wireguard_tunnels.write().await = Some(wireguard_tunnels);
-    }
 
     /// Applies a verified control-plane snapshot through the existing actuator boundary.
     pub async fn apply_topology_snapshot(
@@ -74,7 +68,7 @@ impl DaemonMemory {
         snapshot: TopologySnapshot,
         local_private_key: &str,
     ) -> Result<(), String> {
-        self.set_wireguard_tunnels(snapshot.clone()).await;
+        // Remove dependents before changing the WireGuard underlay.
         #[cfg(target_os = "linux")]
         self.remove_stale_l2tp(&snapshot).await?;
         #[cfg(target_os = "linux")]
@@ -112,6 +106,38 @@ impl DaemonMemory {
             .collect()
     }
 
+    pub(super) async fn cached_ports(&self) -> HashMap<i32, u16> {
+        self.reserved_ports.lock().await.clone()
+    }
+
+    pub(super) async fn restore_ports(&self, ports: &HashMap<i32, u16>) -> Result<(), String> {
+        let mut reserved = self.reserved_ports.lock().await;
+        let mut added = Vec::new();
+        for (&id, &port) in ports {
+            let result = if let Some(existing) = reserved.get(&id) {
+                if *existing == port { Ok(()) } else { Err(format!("conflicting cached port for tunnel {id}")) }
+            } else {
+                match self.port_mgmt.allocate(Some(port)) {
+                    Ok(allocated) if allocated == port => {
+                        reserved.insert(id, port);
+                        added.push((id, port));
+                        Ok(())
+                    }
+                    Ok(allocated) => {
+                        self.port_mgmt.release(allocated);
+                        Err(format!("cached port {port} unavailable for tunnel {id}"))
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            };
+            if let Err(error) = result {
+                for (id, port) in added { reserved.remove(&id); self.port_mgmt.release(port); }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn reserve_tunnel_port(&self, tunnel_id: i32) -> Result<u16, String> {
         let mut reserved = self.reserved_ports.lock().await;
         if let Some(port) = reserved.get(&tunnel_id) {
@@ -146,122 +172,6 @@ impl DaemonMemory {
             .insert(tunnel_id, endpoint);
     }
 
-    pub async fn reconcile_wireguard_tunnels(
-        &self,
-        snapshot: &TopologySnapshot,
-        local_private_key: &str,
-    ) -> Result<(), String> {
-        let mut active = self.wireguard.lock().await;
-        let desired_ids: HashSet<i32> = snapshot
-            .tunnels
-            .iter()
-            .filter(|t| {
-                matches!(t.local_answered, WireguardAnswered::Answered)
-                    && matches!(t.remote_response, WireguardAnswered::Answered)
-            })
-            .map(|t| t.tunnel_id)
-            .collect();
-        let memory_arc = Arc::new(self.clone());
-
-        // Removals run before fallible creations; failed teardown stays tracked for the next poll.
-        let stale_ids: Vec<i32> = active
-            .keys()
-            .copied()
-            .filter(|id| !desired_ids.contains(id))
-            .collect();
-        let mut removal_error = None;
-        for id in stale_ids {
-            if let Some(stale) = active.get_mut(&id) {
-                let teardown = stale.teardown().await.map_err(|error| error.to_string());
-                match teardown {
-                    Ok(()) => {
-                        active.remove(&id);
-                        self.release_tunnel_port(id).await;
-                        self.advertised_endpoints.lock().await.remove(&id);
-                    }
-                    Err(error) => {
-                        removal_error = Some(format!("failed to teardown tunnel {id}: {error}"))
-                    }
-                }
-            }
-        }
-        let snapshot_ids: HashSet<i32> = snapshot.tunnels.iter().map(|t| t.tunnel_id).collect();
-        let unused: Vec<i32> = self
-            .reserved_ports
-            .lock()
-            .await
-            .keys()
-            .copied()
-            .filter(|id| !snapshot_ids.contains(id) && !active.contains_key(id))
-            .collect();
-        for id in unused {
-            self.release_tunnel_port(id).await;
-            self.advertised_endpoints.lock().await.remove(&id);
-        }
-
-        for tunnel in &snapshot.tunnels {
-            let is_ready = matches!(tunnel.local_answered, WireguardAnswered::Answered)
-                && matches!(tunnel.remote_response, WireguardAnswered::Answered);
-            if !is_ready {
-                continue;
-            }
-
-            let tunnel_arc = Arc::new(tunnel.clone());
-            if let Some(existing) = active.get_mut(&tunnel.tunnel_id) {
-                existing
-                    .update_from_rest(tunnel_arc, memory_arc.clone())
-                    .await
-                    .map_err(|e| format!("failed to update tunnel {}: {}", tunnel.tunnel_id, e))?;
-                existing.activate().await.map_err(|e| {
-                    format!("failed to activate tunnel {}: {}", tunnel.tunnel_id, e)
-                })?;
-                continue;
-            }
-
-            let new_tunnel_result = wireguard::WireguardTunnelC::new_from_rest(
-                tunnel_arc,
-                local_private_key.to_string(),
-                memory_arc.clone(),
-            )
-            .await
-            .map(|(tunnel, _)| tunnel)
-            .map_err(|error| error.to_string());
-            let mut new_tunnel = match new_tunnel_result {
-                Ok(tunnel) => tunnel,
-                Err(error) => {
-                    self.release_tunnel_port(tunnel.tunnel_id).await;
-                    return Err(format!(
-                        "failed to create tunnel {}: {error}",
-                        tunnel.tunnel_id
-                    ));
-                }
-            };
-
-            let activation_result = new_tunnel
-                .activate()
-                .await
-                .map_err(|error| error.to_string());
-            if let Err(error) = activation_result {
-                // A partially created interface must remain tracked if cleanup fails.
-                if new_tunnel.teardown().await.is_err() {
-                    active.insert(tunnel.tunnel_id, new_tunnel);
-                } else {
-                    self.release_tunnel_port(tunnel.tunnel_id).await;
-                    self.advertised_endpoints
-                        .lock()
-                        .await
-                        .remove(&tunnel.tunnel_id);
-                }
-                return Err(format!(
-                    "failed to setup tunnel {}: {error}",
-                    tunnel.tunnel_id
-                ));
-            }
-            active.insert(tunnel.tunnel_id, new_tunnel);
-        }
-
-        removal_error.map_or(Ok(()), Err)
-    }
 }
 
 #[tokio::test]

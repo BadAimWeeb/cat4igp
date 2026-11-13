@@ -18,6 +18,7 @@ use cat4igp_shared::{
 pub mod client;
 pub mod control;
 mod control_relay;
+mod topology_cache;
 mod daemon_memory;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use daemon_memory::l2tp_v2_policy;
@@ -618,6 +619,11 @@ impl Daemon {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         println!("✓ Listening on socket: {:?}", self.config.daemon_socket);
 
+        if let Err(error) = self.restore_cached_topology().await {
+            eprintln!("[daemon] cached topology restore failed: {error}");
+            self.memory.set_last_poll_error(Some(error)).await;
+        }
+
         if let Some(relay) = &self.config.control_relay {
             if relay.listen.port() == 0 || relay.target.port() == 0 || relay.target.ip().is_unspecified()
                 || relay.target.ip().is_multicast() || relay.listen == relay.target
@@ -755,6 +761,9 @@ impl Daemon {
         loop {
             interval.tick().await;
             if let Err(error) = self.sync_control_snapshot().await {
+                if let Err(restore_error) = self.restore_cached_topology().await {
+                    eprintln!("[daemon] cached topology retry failed: {restore_error}");
+                }
                 if error != "control plane is not enrolled" {
                     eprintln!("[daemon] control snapshot sync failed: {error}");
                     self.memory.set_last_poll_error(Some(error)).await;
@@ -790,6 +799,36 @@ impl Daemon {
             }
         }
     }
+    async fn restore_cached_topology(&self) -> Result<(), String> {
+        let _sync = self.control_sync.lock().await;
+        let Some(mut config) = self.server_config.lock().await.clone() else { return Ok(()); };
+        if config.control_node_id.is_none() { return Ok(()); }
+        let (snapshot, ports) = match topology_cache::load(&self.config.data_dir, &config) {
+            Ok(cache) => cache,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        if snapshot.revision > config.topology_revision {
+            config.topology_revision = snapshot.revision;
+            config.save(&self.config.data_dir).map_err(|e| e.to_string())?;
+            *self.server_config.lock().await = Some(config.clone());
+        }
+        self.memory.restore_ports(&ports).await?;
+        let key = config.wg_private_key.as_deref().filter(|s| !s.is_empty())
+            .ok_or("wireguard private key missing from server configuration")?;
+        self.memory.apply_topology_snapshot(snapshot, key).await
+    }
+
+    async fn cache_topology(&self, config: &mut ServerConfig, snapshot: &TopologySnapshot) -> Result<(), String> {
+        let mut ports = self.memory.cached_ports().await;
+        ports.retain(|id, _| snapshot.tunnels.iter().any(|tunnel| tunnel.tunnel_id == *id));
+        topology_cache::save(&self.config.data_dir, config, snapshot, &ports).map_err(|e| e.to_string())?;
+        config.topology_revision = snapshot.revision;
+        config.save(&self.config.data_dir).map_err(|e| e.to_string())?;
+        *self.server_config.lock().await = Some(config.clone());
+        Ok(())
+    }
+
 
     async fn apply_pushed_snapshot(&self, snapshot: TopologySnapshot) -> Result<(), String> {
         let _sync = self.control_sync.lock().await;
@@ -800,7 +839,7 @@ impl Daemon {
             .clone()
             .ok_or_else(|| "control plane is not enrolled".to_string())?;
         if snapshot.node_id != config.control_node_id.unwrap_or_default()
-            || snapshot.revision <= config.topology_revision
+            || snapshot.revision < config.topology_revision
         {
             return Ok(());
         }
@@ -810,16 +849,16 @@ impl Daemon {
             .filter(|key| !key.is_empty())
             .ok_or_else(|| "wireguard private key missing from server configuration".to_string())?
             .to_owned();
-        self.answer_pending_tunnels(&mut config, &snapshot).await?;
+        self.cache_topology(&mut config, &snapshot).await?;
+        if let Err(error) = self.answer_pending_tunnels(&mut config, &snapshot).await {
+            eprintln!("[daemon] topology answer failed: {error}");
+        }
+        self.cache_topology(&mut config, &snapshot).await?;
         self.memory
             .apply_topology_snapshot(snapshot.clone(), &private_key)
             .await?;
         self.report_connectivity().await;
-        config.topology_revision = snapshot.revision;
-        config
-            .save(&self.config.data_dir)
-            .map_err(|error| error.to_string())?;
-        *self.server_config.lock().await = Some(config);
+        self.cache_topology(&mut config, &snapshot).await?;
         if self.memory.disconnected_tunnel_ids().await.is_empty() {
             self.memory.set_last_poll_error(None).await;
         }
@@ -897,16 +936,16 @@ impl Daemon {
                         "wireguard private key missing from server configuration".to_string()
                     })?
                     .to_owned();
-                self.answer_pending_tunnels(&mut config, &snapshot).await?;
+                self.cache_topology(&mut config, &snapshot).await?;
+                if let Err(error) = self.answer_pending_tunnels(&mut config, &snapshot).await {
+                    eprintln!("[daemon] topology answer failed: {error}");
+                }
+                self.cache_topology(&mut config, &snapshot).await?;
                 self.memory
                     .apply_topology_snapshot(snapshot.clone(), &private_key)
                     .await?;
                 self.report_connectivity().await;
-                config.topology_revision = snapshot.revision;
-                config
-                    .save(&self.config.data_dir)
-                    .map_err(|error| error.to_string())?;
-                *self.server_config.lock().await = Some(config);
+                self.cache_topology(&mut config, &snapshot).await?;
                 if self.memory.disconnected_tunnel_ids().await.is_empty() {
                     self.memory.set_last_poll_error(None).await;
                 }
