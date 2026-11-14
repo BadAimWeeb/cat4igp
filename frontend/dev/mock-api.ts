@@ -57,7 +57,7 @@ export function createMockApi() {
       last_seen: id === 3 ? null : stamp(),
     })),
     meshes: [
-      { id: 1, name: "Demo mesh", auto_wireguard: true, mtu: 1420, fec: false },
+      { id: 1, name: "Demo mesh", auto_wireguard: true, mtu: 1420, fec: false, faketcp: false },
     ],
     memberships: [
       { mesh_id: 1, node_id: 1 },
@@ -216,12 +216,14 @@ export function createMockApi() {
       }
       case "create_mesh": {
         if (!Object.hasOwn(b, "fec")) b.fec = false;
-        fields(b, ["action", "name", "auto_wireguard", "mtu", "fec"]);
+        if (!Object.hasOwn(b, "faketcp")) b.faketcp = false;
+        fields(b, ["action", "name", "auto_wireguard", "mtu", "fec", "faketcp"]);
         requireValue(
           name(b.name) &&
             typeof b.auto_wireguard === "boolean" &&
             typeof b.fec === "boolean" &&
-            (b.auto_wireguard || !b.fec) &&
+            typeof b.faketcp === "boolean" &&
+            (b.auto_wireguard || (!b.fec && !b.faketcp)) &&
             uint(b.mtu) &&
             ((b.mtu >= 1280 && b.mtu <= 9000) ||
               (!b.auto_wireguard && b.mtu === 0)),
@@ -233,6 +235,7 @@ export function createMockApi() {
           auto_wireguard: b.auto_wireguard as boolean,
           mtu: b.auto_wireguard ? (b.mtu as number) : 0,
           fec: b.fec as boolean,
+          faketcp: b.faketcp as boolean,
         });
         return { committed: true, mesh_id: id };
       }
@@ -261,6 +264,18 @@ export function createMockApi() {
           typeof b.fec === "boolean" && (m.auto_wireguard || !b.fec),
         );
         m.fec = b.fec as boolean;
+        for (const t of inventory.tunnels)
+          if (t.intents.some((i) => i.kind === "mesh" && i.mesh_id === m.id)) {
+            affected.add(t.node_id_peer1);
+            affected.add(t.node_id_peer2);
+          }
+        break;
+      }
+      case "set_mesh_faketcp": {
+        fields(b, ["action", "id", "faketcp"]);
+        const m = mesh(b.id);
+        requireValue(typeof b.faketcp === "boolean" && (m.auto_wireguard || !b.faketcp));
+        m.faketcp = b.faketcp as boolean;
         for (const t of inventory.tunnels)
           if (t.intents.some((i) => i.kind === "mesh" && i.mesh_id === m.id)) {
             affected.add(t.node_id_peer1);

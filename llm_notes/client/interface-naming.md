@@ -48,6 +48,14 @@ The following are the currently defined protocols:
 
 cat4igp includes support for Forward Error Correction (FEC) to UDP-based protocols to improve performance on lossy networks. This is inspired by [UDPspeeder](https://github.com/wangyu-/UDPspeeder), but this is not going to be compatible with it.
 
-~~[FakeTCP](https://github.com/wangyu-/udp2raw) is also supported, to work around the issue of UDP traffic being throttled or blocked on certain networks. However, since FakeTCP is not a true TCP implementation and may not be compatible with all network environments, users should be aware of its limitations and potential issues when using it.~~ (to be done as an internal library)
+FakeTCP wraps WireGuard datagrams in authenticated TCP-shaped packets on Linux.
+It requires root or `CAP_NET_RAW` and `CAP_NET_ADMIN`, an `nft` executable,
+and a configured public IPv4/IPv6 hostname plus TCP port forwarding. UDP STUN
+cannot discover TCP mappings. It is not compatible with udp2raw, does not
+implement TCP retransmission or congestion control, and may fail through NAT,
+stateful firewalls or DPI; it is not guaranteed censorship circumvention.
+The inner WireGuard protocol supplies confidentiality. Each active tunnel owns
+an nftables table; normal teardown removes it, but a crash or SIGKILL can leave
+tables named `cat4igp_ft_*` for an administrator to inspect and remove.
 
 Protocol that is not designed to circumvent censorship and are UDP-based (QUIC-based are exempt) should add a flag to allow for FEC and FakeTCP implementation & indication.

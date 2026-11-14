@@ -103,6 +103,7 @@ pub struct MeshGroup {
     pub auto_wireguard_mtu: i32,
     pub created_at: chrono::NaiveDateTime,
     pub auto_wireguard_fec: bool,
+    pub auto_wireguard_faketcp: bool,
 }
 
 #[derive(Insertable)]

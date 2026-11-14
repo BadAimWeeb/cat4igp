@@ -983,7 +983,7 @@ impl Daemon {
                 .as_millis()
                 .try_into()
                 .map_err(|_| "system clock is out of range".to_string())?;
-            let (endpoint, decline_type) = if tunnel.faketcp {
+            let (endpoint, decline_type) = if tunnel.faketcp && !cfg!(target_os = "linux") {
                 if matches!(tunnel.local_answered, WireguardAnswered::Unanswered) {
                     (None, Some(4))
                 } else {
@@ -1112,6 +1112,9 @@ impl Daemon {
                 return Err("configured endpoint is unspecified or multicast".to_string());
             }
             return Ok(address);
+        }
+        if tunnel.faketcp {
+            return Err("FakeTCP requires a configured public hostname and TCP port forwarding; UDP STUN cannot discover its endpoint".into());
         }
         let mut detector = crate::network::PublicIpDetector::new();
         detector.init().await?;

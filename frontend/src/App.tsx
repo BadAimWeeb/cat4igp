@@ -377,6 +377,7 @@ export function App() {
           name: checkedName(String(values.get("name"))),
           auto_wireguard: auto,
           fec: auto && values.get("fec") === "on",
+          faketcp: auto && values.get("faketcp") === "on",
           mtu,
         },
         "Create mesh",

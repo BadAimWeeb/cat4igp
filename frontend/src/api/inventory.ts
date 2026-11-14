@@ -4,7 +4,7 @@ type Node = {
   created_at: string;
   last_seen: string | null;
 };
-type Mesh = { id: number; name: string; auto_wireguard: boolean; mtu: number; fec: boolean };
+type Mesh = { id: number; name: string; auto_wireguard: boolean; mtu: number; fec: boolean; faketcp?: boolean };
 type Membership = { mesh_id: number; node_id: number };
 type Invite = {
   id: number;
@@ -80,6 +80,7 @@ export function inventoryFrom(value: unknown): Inventory {
         text(r.name) &&
         typeof r.auto_wireguard === "boolean" &&
         typeof r.fec === "boolean" &&
+        (r.faketcp === undefined || typeof r.faketcp === "boolean") &&
         integer(r.mtu),
     ) ||
     !rows(data.memberships, (r) => integer(r.mesh_id) && integer(r.node_id)) ||

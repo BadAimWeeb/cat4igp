@@ -63,7 +63,7 @@ export function Meshes({
                 </TableCell>
                 <TableCell>
                   {m.auto_wireguard
-                    ? `MTU ${m.mtu}${m.fec ? " · FEC enabled" : ""}`
+                    ? `MTU ${m.mtu}${m.fec ? " · FEC enabled" : ""}${m.faketcp ? " · FakeTCP enabled" : ""}`
                     : "Disabled"}
                 </TableCell>
                 <TableCell>
@@ -89,6 +89,13 @@ export function Meshes({
                           { action: "set_mesh_fec", id: m.id, fec: !m.fec },
                           `${m.fec ? "Disable" : "Enable"} WireGuard FEC for ${meshName(m.id)}`,
                           "Applies only to current and future IPv4 and IPv6 WireGuard tunnels in this mesh. Other protocols use their own FEC settings. Existing WireGuard tunnels restart as clients converge. Shared tunnels keep FEC if another mesh or their explicit setting requires it.",
+                        ),
+                      }, {
+                        label: `${m.faketcp ? "Disable" : "Enable"} FakeTCP for all WireGuard tunnels…`,
+                        onClick: () => confirmed(
+                          { action: "set_mesh_faketcp", id: m.id, faketcp: !m.faketcp },
+                          `${m.faketcp ? "Disable" : "Enable"} WireGuard FakeTCP for ${meshName(m.id)}`,
+                          "Applies to current and future WireGuard tunnels in this mesh. Linux clients need raw socket privileges and nftables. Tunnels restart as clients converge. Shared tunnels keep FakeTCP if another mesh or their explicit setting requires it.",
                         ),
                       }] : []),
                       {
@@ -196,6 +203,11 @@ export function CreateMesh({
               label="Enable FEC for WireGuard only"
             />
             <small className="muted">Other protocols use their own FEC settings.</small>
+            <FormControlLabel
+              control={<Switch name="faketcp" disabled={disabled || !auto} />}
+              label="Enable FakeTCP for WireGuard only"
+            />
+            <small className="muted">Linux clients require raw socket privileges and nftables.</small>
             <NumberField
               size="small"
               label="MTU"

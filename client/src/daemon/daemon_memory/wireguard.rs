@@ -13,6 +13,9 @@ pub struct WireguardTunnelC {
     os_tun: crate::tunnel::wireguard::WireGuardTunnel,
     mtu: i32,
     fec: Option<Arc<FEC::PeerEngine>>,
+    #[cfg(target_os = "linux")]
+    faketcp: Option<crate::network::faketcp::FakeTcp>,
+    fake_peer: Option<SocketAddr>,
 }
 
 impl WireguardTunnelC {
@@ -32,6 +35,9 @@ impl WireguardTunnelC {
             mtu,
             os_tun,
             fec,
+            #[cfg(target_os = "linux")]
+            faketcp: None,
+            fake_peer: None,
         }
     }
 
@@ -44,15 +50,30 @@ impl WireguardTunnelC {
             .reserve_tunnel_port(rest_info.tunnel_id)
             .await
             .map_err(std::io::Error::other)?;
-        if let Some(peer) = rest_info
-            .remote_endpoint
-            .as_deref()
-            .and_then(|endpoint| endpoint.parse().ok())
-        {
-            // ponytail: use the active WireGuard/FEC socket for retries when socket handoff is supported.
+        let peer = rest_info.remote_endpoint.as_deref().map(str::parse::<SocketAddr>).transpose()?;
+        #[cfg(target_os = "linux")]
+        let mut faketcp = None;
+        let mut transport_info = (*rest_info).clone();
+        let mut transport_port = port;
+        if rest_info.faketcp {
+            #[cfg(target_os = "linux")]
+            {
+                let peer = peer.ok_or("FakeTCP requires a remote endpoint")?;
+                let local = wireguard_control::Key::from_base64(&local_private_key)?;
+                let remote = wireguard_control::Key::from_base64(&rest_info.public_key)?;
+                let key = FEC::tunnel_psk(local.0, remote.0, rest_info.tunnel_id).ok_or("invalid FakeTCP peer key")?;
+                transport_port = crate::network::ports::get_random_udp_port()?;
+                let bridge = crate::network::faketcp::FakeTcp::start(port, peer, ([127, 0, 0, 1], transport_port).into(), key).await?;
+                transport_info.remote_endpoint = Some(bridge.local_addr().to_string());
+                transport_info.endpoint_ipv6 = false;
+                faketcp = Some(bridge);
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err("FakeTCP requires Linux".into());
+        } else if let Some(peer) = peer {
             let _ = crate::network::ports::punch_udp(port, peer).await;
         }
-        let fec_res = Self::gen_new_fec(rest_info.clone(), port, &local_private_key).await?;
+        let fec_res = Self::gen_new_fec(Arc::new(transport_info.clone()), transport_port, &local_private_key).await?;
 
         let (fec, os_tun) = if let Some((fec, fec_listen_port, wg_port)) = fec_res {
             let fec1 = fec.clone();
@@ -69,9 +90,13 @@ impl WireguardTunnelC {
         } else {
             (
                 None,
-                Self::gen_new_wg_tunnel(rest_info.clone(), local_private_key, None, port, 0),
+                Self::gen_new_wg_tunnel(rest_info.clone(), local_private_key, None, transport_port, 0),
             )
         };
+        let mut os_tun = os_tun;
+        if rest_info.faketcp && fec.is_none() {
+            os_tun.set_peer_endpoint(transport_info.remote_endpoint.as_deref().ok_or("missing FakeTCP bridge")?.parse()?);
+        }
 
         Ok((
             Self {
@@ -80,6 +105,9 @@ impl WireguardTunnelC {
                 ipv6: rest_info.endpoint_ipv6,
                 mtu: rest_info.mtu,
                 fec,
+                #[cfg(target_os = "linux")]
+                faketcp,
+                fake_peer: if rest_info.faketcp { peer } else { None },
                 os_tun,
             },
             port,
@@ -215,6 +243,19 @@ impl WireguardTunnelC {
         if self.tunnel_id != rest_info.tunnel_id || self.peer_node_id != rest_info.peer_node_id {
             return Err("Tunnel ID or peer node ID mismatch".into());
         }
+        #[cfg(target_os = "linux")]
+        let transport_failed = self.faketcp.as_ref().is_some_and(|bridge| !bridge.is_running());
+        #[cfg(not(target_os = "linux"))]
+        let transport_failed = false;
+        let new_peer = rest_info.remote_endpoint.as_deref().map(str::parse::<SocketAddr>).transpose()?;
+        if transport_failed || self.fake_peer.is_some() != rest_info.faketcp || (rest_info.faketcp && (self.fake_peer != new_peer || self.fec.is_some() != rest_info.fec || self.ipv6 != rest_info.endpoint_ipv6)) {
+            let private_key = self.os_tun.get_local_private_key().to_owned();
+            self.teardown().await?;
+            let (replacement, _) = Self::new_from_rest(rest_info, private_key, daemon_memory).await?;
+            *self = replacement;
+            return Ok(());
+        }
+        if rest_info.faketcp { self.mtu = rest_info.mtu; return Ok(()); }
 
         self.mtu = rest_info.mtu;
         if self.ipv6 != rest_info.endpoint_ipv6 || self.fec.is_some() != rest_info.fec {
@@ -298,7 +339,15 @@ impl WireguardTunnelC {
     }
 
     pub async fn teardown(&mut self) -> Result<(), Box<dyn Error>> {
-        self.os_tun.destroy().await
+        self.os_tun.destroy().await?;
+        #[cfg(target_os = "linux")]
+        if let Some(bridge) = &mut self.faketcp { bridge.stop().await?; }
+        #[cfg(target_os = "linux")]
+        { self.faketcp = None; }
+        if let Some(fec) = self.fec.take() {
+            Arc::try_unwrap(fec).map_err(|_| "FEC engine still in use")?.shutdown().await;
+        }
+        Ok(())
     }
 
     pub fn is_connected(&self) -> bool {

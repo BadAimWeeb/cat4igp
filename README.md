@@ -18,3 +18,11 @@ This will attempt to address those drawbacks.
 
 Client packages for Alpine, Debian, Arch Linux and OpenWrt, plus portable static binaries, are
 built by GitHub Actions. The server is published as a multiarchitecture Alpine image in GitHub Packages.
+
+### WireGuard mesh FakeTCP
+
+Administrators can enable FakeTCP when creating an Auto WireGuard mesh or toggle it later in the mesh actions. It applies to current and future mesh-owned WireGuard tunnels; changing it causes clients to converge on the new configuration. A tunnel shared by multiple meshes uses FakeTCP if any owning mesh enables it, or if its explicit per-tunnel flag is set. Other tunnel protocols are unaffected.
+
+FakeTCP is disabled by default for existing meshes and requests that omit the setting. It requires Linux clients with raw-socket privileges and nftables; enable it only when both ends support it. FakeTCP disguises packet framing as TCP, not as a reliable TCP connection, and does not replace WireGuard encryption.
+
+The administrator `create_mesh` action accepts optional boolean `faketcp` (default `false`); enabling it requires `auto_wireguard: true`. Use `{"action":"set_mesh_faketcp","id":1,"faketcp":true}` to change an existing mesh. Inventory mesh entries report the boolean as `faketcp`. Disabling a mesh policy does not override another owning mesh or an explicit tunnel setting.

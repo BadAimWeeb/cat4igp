@@ -29,6 +29,7 @@ diesel::table! {
         auto_wireguard_mtu -> Integer,
         created_at -> Timestamp,
         auto_wireguard_fec -> Bool,
+        auto_wireguard_faketcp -> Bool,
     }
 }
 

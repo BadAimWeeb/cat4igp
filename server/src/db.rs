@@ -611,6 +611,14 @@ pub fn topology_snapshot(
         .load::<i32>(conn)?
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
+    let faketcp_tunnels = ti::table
+        .inner_join(mg::table.on(ti::mesh_id.eq(mg::id)))
+        .filter(ti::kind.eq("mesh"))
+        .filter(mg::auto_wireguard_faketcp.eq(true))
+        .select(ti::tunnel_id)
+        .load::<i32>(conn)?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
     let tunnels = get_wireguard_answers(conn, node_id_val)?;
     let tunnels = tunnels
         .into_iter()
@@ -652,7 +660,7 @@ pub fn topology_snapshot(
                 mtu: tunnel.mtu,
                 endpoint_ipv6: tunnel.endpoint_ipv6,
                 fec: tunnel.fec || fec_tunnels.contains(&tunnel.id),
-                faketcp: tunnel.faketcp,
+                faketcp: tunnel.faketcp || faketcp_tunnels.contains(&tunnel.id),
                 created_at: tunnel.created_at.and_utc().timestamp_millis(),
                 updated_at: tunnel.updated_at.and_utc().timestamp_millis(),
             })

@@ -106,6 +106,7 @@ try {
   await action({ ...create, name: "changed" }, key, 409);
   assert.equal(api.state.inventory.meshes.length, 2);
   assert.equal(api.state.inventory.meshes.at(-1).fec, false);
+  assert.equal(api.state.inventory.meshes.at(-1).faketcp, false);
   const mtuKey = randomUUID();
   const mtuAction = { action: "set_mesh_mtu", id: 1, mtu: 1380 };
   const mtuResult = (await action(mtuAction, mtuKey)).data;
@@ -147,6 +148,16 @@ try {
     true,
   );
   await action({ ...create, fec: true }, randomUUID(), 409);
+  const fakeAction = { action: "set_mesh_faketcp", id: 1, faketcp: true };
+  const fakeKey = randomUUID();
+  const fakeResult = (await action(fakeAction, fakeKey)).data;
+  assert.deepEqual((await action(fakeAction, fakeKey)).data, fakeResult);
+  assert.equal(inventoryFrom((await call("/admin/inventory")).data).meshes[0].faketcp, true);
+  await action({ ...fakeAction, faketcp: false }, fakeKey, 409);
+  await action({ ...fakeAction, faketcp: "true" }, randomUUID(), 409);
+  await action({ ...fakeAction, id: first.mesh_id }, randomUUID(), 409);
+  await action({ ...create, faketcp: true }, randomUUID(), 409);
+  await action({ ...fakeAction, faketcp: false });
   await action({ action: "delete_mesh", id: fecMesh.mesh_id });
   await action({ action: "rename_node", id: 1, name: "renamed" });
   assert.equal(api.state.inventory.nodes[0].name, "renamed");

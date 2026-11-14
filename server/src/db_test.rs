@@ -453,7 +453,7 @@ fn mesh_fec_policy_shared_tunnels_revisions_and_rollback() {
     let command = |key: &str, action| Mutation { request_id: key.into(), action, applied_at: at };
     for (id, fec) in [(1, false), (2, true)] {
         let create = command(&format!("create-{id}"), Action::CreateMesh {
-            name: format!("mesh-{id}"), auto_wireguard: true, mtu: 1420, fec,
+            name: format!("mesh-{id}"), auto_wireguard: true, mtu: 1420, fec, faketcp: false,
         });
         assert!(crate::admin::apply(&mut conn, &create).unwrap().is_ok());
         for node_id in [1, 2] {
@@ -499,12 +499,59 @@ fn mesh_fec_policy_shared_tunnels_revisions_and_rollback() {
     assert!(crate::admin::apply(&mut conn, &command("legacy", action)).unwrap().is_ok());
     assert_eq!(crate::admin::read(&mut conn, Operation::Inventory).unwrap()["meshes"][2]["fec"], false);
     assert!(crate::admin::apply(&mut conn, &command("no-auto", Action::CreateMesh {
-        name: "no-auto".into(), auto_wireguard: false, mtu: 0, fec: false,
+        name: "no-auto".into(), auto_wireguard: false, mtu: 0, fec: false, faketcp: false,
     })).unwrap().is_ok());
     for (key, action) in [
-        ("bad-create", Action::CreateMesh { name: "bad".into(), auto_wireguard: false, mtu: 0, fec: true }),
+        ("bad-create", Action::CreateMesh { name: "bad".into(), auto_wireguard: false, mtu: 0, fec: true, faketcp: false }),
         ("bad-update", Action::SetMeshFec { id: 4, fec: true }),
         ("missing", Action::SetMeshFec { id: 999, fec: true }),
+    ] {
+        assert!(crate::admin::apply(&mut conn, &command(key, action)).unwrap().is_err());
+    }
+}
+
+#[test]
+fn mesh_faketcp_policy_preserves_shared_and_explicit_settings() {
+    use crate::admin::{Action, Mutation, Operation};
+    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    migrate(&mut conn, true).unwrap();
+    conn.batch_execute("INSERT INTO nodes(id,name,auth_key) VALUES(1,'a','a'),(2,'b','b'),(3,'c','c');
+        INSERT INTO application_kv SELECT 'wireguard_key/' || id, json_object('public_key',auth_key,'created_at','2026-01-01') FROM nodes;
+        INSERT INTO node_control_identities(node_id,peer_id,signing_key,encryption_key) VALUES(1,'a','a','a'),(2,'b','b','b'),(3,'c','c','c');").unwrap();
+    let at = chrono::Utc::now().naive_utc();
+    let command = |key: &str, action| Mutation { request_id: key.into(), action, applied_at: at };
+    for (id, faketcp) in [(1, false), (2, true)] {
+        assert!(crate::admin::apply(&mut conn, &command(&format!("create-{id}"), Action::CreateMesh {
+            name: format!("mesh-{id}"), auto_wireguard: true, mtu: 1420, fec: false, faketcp,
+        })).unwrap().is_ok());
+        for node_id in [1, 2] {
+            assert!(crate::admin::apply(&mut conn, &command(&format!("join-{id}-{node_id}"), Action::AddMembership { mesh_id: id, node_id })).unwrap().is_ok());
+        }
+    }
+    assert!(topology_snapshot(&mut conn, 1, 0).unwrap().tunnels.iter().all(|t| t.faketcp));
+    create_wireguard_tunnel(&mut conn, 1, 3, 1420, false).unwrap();
+    conn.batch_execute("UPDATE wireguard_tunnels SET faketcp=1 WHERE endpoint_ipv6=1").unwrap();
+    let disable = command("disable", Action::SetMeshFaketcp { id: 2, faketcp: false });
+    let revision = control_identity_for_node(&mut conn, 1).unwrap().topology_revision;
+    let result = crate::admin::apply(&mut conn, &disable).unwrap();
+    assert_eq!(crate::admin::apply(&mut conn, &disable).unwrap(), result);
+    assert_eq!(control_identity_for_node(&mut conn, 1).unwrap().topology_revision, revision + 1);
+    assert!(topology_snapshot(&mut conn, 1, 0).unwrap().tunnels.iter().all(|t| t.faketcp == t.endpoint_ipv6));
+    assert!(crate::admin::apply(&mut conn, &command("enable-1", Action::SetMeshFaketcp { id: 1, faketcp: true })).unwrap().is_ok());
+    assert!(crate::admin::apply(&mut conn, &command("enable-2", Action::SetMeshFaketcp { id: 2, faketcp: true })).unwrap().is_ok());
+    assert!(crate::admin::apply(&mut conn, &command("disable-1", Action::SetMeshFaketcp { id: 1, faketcp: false })).unwrap().is_ok());
+    assert!(topology_snapshot(&mut conn, 2, 0).unwrap().tunnels.iter().all(|t| t.faketcp));
+    assert!(crate::admin::apply(&mut conn, &command("leave", Action::RemoveMembership { mesh_id: 2, node_id: 2 })).unwrap().is_ok());
+    assert!(topology_snapshot(&mut conn, 2, 0).unwrap().tunnels.iter().all(|t| t.faketcp == t.endpoint_ipv6));
+    let old = r#"{"action":"create_mesh","name":"legacy","auto_wireguard":false,"mtu":0}"#;
+    let action: Action = serde_json::from_str(old).unwrap();
+    assert_eq!(serde_json::to_string(&action).unwrap(), old);
+    assert!(crate::admin::apply(&mut conn, &command("legacy", action)).unwrap().is_ok());
+    assert_eq!(crate::admin::read(&mut conn, Operation::Inventory).unwrap()["meshes"][2]["faketcp"], false);
+    for (key, action) in [
+        ("bad-create", Action::CreateMesh { name: "bad".into(), auto_wireguard: false, mtu: 0, fec: false, faketcp: true }),
+        ("bad-update", Action::SetMeshFaketcp { id: 3, faketcp: true }),
+        ("missing", Action::SetMeshFaketcp { id: 999, faketcp: true }),
     ] {
         assert!(crate::admin::apply(&mut conn, &command(key, action)).unwrap().is_err());
     }

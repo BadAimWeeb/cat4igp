@@ -73,10 +73,16 @@ pub(crate) enum Action {
         mtu: i32,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         fec: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        faketcp: bool,
     },
     SetMeshFec {
         id: i32,
         fec: bool,
+    },
+    SetMeshFaketcp {
+        id: i32,
+        faketcp: bool,
     },
     SetMeshMtu {
         id: i32,
@@ -217,7 +223,7 @@ fn topology_mutation(
             || !(*node_id > 0
                 && diesel::select(exists(nodes::table.find(node_id))).get_result::<bool>(conn)?))
         .then_some("node or mesh not found"),
-        Action::DeleteMesh { id } | Action::SetMeshFec { id, .. } | Action::SetMeshMtu { id, .. } => (!(*id > 0
+        Action::DeleteMesh { id } | Action::SetMeshFec { id, .. } | Action::SetMeshFaketcp { id, .. } | Action::SetMeshMtu { id, .. } => (!(*id > 0
             && diesel::select(exists(mesh_groups::table.find(id))).get_result::<bool>(conn)?))
         .then_some("mesh not found"),
         Action::DeleteNode { id } => (!(*id > 0
@@ -292,6 +298,11 @@ fn topology_mutation(
             return Ok(Err("FEC requires Auto WireGuard".into()));
         }
     }
+    if let Action::SetMeshFaketcp { id, faketcp: true } = &command.action {
+        if !mesh_groups::table.find(id).select(mesh_groups::auto_wireguard).first::<bool>(conn)? {
+            return Ok(Err("FakeTCP requires Auto WireGuard".into()));
+        }
+    }
     if let Action::SetMeshMtu { id, mtu } = &command.action {
         if !(1280..=9000).contains(mtu) {
             return Ok(Err("MTU must be between 1280 and 9000".into()));
@@ -364,6 +375,11 @@ fn topology_mutation(
         Action::SetMeshFec { id, fec } => {
             diesel::update(mesh_groups::table.find(id))
                 .set(mesh_groups::auto_wireguard_fec.eq(fec))
+                .execute(conn)?;
+        }
+        Action::SetMeshFaketcp { id, faketcp } => {
+            diesel::update(mesh_groups::table.find(id))
+                .set(mesh_groups::auto_wireguard_faketcp.eq(faketcp))
                 .execute(conn)?;
         }
         Action::SetMeshMtu { id, mtu } => {
@@ -537,9 +553,9 @@ pub(crate) fn read(
                 .into_iter().map(|(id, name, created_at, last_seen)|
                     serde_json::json!({"id":id,"name":name,"created_at":created_at,"last_seen":last_seen})).collect::<Vec<_>>();
             let meshes = mesh_groups::table.select((mesh_groups::id, mesh_groups::name,
-                mesh_groups::auto_wireguard, mesh_groups::auto_wireguard_mtu, mesh_groups::auto_wireguard_fec))
-                .load::<(i32, String, bool, i32, bool)>(conn)?.into_iter()
-                .map(|(id, name, auto_wireguard, mtu, fec)| serde_json::json!({"id":id,"name":name,"auto_wireguard":auto_wireguard,"mtu":mtu,"fec":fec})).collect::<Vec<_>>();
+                mesh_groups::auto_wireguard, mesh_groups::auto_wireguard_mtu, mesh_groups::auto_wireguard_fec, mesh_groups::auto_wireguard_faketcp))
+                .load::<(i32, String, bool, i32, bool, bool)>(conn)?.into_iter()
+                .map(|(id, name, auto_wireguard, mtu, fec, faketcp)| serde_json::json!({"id":id,"name":name,"auto_wireguard":auto_wireguard,"mtu":mtu,"fec":fec,"faketcp":faketcp})).collect::<Vec<_>>();
             let memberships = mesh_group_memberships::table
                 .select((mesh_group_memberships::mesh_group_id, mesh_group_memberships::node_id))
                 .load::<(i32, i32)>(conn)?.into_iter()
@@ -702,9 +718,10 @@ pub(crate) fn apply(
                 auto_wireguard,
                 mtu,
                 fec,
+                faketcp,
             } => {
                 if !valid_name(name) || (!(1280..=9000).contains(mtu) && (*auto_wireguard || *mtu != 0))
-                    || (!*auto_wireguard && *fec)
+                    || (!*auto_wireguard && (*fec || *faketcp))
                 {
                     Err("invalid mesh name or MTU".into())
                 } else {
@@ -715,6 +732,7 @@ pub(crate) fn apply(
                             mesh_groups::name.eq(name),
                             mesh_groups::auto_wireguard.eq(auto_wireguard),
                             mesh_groups::auto_wireguard_fec.eq(fec),
+                            mesh_groups::auto_wireguard_faketcp.eq(faketcp),
                             mesh_groups::auto_wireguard_mtu.eq(if *auto_wireguard {
                                 *mtu
                             } else {
@@ -1283,7 +1301,7 @@ mod tests {
         );
         assert_eq!(
             inventory["meshes"],
-            serde_json::json!([{"id":1,"name":"mesh","auto_wireguard":true,"mtu":1420,"fec":false}])
+            serde_json::json!([{"id":1,"name":"mesh","auto_wireguard":true,"mtu":1420,"fec":false,"faketcp":false}])
         );
         assert_eq!(
             inventory["memberships"],
@@ -1723,6 +1741,7 @@ mod tests {
                 auto_wireguard: true,
                 mtu: 1420,
                 fec: false,
+                faketcp: false,
             },
         };
         let first = apply(&mut conn, &command).unwrap();
