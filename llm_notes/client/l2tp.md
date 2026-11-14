@@ -8,9 +8,10 @@ or updates WireGuard before creating its L2TP dependents. Failed cleanup stays
 tracked for retry; cached topology permits best-effort offline restoration.
 
 
-Linux clients support static L2TPv3 Ethernet over UDP, either directly or over a
-controller-managed WireGuard tunnel. Both endpoints must enable
-`[tunnel_protocols] l2tp = true` and have `/dev/net/tun` and `CAP_NET_ADMIN`.
+Linux clients support static L2TPv3 Ethernet over UDP in userspace, using a TAP
+interface, either directly or over a controller-managed WireGuard tunnel. Both
+endpoints must enable `[tunnel_protocols] l2tp = true` and have `/dev/net/tun`
+and `CAP_NET_ADMIN`. No kernel L2TPv3 module is required.
 Enable `allow_insecure_l2tp = true` at the top level on **both** clients only
 when direct, unencrypted and unauthenticated traffic is acceptable. A cookie is
 not cryptographic authentication. WireGuard mode requires no insecure opt-in.
@@ -47,6 +48,14 @@ Each endpoint uses a dedicated UDP port outside the WireGuard port range and
 other services, an IPv4 transport address, and a distinct PPP IPv4 address.
 Peer 1 initiates; peer 2 listens. Direct mode permits PPP MTU 1280–1500;
 WireGuard mode permits 1280–65000, using IP fragmentation over WireGuard.
+
+To force the xl2tpd userspace data path, set `l2tp_v2_userspace = true` at the
+top level on each client. The default `false` retains xl2tpd's kernel/auto
+selection. Userspace mode requires an xl2tpd build supporting `force userspace`
+and limits PPP MTU to 4000 bytes because of its packet buffer; it still needs
+`pppd`, `/dev/ppp`, and the privileges above. Peers may select different modes.
+Userspace does not add encryption.
+
 
 In WireGuard mode select an existing edge connecting the same peers and supply
 two dedicated, unused IPv4 underlay addresses. Each client installs its local

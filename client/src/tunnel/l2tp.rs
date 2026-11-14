@@ -40,6 +40,18 @@ fn decapsulate(local_session: NonZeroU32, local_cookie: [u8; 8], packet: &[u8]) 
     }
     Some(&packet[HEADER_LEN..])
 }
+// Ethernet VLAN tags extend the frame but do not count against the interface MTU.
+fn valid_frame(frame: &[u8], mtu: usize) -> bool {
+    if !(ETHERNET_HEADER_LEN..=MAX_FRAME_LEN).contains(&frame.len()) { return false; }
+    let mut header = ETHERNET_HEADER_LEN;
+    let mut protocol = u16::from_be_bytes([frame[12], frame[13]]);
+    while protocol == 0x8100 || protocol == 0x88a8 || protocol == 0x9100 {
+        if frame.len() < header + 4 { return false; }
+        protocol = u16::from_be_bytes([frame[header + 2], frame[header + 3]]);
+        header += 4;
+    }
+    frame.len() - header <= mtu
+}
 
 #[cfg(test)]
 async fn bind(local: SocketAddr, peer: SocketAddr) -> io::Result<UdpSocket> {
@@ -252,8 +264,8 @@ mod linux {
         }
     }
 
-    async fn forward(tap: AsyncFd<std::fs::File>, socket: UdpSocket, local_session: NonZeroU32, peer_session: NonZeroU32, local_cookie: [u8; 8], peer_cookie: [u8; 8], max_frame: usize) -> io::Result<()> {
-        let mut outbound = vec![0u8; HEADER_LEN + max_frame + 1];
+    async fn forward(tap: AsyncFd<std::fs::File>, socket: UdpSocket, local_session: NonZeroU32, peer_session: NonZeroU32, local_cookie: [u8; 8], peer_cookie: [u8; 8], mtu: usize) -> io::Result<()> {
+        let mut outbound = vec![0u8; HEADER_LEN + MAX_FRAME_LEN + 1];
         outbound[..4].copy_from_slice(&[0, 3, 0, 0]);
         outbound[4..8].copy_from_slice(&peer_session.get().to_be_bytes());
         outbound[8..16].copy_from_slice(&peer_cookie);
@@ -263,7 +275,7 @@ mod linux {
                 n = read_tap(&tap, &mut outbound[HEADER_LEN..]) => {
                     let n = n?;
                     if n == 0 { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TAP closed")); }
-                    if n < ETHERNET_HEADER_LEN || n > max_frame { continue; }
+                    if !valid_frame(&outbound[HEADER_LEN..HEADER_LEN + n], mtu) { continue; }
                     match socket.send(&outbound[..HEADER_LEN + n]).await {
                         Ok(sent) if sent == HEADER_LEN + n => {},
                         Ok(_) => return Err(io::Error::new(io::ErrorKind::WriteZero, "short UDP send")),
@@ -277,7 +289,7 @@ mod linux {
                         Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => continue,
                         Err(error) => return Err(error),
                     };
-                    if let Some(frame) = decapsulate(local_session, local_cookie, &inbound[..n]).filter(|f| f.len() <= max_frame) { write_tap(&tap, frame).await?; }
+                    if let Some(frame) = decapsulate(local_session, local_cookie, &inbound[..n]).filter(|f| valid_frame(f, mtu)) { write_tap(&tap, frame).await?; }
                 }
             }
         }
@@ -298,9 +310,9 @@ mod linux {
             crate::interface::link_up_with_mtu(self.interface.clone(), self.mtu).await?;
             *self.failure.lock().unwrap() = None;
             let failure = self.failure.clone();
-            let (local_session, peer_session, local_cookie, peer_cookie, max_frame) = (self.local_session, self.peer_session, self.local_cookie, self.peer_cookie, self.mtu as usize + ETHERNET_HEADER_LEN);
+            let (local_session, peer_session, local_cookie, peer_cookie, mtu) = (self.local_session, self.peer_session, self.local_cookie, self.peer_cookie, self.mtu as usize);
             self.task = Some(tokio::spawn(async move {
-                if let Err(error) = forward(tap, socket, local_session, peer_session, local_cookie, peer_cookie, max_frame).await { *failure.lock().unwrap() = Some(error.to_string()); }
+                if let Err(error) = forward(tap, socket, local_session, peer_session, local_cookie, peer_cookie, mtu).await { *failure.lock().unwrap() = Some(error.to_string()); }
             }));
             Ok(())
         }
@@ -345,6 +357,26 @@ pub use linux::L2tpTunnel;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ethernet_mtu_excludes_vlan_tags() {
+        let mtu = 1500;
+        let mut frame = vec![0; ETHERNET_HEADER_LEN + mtu];
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        assert!(valid_frame(&frame, mtu));
+        frame.push(0);
+        assert!(!valid_frame(&frame, mtu));
+        frame.pop();
+        frame.splice(12..12, [0x88, 0xa8, 0, 1, 0x81, 0x00, 0, 2]);
+        assert!(valid_frame(&frame, mtu));
+        frame.push(0);
+        assert!(!valid_frame(&frame, mtu));
+        assert!(!valid_frame(&[0; ETHERNET_HEADER_LEN - 1], mtu));
+        let mut truncated_tag = [0; ETHERNET_HEADER_LEN];
+        truncated_tag[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
+        assert!(!valid_frame(&truncated_tag, mtu));
+        assert!(!valid_frame(&vec![0; MAX_FRAME_LEN + 1], usize::MAX));
+    }
 
     #[tokio::test]
     async fn rejects_invalid_peer_endpoints() {

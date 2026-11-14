@@ -25,6 +25,10 @@ pub struct ClientConfig {
     #[serde(default)]
     pub allow_insecure_l2tp: bool,
 
+    /// Force xl2tpd's userspace L2TPv2 data path instead of kernel acceleration.
+    #[serde(default)]
+    pub l2tp_v2_userspace: bool,
+
     /// Optional public IPv4 hostname for responding to connection requests
     #[serde(default, deserialize_with = "optional_hostname")]
     pub public_hostname_ipv4: Option<String>,
@@ -101,6 +105,7 @@ impl Default for ClientConfig {
                 l2tp: false,
             },
             allow_insecure_l2tp: false,
+            l2tp_v2_userspace: false,
             public_hostname_ipv4: None,
             public_hostname_ipv6: None,
             control_bootstrap_addresses: Vec::new(),

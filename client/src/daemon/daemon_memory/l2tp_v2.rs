@@ -80,7 +80,7 @@ impl DaemonMemory {
             if (self.l2tp_excluded_ports.0..self.l2tp_excluded_ports.1).contains(&info.local_port) {
                 return Err(format!("L2TPv2 {} port {} conflicts with WireGuard port_range", info.tunnel_id, info.local_port));
             }
-            let mut tunnel = L2tpV2Tunnel::new(format!("catp{:x}", info.tunnel_id), info.clone()).map_err(|e| e.to_string())?;
+            let mut tunnel = L2tpV2Tunnel::new(format!("catp{:x}", info.tunnel_id), info.clone(), self.l2tp_v2_userspace).map_err(|e| e.to_string())?;
             let local: Ipv4Addr = info.local_endpoint.parse().map_err(|_| "invalid L2TPv2 local address")?;
             let remote: Ipv4Addr = info.remote_endpoint.parse().map_err(|_| "invalid L2TPv2 remote address")?;
             if address_conflict(snapshot, info) { return Err(format!("L2TPv2 local or remote address is reused for tunnel {}", info.tunnel_id)); }

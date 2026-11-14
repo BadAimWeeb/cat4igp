@@ -41,7 +41,7 @@ fn write_private(path: &Path, content: &str) -> io::Result<()> {
     file.write_all(content.as_bytes())
 }
 
-fn configuration(parent: &Path, interface: &str, info: &L2tpV2TunnelInfo) -> io::Result<Directory> {
+fn configuration(parent: &Path, interface: &str, info: &L2tpV2TunnelInfo, userspace: bool) -> io::Result<Directory> {
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
     let dir = loop {
@@ -64,7 +64,7 @@ fn configuration(parent: &Path, interface: &str, info: &L2tpV2TunnelInfo) -> io:
     } else {
         format!("[lns peer]\nlac = {}\nassign ip = no\nexclusive = yes\n", info.remote_endpoint)
     };
-    let config = format!("[global]\nlisten-addr = {}\nport = {}\naccess control = yes\n{}require authentication = yes\nrequire chap = yes\nrefuse pap = yes\npppoptfile = {}\n", info.local_endpoint, info.local_port, section, dir.0.join("options").display());
+    let config = format!("[global]\nlisten-addr = {}\nport = {}\naccess control = yes\nforce userspace = {}\n{}require authentication = yes\nrequire chap = yes\nrefuse pap = yes\npppoptfile = {}\n", info.local_endpoint, info.local_port, if userspace { "yes" } else { "no" }, section, dir.0.join("options").display());
     write_private(&dir.0.join("xl2tpd.conf"), &config)?;
     Ok(dir)
 }
@@ -75,15 +75,20 @@ fn configuration(parent: &Path, interface: &str, info: &L2tpV2TunnelInfo) -> io:
 pub struct L2tpV2Tunnel {
     interface: String,
     info: L2tpV2TunnelInfo,
+    userspace: bool,
     worker: Option<JoinHandle<()>>,
     shutdown: Option<oneshot::Sender<()>>,
     failure: Arc<Mutex<Option<String>>>,
 }
 
 impl L2tpV2Tunnel {
-    pub fn new(interface: String, info: L2tpV2TunnelInfo) -> io::Result<Self> {
+    pub fn new(interface: String, info: L2tpV2TunnelInfo, userspace: bool) -> io::Result<Self> {
         validate(&interface, &info)?;
-        Ok(Self { interface, info, worker: None, shutdown: None, failure: Arc::new(Mutex::new(None)) })
+        // xl2tpd uses a 4096-byte userspace packet buffer; leave room for framing.
+        if userspace && info.mtu > 4000 {
+            return Err(invalid("userspace L2TPv2 MTU must not exceed 4000"));
+        }
+        Ok(Self { interface, info, userspace, worker: None, shutdown: None, failure: Arc::new(Mutex::new(None)) })
     }
 
     pub fn interface(&self) -> &str { &self.interface }
@@ -106,7 +111,7 @@ impl L2tpV2Tunnel {
         if unsafe { libc::if_nametoindex(name.as_ptr()) } != 0 {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "PPP interface already exists"));
         }
-        let dir = configuration(Path::new("/run"), &self.interface, &self.info)?;
+        let dir = configuration(Path::new("/run"), &self.interface, &self.info, self.userspace)?;
         let source = CString::new(dir.0.join("ppp").as_os_str().as_encoded_bytes()).map_err(|_| invalid("invalid configuration path"))?;
         let mut command = Command::new("xl2tpd");
         command.arg("-D").arg("-c").arg(dir.0.join("xl2tpd.conf"))
@@ -191,19 +196,25 @@ mod tests {
         value.mtu = 65001;
         assert!(validate("ppp-test", &value).is_err());
         assert!(validate("../ppp", &info()).is_err());
+        value.mtu = 4000;
+        assert!(L2tpV2Tunnel::new("ppp-test".into(), value.clone(), true).is_ok());
+        value.mtu = 4001;
+        assert!(L2tpV2Tunnel::new("ppp-test".into(), value.clone(), true).is_err());
+        assert!(L2tpV2Tunnel::new("ppp-test".into(), value, false).is_ok());
     }
 
     #[test]
     fn generates_private_configuration_for_both_roles() {
         use std::os::unix::fs::PermissionsExt;
         let parent = tempfile::tempdir().unwrap();
-        for initiator in [true, false] {
+        for (initiator, userspace) in [(true, false), (true, true), (false, false), (false, true)] {
             let mut value = info(); value.initiator = initiator;
-            let dir = configuration(parent.path(), "ppp-test", &value).unwrap();
+            let dir = configuration(parent.path(), "ppp-test", &value, userspace).unwrap();
             assert_eq!(fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777, 0o700);
             assert_eq!(fs::metadata(dir.0.join("ppp/chap-secrets")).unwrap().permissions().mode() & 0o777, 0o600);
             let config = fs::read_to_string(dir.0.join("xl2tpd.conf")).unwrap();
             assert!(config.contains(if initiator { "lns = 192.0.2.2:1702" } else { "lac = 192.0.2.2" }));
+            assert!(config.contains(if userspace { "force userspace = yes\n" } else { "force userspace = no\n" }));
             let options = fs::read_to_string(dir.0.join("options")).unwrap();
             assert!(options.contains("require-chap\n"));
             assert!(!options.contains("noauth\n"));
@@ -231,7 +242,7 @@ mod tests {
             assert!(status.success());
             Some(policy)
         } else { None };
-        let mut tunnel = L2tpV2Tunnel::new("catppptest".into(), value).unwrap();
+        let mut tunnel = L2tpV2Tunnel::new("catppptest".into(), value, std::env::var_os("CAT4IGP_PPP_TEST_USERSPACE").is_some()).unwrap();
         tunnel.setup().await.unwrap();
         let connected = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
