@@ -19,6 +19,8 @@ This will attempt to address those drawbacks.
 Client packages for Alpine, Debian, Arch Linux and OpenWrt, plus portable static binaries, are
 built by GitHub Actions. The server is published as a multiarchitecture Alpine image in GitHub Packages.
 
+For a standalone server, see the [deployment guide](llm_notes/server/deployment.md) for Docker setup, administrator bootstrap, HTTPS, backups, and verification.
+
 ### WireGuard mesh FakeTCP
 
 Administrators can enable FakeTCP when creating an Auto WireGuard mesh or toggle it later in the mesh actions. It applies to current and future mesh-owned WireGuard tunnels; changing it causes clients to converge on the new configuration. A tunnel shared by multiple meshes uses FakeTCP if any owning mesh enables it, or if its explicit per-tunnel flag is set. Other tunnel protocols are unaffected.

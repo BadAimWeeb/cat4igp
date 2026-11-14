@@ -241,6 +241,19 @@ fn topology_mutation(
     if let Some(message) = missing {
         return Ok(Err(message.into()));
     }
+    let l2tp_requirements = match &command.action {
+        Action::CreateL2tpTunnel { node_id_peer1, node_id_peer2, wireguard_tunnel_id, .. } => Some((*node_id_peer1, *node_id_peer2, false, wireguard_tunnel_id.is_some())),
+        Action::CreateL2tpV2Tunnel { node_id_peer1, node_id_peer2, wireguard_tunnel_id, .. } => Some((*node_id_peer1, *node_id_peer2, true, wireguard_tunnel_id.is_some())),
+        _ => None,
+    };
+    if let Some((first, second, v2, wireguard)) = l2tp_requirements {
+        for node in [first, second] {
+            let features = crate::db::feature_support(conn, node)?;
+            if !features.is_some_and(|f| (if v2 { f.l2tp_v2 } else { f.l2tp_v3 }) && (!wireguard || f.wireguard)) {
+                return Ok(Err(format!("node {node} has unknown or unsupported L2TP{} capability", if v2 { "v2" } else { "v3" })));
+            }
+        }
+    }
     if let Action::CreateL2tpV2Tunnel { node_id_peer1, node_id_peer2, endpoint_peer1, endpoint_peer2, udp_port_peer1, udp_port_peer2, address_peer1, address_peer2, secret, mtu, wireguard_tunnel_id } = &command.action {
         let ipv4 = |s: &str| s.parse::<std::net::Ipv4Addr>().ok().filter(|v| !v.is_unspecified() && !v.is_multicast() && !v.is_broadcast() && !v.is_loopback() && !v.is_link_local() && v.octets()[0] != 0 && v.octets()[0] < 240);
         let (a, b) = (ipv4(endpoint_peer1), ipv4(endpoint_peer2));
@@ -452,6 +465,7 @@ fn topology_mutation(
             diesel::delete(mesh_groups::table.find(id)).execute(conn)?;
         }
         Action::DeleteNode { id } => {
+            diesel::delete(application_kv::table.find(format!("features/{id}"))).execute(conn)?;
             diesel::sql_query("DELETE FROM application_kv WHERE key IN (SELECT 'l2tp_active/' || id FROM l2tpv3_tunnels WHERE node_id_peer1=? OR node_id_peer2=?)").bind::<Integer,_>(id).bind::<Integer,_>(id).execute(conn)?;
             diesel::sql_query("DELETE FROM l2tpv3_tunnels WHERE node_id_peer1=? OR node_id_peer2=?").bind::<Integer,_>(id).bind::<Integer,_>(id).execute(conn)?;
             diesel::sql_query("DELETE FROM l2tpv2_tunnels WHERE node_id_peer1=? OR node_id_peer2=?").bind::<Integer,_>(id).bind::<Integer,_>(id).execute(conn)?;
@@ -550,8 +564,10 @@ pub(crate) fn read(
             let nodes = nodes::table.select((nodes::id, nodes::name,
                 nodes::created_at, nodes::last_seen))
                 .load::<(i32, String, TimestampText, Option<TimestampText>)>(conn)?
-                .into_iter().map(|(id, name, created_at, last_seen)|
-                    serde_json::json!({"id":id,"name":name,"created_at":created_at,"last_seen":last_seen})).collect::<Vec<_>>();
+                .into_iter().map(|(id, name, created_at, last_seen)| {
+                    let features = crate::db::feature_support(conn, id)?;
+                    Ok(serde_json::json!({"id":id,"name":name,"created_at":created_at,"last_seen":last_seen,"features":features}))
+                }).collect::<Result<Vec<_>, Error>>()?;
             let meshes = mesh_groups::table.select((mesh_groups::id, mesh_groups::name,
                 mesh_groups::auto_wireguard, mesh_groups::auto_wireguard_mtu, mesh_groups::auto_wireguard_fec, mesh_groups::auto_wireguard_faketcp))
                 .load::<(i32, String, bool, i32, bool, bool)>(conn)?.into_iter()
@@ -580,11 +596,12 @@ pub(crate) fn read(
                     serde_json::json!({"id":id,"node_id_peer1":node_id_peer1,"node_id_peer2":node_id_peer2,
                         "endpoint_peer1":endpoint_peer1,"endpoint_peer2":endpoint_peer2,"ipv6":ipv6,"mtu":mtu,
                         "intents":intents.remove(&id).unwrap_or_default()})).collect::<Vec<_>>();
-            Ok(serde_json::json!({"nodes":nodes,"meshes":meshes,"memberships":memberships,"invites":invites,"tunnels":tunnels,"l2tp_tunnels":crate::db::l2tp_rows(conn)?,"l2tp_v2_tunnels":crate::db::l2tp_v2_rows(conn)?}))
+            Ok(serde_json::json!({"server_features":cat4igp_shared::control::FeatureSupport::server(),"nodes":nodes,"meshes":meshes,"memberships":memberships,"invites":invites,"tunnels":tunnels,"l2tp_tunnels":crate::db::l2tp_rows(conn)?,"l2tp_v2_tunnels":crate::db::l2tp_v2_rows(conn)?}))
         }
         Operation::Status => {
             Ok(serde_json::json!({
                 "application_version": cat4igp_shared::compat::APPLICATION_VERSION,
+                "features": cat4igp_shared::control::FeatureSupport::server(),
                 "observation": "local applied inventory"
             }))
         }
@@ -1268,6 +1285,7 @@ mod tests {
         assert_eq!(
             read(&mut conn, Operation::Inventory).unwrap(),
             serde_json::json!({
+                "server_features":cat4igp_shared::control::FeatureSupport::server(),
                 "nodes":[],"meshes":[],"memberships":[],"invites":[],"tunnels":[],"l2tp_tunnels":[],"l2tp_v2_tunnels":[]
             })
         );
@@ -1295,8 +1313,8 @@ mod tests {
         assert_eq!(
             inventory["nodes"],
             serde_json::json!([
-                {"id":1,"name":"a","created_at":"2026-10-20 12:34:56.123456","last_seen":null},
-                {"id":2,"name":"b","created_at":"2026-10-20 12:34:56","last_seen":"2026-10-20 13:00:00"}
+                {"id":1,"name":"a","created_at":"2026-10-20 12:34:56.123456","last_seen":null,"features":null},
+                {"id":2,"name":"b","created_at":"2026-10-20 12:34:56","last_seen":"2026-10-20 13:00:00","features":null}
             ])
         );
         assert_eq!(

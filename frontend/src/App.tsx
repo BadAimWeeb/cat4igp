@@ -488,7 +488,7 @@ export function App() {
                 >
                   <ListItemText primary={t} />
                   <span className="view-count" aria-label={`${t} count`}>
-                    {data?.[t.toLowerCase() as keyof Inventory].length ?? "—"}
+                    {data?.[t.toLowerCase() as "nodes" | "meshes" | "invites" | "tunnels"].length ?? "—"}
                   </span>
                 </ListItemButton>
               </ListItem>

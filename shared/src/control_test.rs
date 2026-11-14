@@ -1,6 +1,17 @@
 use super::*;
 
 #[test]
+fn feature_support_defaults_missing_fields_to_unsupported() {
+    let features: FeatureSupport = serde_json::from_str(r#"{"wireguard":true,"future":true}"#).unwrap();
+    assert!(features.wireguard);
+    assert!(!features.fec && !features.faketcp && !features.l2tp_v2 && !features.l2tp_v3);
+    assert!(FeatureSupport::server().supports(features));
+    assert!(!features.supports(FeatureSupport { fec: true, ..Default::default() }));
+    let message = ControlRequest::Features(features);
+    assert!(matches!(serde_json::from_str::<ControlRequest>(&serde_json::to_string(&message).unwrap()).unwrap(), ControlRequest::Features(value) if value == features));
+}
+
+#[test]
 fn l2tp_capability_report_binds_identity_network_and_nonce() {
     let key = identity::Keypair::generate_ed25519();
     let peer = key.public().to_peer_id();

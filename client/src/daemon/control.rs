@@ -159,36 +159,25 @@ pub fn start(
     let worker = tokio::spawn(async move {
         let mut seen = HashSet::new();
         let mut order = VecDeque::new();
-        let mut next_replica = 0;
         let mut reconnect = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             tokio::select! {
                 command = receiver.recv() => {
                     let Some(Command::Request(request, reply)) = command else { break; };
-                    if !authorized(&current).await {
-                        let _ = reply.send(Err("discovery roster expired or unavailable".into()));
-                        continue;
-                    }
                     let Some(mut config) = current.lock().await.clone() else {
                         let _ = reply.send(Err("control configuration unavailable".into()));
                         continue;
                     };
-                    let mut bootstraps = config.control_bootstrap_addresses.clone();
-                    if !bootstraps.is_empty() {
-                        let count = bootstraps.len();
-                        bootstraps.rotate_left(next_replica % count);
-                        next_replica = (next_replica + 1) % count;
-                    }
+                    let bootstraps = config.control_bootstrap_addresses.clone();
                     // ponytail: serial bounded one-shot RPCs; reuse connected streams when polling load warrants it.
                     let result = request_to_bootstraps(&mut config, &bootstraps, request).await;
                     let _ = reply.send(result);
                 }
                 _ = reconnect.tick() => {
-                    if !authorized(&current).await { continue; }
                     let guard = current.lock().await;
                     let Some(config) = guard.as_ref() else { continue };
                     for bootstrap in &config.control_bootstrap_addresses {
-                        if bootstrap_peer_id(bootstrap).is_ok_and(|peer| config.control_peer_authorized(peer, now_ms().unwrap_or(i64::MAX))) {
+                        if bootstrap_peer_id(bootstrap).is_ok_and(|peer| config.control_peer_authorized(peer)) {
                           if let Ok(address) = bootstrap.parse::<libp2p::Multiaddr>() {
                             let _ = swarm.dial(address);
                           }
@@ -206,8 +195,7 @@ pub fn start(
                     libp2p::swarm::SwarmEvent::Behaviour(ControlBehaviourEvent::Gossipsub(
                         gossipsub::Event::Message { message, .. },
                     )) if message.data.len() <= 64 * 1024 => {
-                        if !authorized(&current).await { continue; }
-                        if !message.source.is_some_and(|peer| current.try_lock().ok().and_then(|guard| guard.as_ref().map(|config| config.control_peer_authorized(peer, now_ms().unwrap_or(i64::MAX)))).unwrap_or(false)) { continue; }
+                        if message.source != Some(controller) { continue; }
                         let Ok(envelope) = serde_json::from_slice::<EncryptedEnvelope>(&message.data) else { continue };
                         let Ok(now) = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -239,20 +227,11 @@ pub async fn enroll(
             .first()
             .ok_or_else(|| "at least one controller bootstrap address is required".to_string())?,
     )?;
-    if config.discovery_bootstrap_addresses.is_empty()
-        && config.discovery_proof.is_none()
-        && config
-            .controller_peer_id
-            .as_deref()
-            .is_some_and(|pin| pin != controller.to_string())
+    if config.controller_peer_id.as_deref().is_some_and(|pin| pin != controller.to_string())
     {
         return Err("bootstrap does not match pinned controller".into());
     }
-    if config.discovery_bootstrap_addresses.is_empty()
-        && config.discovery_proof.is_none()
-        && bootstraps
-            .iter()
-            .any(|bootstrap| bootstrap_peer_id(bootstrap).as_ref() != Ok(&controller))
+    if bootstraps.iter().any(|bootstrap| bootstrap_peer_id(bootstrap).as_ref() != Ok(&controller))
     {
         return Err("all controller bootstrap addresses must use the same peer id".to_string());
     }
@@ -276,42 +255,6 @@ pub async fn enroll(
             .map_err(|error| error.to_string())?,
         wireguard_public_key: config.wg_public_key.clone().unwrap_or_default(),
     });
-    if !config.discovery_bootstrap_addresses.is_empty()
-        && !config.discovery_proof.as_ref().is_some_and(|proof| {
-            proof.body.roster.body.issued_at_ms <= now_ms().unwrap_or(i64::MAX)
-                && now_ms().unwrap_or(i64::MAX) < proof.body.roster.body.expires_at_ms
-        })
-    {
-        let pin = config
-            .controller_signing_key
-            .as_deref()
-            .ok_or("public discovery requires an out-of-band controller signing key pin")?;
-        let pin = libp2p::identity::PublicKey::try_decode_protobuf(&hex_decode(pin)?)
-            .map_err(|_| "invalid discovery signing key pin")?;
-        let seeds = config
-            .discovery_bootstrap_addresses
-            .iter()
-            .map(|address| {
-                address
-                    .parse()
-                    .map_err(|_| "invalid public discovery bootstrap".to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let minimum_revision = config
-            .discovery_proof
-            .as_ref()
-            .map_or(0, |proof| proof.body.roster.body.revision);
-        let proof = cat4igp_shared::discovery::transport::discover(
-            &keypair,
-            &pin,
-            &config.control_network_id,
-            cat4igp_shared::discovery::Role::Client,
-            &seeds,
-            minimum_revision,
-        )
-        .await?;
-        config.accept_discovery_proof(proof, now_ms()?)?;
-    }
     let response = request_to_bootstraps(config, bootstraps, request).await?;
     if let ControlResponse::Enrolled(enrollment) = &response {
         if config.controller_signing_key.as_ref().is_some_and(|pin| {
@@ -387,17 +330,17 @@ async fn request_to_bootstraps(
     for bootstrap in bootstraps {
         let peer = bootstrap_peer_id(bootstrap)?;
         if config.controller_signing_key.is_some()
-            && !config.control_peer_authorized(peer, now_ms()?)
+            && !config.control_peer_authorized(peer)
         {
-            return Err("private bootstrap is not authorized by current signed roster".into());
+            return Err("private bootstrap does not match pinned controller".into());
         }
     }
     for bootstrap in bootstraps {
         let controller = bootstrap_peer_id(bootstrap)?;
         if config.controller_signing_key.is_some()
-            && !config.control_peer_authorized(controller, now_ms()?)
+            && !config.control_peer_authorized(controller)
         {
-            return Err("private bootstrap is not authorized by current signed roster".into());
+            return Err("private bootstrap does not match pinned controller".into());
         }
         let Ok(address) = bootstrap.parse() else {
             errors.push(format!("{bootstrap}: invalid multiaddress"));
@@ -409,14 +352,7 @@ async fn request_to_bootstraps(
         )
         .await
         {
-            Ok(Ok(response)) => {
-                if config.controller_signing_key.is_some()
-                    && !config.control_peer_authorized(controller, now_ms()?)
-                {
-                    return Err("private replica authorization expired during request".into());
-                }
-                return Ok(response);
-            }
+            Ok(Ok(response)) => return Ok(response),
             Ok(Err(error)) if error.starts_with("retryable:") => errors.push(error),
             Ok(Err(error)) => return Err(error),
             Err(_) => errors.push(format!("{bootstrap}: timed out")),
@@ -525,58 +461,7 @@ async fn request_to(
     }
 }
 
-pub fn now_ms() -> Result<i64, String> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "system clock is before Unix epoch".to_string())?
-        .as_millis()
-        .try_into()
-        .map_err(|_| "system clock out of range".to_string())
-}
 
-async fn authorized(current: &tokio::sync::Mutex<Option<crate::config::ServerConfig>>) -> bool {
-    let Ok(now) = now_ms() else { return false };
-    current
-        .lock()
-        .await
-        .as_ref()
-        .is_some_and(|config| config.discovery_authorized(now))
-}
-
-pub async fn refresh_discovery(config: &mut crate::config::ServerConfig) -> Result<(), String> {
-    if config.discovery_bootstrap_addresses.is_empty() {
-        return Ok(());
-    }
-    let keypair = config
-        .ensure_control_keypair()
-        .map_err(|error| error.to_string())?;
-    let pin = libp2p::identity::PublicKey::try_decode_protobuf(&hex_decode(
-        config
-            .controller_signing_key
-            .as_deref()
-            .ok_or("missing discovery signing pin")?,
-    )?)
-    .map_err(|_| "invalid discovery signing pin")?;
-    let seeds = config
-        .discovery_bootstrap_addresses
-        .iter()
-        .map(|address| address.parse().map_err(|_| "invalid discovery bootstrap"))
-        .collect::<Result<Vec<_>, _>>()?;
-    let minimum = config
-        .discovery_proof
-        .as_ref()
-        .map_or(0, |proof| proof.body.roster.body.revision);
-    let proof = cat4igp_shared::discovery::transport::discover(
-        &keypair,
-        &pin,
-        &config.control_network_id,
-        cat4igp_shared::discovery::Role::Client,
-        &seeds,
-        minimum,
-    )
-    .await?;
-    config.accept_discovery_proof(proof, now_ms()?)
-}
 
 #[cfg(test)]
 #[path = "control_test.rs"]

@@ -23,6 +23,7 @@ pub struct DaemonMemory {
     l2tp: Arc<Mutex<HashMap<i32, l2tp::ActiveL2tp>>>,
     #[cfg(target_os = "linux")]
     l2tp_v2: Arc<Mutex<HashMap<i32, l2tp_v2::ActiveL2tpV2>>>,
+    wireguard_enabled: bool,
     l2tp_enabled: bool,
     l2tp_v2_userspace: bool,
     allow_insecure_l2tp: bool,
@@ -49,6 +50,7 @@ impl DaemonMemory {
             l2tp: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(target_os = "linux")]
             l2tp_v2: Arc::new(Mutex::new(HashMap::new())),
+            wireguard_enabled: client_config.tunnel_protocols.wireguard,
             l2tp_enabled: client_config.tunnel_protocols.l2tp,
             l2tp_v2_userspace: client_config.l2tp_v2_userspace,
             allow_insecure_l2tp: client_config.allow_insecure_l2tp,

@@ -2,14 +2,28 @@ use super::*;
 use diesel::{connection::SimpleConnection, migration::MigrationSource};
 
 #[test]
+fn capability_reports_distinguish_unknown_and_unsupported() {
+    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    migrate(&mut conn, true).unwrap();
+    assert_eq!(feature_support(&mut conn, 7).unwrap(), None);
+    let mut features = cat4igp_shared::control::FeatureSupport::default();
+    set_feature_support(&mut conn, 7, features).unwrap();
+    assert_eq!(feature_support(&mut conn, 7).unwrap(), Some(features));
+    features.wireguard = true;
+    set_feature_support(&mut conn, 7, features).unwrap();
+    assert_eq!(feature_support(&mut conn, 7).unwrap(), Some(features));
+}
+
+#[test]
 fn global_tunnel_ids_remap_and_allocate() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611140000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 1]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO wireguard_tunnels(id,node_id_peer1,node_id_peer2,endpoint_ipv6) VALUES(1,1,2,0); INSERT INTO l2tpv2_tunnels VALUES(1,1,2,'a','b',1701,1702,'10.0.0.1','10.0.0.2','secret',1400,NULL),(3,1,2,'a','b',1701,1702,'10.0.0.1','10.0.0.2','secret',1400,NULL); INSERT INTO l2tpv3_tunnels VALUES(1,'static',1,2,'a','b',1,2,1,2,'0123456789abcdef','fedcba9876543210','pure',NULL,1500),(3,'static',1,2,'a','b',1,2,1,2,'0123456789abcdef','fedcba9876543210','pure',NULL,1500),(4,'static',1,2,'a','b',1,2,1,2,'0123456789abcdef','fedcba9876543210','pure',NULL,1500); INSERT INTO application_kv VALUES('l2tp_active/1','true'),('management_id/l2tp','20'),('management_id/l2tpv2','30'),('administrator_result/historical',json_object('fingerprint','f','result','old')); INSERT INTO node_control_identities(node_id,peer_id,signing_key,encryption_key) VALUES(1,'a','a','a'),(2,'b','b','b');").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 1..]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     conn.batch_execute("CREATE TEMP TABLE verify_global(ok INTEGER NOT NULL CHECK(ok=1)); INSERT INTO verify_global SELECT count(*)=1 FROM wireguard_tunnels WHERE id=1; INSERT INTO verify_global SELECT count(*)=2 FROM l2tpv2_tunnels WHERE id IN (3,31); INSERT INTO verify_global SELECT count(*)=3 FROM l2tpv3_tunnels WHERE id IN (4,32,33); INSERT INTO verify_global SELECT count(*)=1 FROM application_kv WHERE key='l2tp_active/32' AND value='true'; INSERT INTO verify_global SELECT count(*)=1 FROM application_kv WHERE key='administrator_result/historical' AND json_extract(value,'$.result')='old'; INSERT INTO verify_global SELECT count(*)=2 FROM node_control_identities WHERE topology_revision=1;").unwrap();
     assert_eq!(next_management_id(&mut conn, "tunnel").unwrap(), 34);
     assert!(conn.batch_execute("INSERT INTO l2tpv2_tunnels SELECT 1,node_id_peer1,node_id_peer2,endpoint_peer1,endpoint_peer2,udp_port_peer1,udp_port_peer2,address_peer1,address_peer2,secret,mtu,wireguard_tunnel_id FROM l2tpv2_tunnels WHERE id=3;").is_err());
@@ -25,15 +39,16 @@ fn global_tunnel_id_migration_rejects_invalid_counter_and_overflow_atomically() 
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611140000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 1]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO wireguard_tunnels(id,node_id_peer1,node_id_peer2,endpoint_ipv6) VALUES(1,1,2,0); INSERT INTO l2tpv2_tunnels VALUES(1,1,2,'a','b',1701,1702,'10.0.0.1','10.0.0.2','secret',1400,NULL); INSERT INTO application_kv VALUES('management_id/l2tp','\"invalid\"');").unwrap();
-    assert!(conn.run_migrations(&migrations[migrations.len() - 1..]).is_err());
+    assert!(conn.run_migrations(&migrations[target..=target]).is_err());
     conn.batch_execute("UPDATE application_kv SET value='2147483647' WHERE key='management_id/l2tp';").unwrap();
-    assert!(conn.run_migrations(&migrations[migrations.len() - 1..]).is_err());
+    assert!(conn.run_migrations(&migrations[target..=target]).is_err());
     conn.batch_execute("CREATE TEMP TABLE verify_rollback(ok INTEGER NOT NULL CHECK(ok=1)); INSERT INTO verify_rollback SELECT count(*)=1 FROM l2tpv2_tunnels WHERE id=1; INSERT INTO verify_rollback SELECT count(*)=1 FROM wireguard_tunnels WHERE id=1;").unwrap();
     conn.batch_execute("UPDATE application_kv SET value='10' WHERE key='management_id/l2tp';").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 1..]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     assert_eq!(next_management_id(&mut conn, "tunnel").unwrap(), 12);
 }
 
@@ -42,11 +57,9 @@ fn migration_rejects_unknown_schema_before_pending_changes() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    migrations.pop();
-    migrations.pop();
-    migrations.pop();
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611110000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 1]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO __diesel_schema_migrations(version) VALUES('99999999999999'); INSERT INTO l2tpv3_tunnels VALUES(1,'static',1,2,'a','b',1,2,1,2,'0123456789abcdef','fedcba9876543210','pure',NULL,1500);").unwrap();
     let before = conn.applied_migrations().unwrap();
     assert!(migrate(&mut conn, true).unwrap_err().contains("coordinated upgrade required"));
@@ -60,11 +73,9 @@ fn l2tpv3_cookie_migration_validation_and_downgrade() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    migrations.pop();
-    migrations.pop();
-    migrations.pop();
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611110000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 1]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     let insert = "INSERT INTO l2tpv3_tunnels VALUES(1,'static',1,2,'a','b',1,2,1,2,'0123456789abcdef','fedcba9876543210','pure',NULL,1500)";
     conn.batch_execute(insert).unwrap();
     for column in ["cookie_peer1", "cookie_peer2"] {
@@ -73,12 +84,12 @@ fn l2tpv3_cookie_migration_validation_and_downgrade() {
             conn.batch_execute("PRAGMA ignore_check_constraints=ON;").unwrap();
             conn.batch_execute(&format!("UPDATE l2tpv3_tunnels SET {column}={value} WHERE id=1;")).unwrap();
             conn.batch_execute("PRAGMA ignore_check_constraints=OFF;").unwrap();
-            assert!(conn.run_migrations(&migrations[migrations.len() - 1..]).is_err());
+            assert!(conn.run_migrations(&migrations[target..=target]).is_err());
             conn.batch_execute(&format!("CREATE TEMP TABLE data_check(ok INTEGER CHECK(ok=1)); INSERT INTO data_check SELECT CASE WHEN count(*)=1 AND {column} IS {value} THEN 1 ELSE 0 END FROM l2tpv3_tunnels; DROP TABLE data_check;")).unwrap();
             conn.batch_execute(&format!("UPDATE l2tpv3_tunnels SET {column}='0123456789abcdef' WHERE id=1;")).unwrap();
         }
     }
-    conn.run_migrations(&migrations[migrations.len() - 1..]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     for column in ["cookie_peer1", "cookie_peer2"] {
         for value in ["'0123456789abcdef'||char(0)||'x'", "'0123456789abcde'||char(0)", "x'30313233343536373839616263646566'", "NULL", "'0123456789abcdeF'"] {
             assert!(conn.batch_execute(&format!("UPDATE l2tpv3_tunnels SET {column}={value} WHERE id=1;")).is_err());
@@ -95,11 +106,11 @@ fn tunnel_intent_kv_preserves_owners_and_conflicts() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    let migrations = &migrations[..migrations.len() - 4];
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611100000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 1]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO tunnel_intents VALUES(1,'mesh',7),(1,'manual',0),(10,'legacy',-3);").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 1..]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     assert!(conn.batch_execute("INSERT INTO tunnel_intents VALUES(1,'mesh',7);").is_err());
     conn.batch_execute("INSERT OR IGNORE INTO tunnel_intents VALUES(1,'mesh',7); INSERT INTO tunnel_intents VALUES(1,'legacy',0);").unwrap();
     assert!(conn.batch_execute("INSERT INTO tunnel_intents VALUES(1,'legacy',NULL);").is_err());
@@ -116,11 +127,11 @@ fn enrollment_kv_migration_preserves_global_request_uniqueness() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    let migrations = &migrations[..migrations.len() - 4];
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611090000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 2]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO control_enrollment_results VALUES('peer/1','request','fingerprint','result'),('peer2','','f','r'),('peer3','','f','r');").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 2..migrations.len() - 1]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     assert!(conn.batch_execute("INSERT INTO application_kv VALUES('control_enrollment_result/other',json_object('request_id','request','fingerprint','f','result','r'));").is_err());
     conn.revert_last_migration(MIGRATIONS).unwrap();
     conn.batch_execute("CREATE TEMP TABLE enrollment_check(ok INTEGER CHECK(ok=1)); INSERT INTO enrollment_check SELECT CASE WHEN count(*)=1 THEN 1 ELSE 0 END FROM control_enrollment_results WHERE peer_id='peer/1' AND request_id='request' AND fingerprint='fingerprint' AND result='result';").unwrap();
@@ -131,11 +142,11 @@ fn answer_receipt_kv_round_trip_keeps_composite_keys() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    let migrations = &migrations[..migrations.len() - 4];
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611080000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 3]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO control_answer_results VALUES(1,'a/%_','fingerprint','accepted','2026-11-01 12:00:00'),(10,'a/%_','other','accepted','2026-11-01 12:00:00');").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 3..migrations.len() - 2]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     conn.batch_execute("DELETE FROM application_kv WHERE substr(key,1,length('control_answer_result/1/'))='control_answer_result/1/';").unwrap();
     conn.revert_last_migration(MIGRATIONS).unwrap();
     conn.batch_execute("CREATE TEMP TABLE answer_check(ok INTEGER CHECK(ok=1)); INSERT INTO answer_check SELECT CASE WHEN count(*)=1 THEN 1 ELSE 0 END FROM control_answer_results WHERE node_id=10 AND request_id='a/%_' AND fingerprint='other' AND expires_at='2026-11-01 12:00:00';").unwrap();
@@ -146,11 +157,11 @@ fn wireguard_key_kv_migration_preserves_key_and_timestamp() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    let migrations = &migrations[..migrations.len() - 4];
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611070000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 4]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO wireguard_static_key VALUES(42,'public-key','2026-11-01 12:00:00');").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 4..migrations.len() - 3]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     assert_eq!(get_wireguard_pubkey(&mut conn, 42).unwrap(), "public-key");
     conn.revert_last_migration(MIGRATIONS).unwrap();
     conn.batch_execute("CREATE TEMP TABLE key_check(ok INTEGER CHECK(ok=1)); INSERT INTO key_check SELECT CASE WHEN count(*)=1 THEN 1 ELSE 0 END FROM wireguard_static_key WHERE node_id=42 AND public_key='public-key' AND created_at='2026-11-01 12:00:00';").unwrap();
@@ -161,11 +172,11 @@ fn invite_receipt_kv_migration_round_trip() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    let migrations = &migrations[..migrations.len() - 4];
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611060000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 5]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO operator_invite_results VALUES('id/one','[null,null,null]','{\"Ok\":\"code\"}');").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 5..migrations.len() - 4]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     conn.batch_execute("CREATE TEMP TABLE check_receipt (ok INTEGER CHECK(ok=1)); INSERT INTO check_receipt SELECT CASE WHEN count(*)=1 THEN 1 ELSE 0 END FROM application_kv WHERE key='operator_invite_result/id/one' AND json_extract(value,'$.result')='{\"Ok\":\"code\"}';").unwrap();
     conn.revert_last_migration(MIGRATIONS).unwrap();
     conn.batch_execute("INSERT INTO check_receipt SELECT CASE WHEN count(*)=1 THEN 1 ELSE 0 END FROM operator_invite_results WHERE request_id='id/one' AND fingerprint='[null,null,null]' AND result='{\"Ok\":\"code\"}';").unwrap();
@@ -176,11 +187,11 @@ fn administrator_receipt_kv_migration_preserves_retry() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    let migrations = &migrations[..migrations.len() - 4];
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611050000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 6]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO administrator_results VALUES('id/one','fingerprint','{\"Ok\":null}');").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 6..migrations.len() - 5]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     assert_eq!(crate::admin::serving_receipt(&mut conn, "id/one", "fingerprint").unwrap(), Some(Ok(None)));
     assert_eq!(crate::admin::serving_receipt(&mut conn, "id/one", "other").unwrap(), Some(Err("idempotency key conflict".into())));
     conn.revert_last_migration(MIGRATIONS).unwrap();
@@ -192,11 +203,11 @@ fn management_kv_preserves_deleted_id_and_downgrade() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    let migrations = &migrations[..migrations.len() - 4];
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611040000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 7]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO nodes(id,name,auth_key) VALUES(42,'deleted','key'); DELETE FROM nodes WHERE id=42;").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 7..migrations.len() - 6]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     assert_eq!(next_management_id(&mut conn, "node").unwrap(), 43);
     conn.batch_execute("INSERT INTO nodes(id,name,auth_key) VALUES(50,'new','key'); DELETE FROM nodes WHERE id=50;").unwrap();
     assert_eq!(next_management_id(&mut conn, "node").unwrap(), 51);
@@ -212,11 +223,11 @@ fn revocation_migration_round_trip_preserves_identity() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    let migrations = &migrations[..migrations.len() - 4];
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611030000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 8]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO node_revocations VALUES ('peer/α', 17, '2026-11-01 12:00:00');").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 8..migrations.len() - 7]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     assert!(identity_revoked(&mut conn, "peer/α").unwrap());
     assert!(!identity_revoked(&mut conn, "peer").unwrap());
     conn.revert_last_migration(MIGRATIONS).unwrap();
@@ -257,6 +268,9 @@ fn l2tp_provisioning_reverses_peers_and_cascades_with_underlay() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     migrate(&mut conn, true).unwrap();
     conn.batch_execute("INSERT INTO nodes(id,name,auth_key) VALUES(1,'a','a'),(2,'b','b'); INSERT INTO application_kv SELECT 'wireguard_key/' || id, json_object('public_key',auth_key,'created_at','2026-01-01') FROM nodes; INSERT INTO node_control_identities(node_id,peer_id,signing_key,encryption_key) VALUES(1,'a','a','a'),(2,'b','b','b');").unwrap();
+    for node in [1, 2] {
+        set_feature_support(&mut conn, node, cat4igp_shared::control::FeatureSupport { wireguard: true, l2tp_v3: true, ..Default::default() }).unwrap();
+    }
     create_wireguard_tunnel(&mut conn, 1, 2, 1420, false).unwrap();
     let wg = get_wireguard_answers(&mut conn, 1).unwrap()[0].id;
     let command = |key: &str, action| Mutation { request_id: key.into(), action, applied_at: chrono::Utc::now().naive_utc() };
@@ -275,12 +289,11 @@ fn l2tpv2_migration_preserves_existing_data_and_rolls_back() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    migrations.pop();
-    migrations.pop();
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611120000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 1]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO l2tpv3_tunnels VALUES(1,'static',1,2,'a','b',1,2,1,2,'0123456789abcdef','fedcba9876543210','pure',NULL,1500);").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 1..]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     conn.batch_execute("INSERT INTO l2tpv2_tunnels VALUES(1,1,2,'192.0.2.1','192.0.2.2',1701,1702,'10.0.0.1','10.0.0.2','secret',1400);").unwrap();
     conn.revert_last_migration(MIGRATIONS).unwrap();
     conn.batch_execute("CREATE TEMP TABLE v3_check(ok INTEGER CHECK(ok=1)); INSERT INTO v3_check SELECT count(*) FROM l2tpv3_tunnels;").unwrap();
@@ -291,11 +304,11 @@ fn l2tpv2_wireguard_migration_retains_rows_and_guards_downgrade() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
     migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
-    migrations.pop();
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611130000000000").unwrap();
     assert!(conn.applied_migrations().unwrap().is_empty());
-    conn.run_migrations(&migrations[..migrations.len() - 1]).unwrap();
+    conn.run_migrations(&migrations[..target]).unwrap();
     conn.batch_execute("INSERT INTO l2tpv2_tunnels VALUES(1,1,2,'192.0.2.1','192.0.2.2',1701,1702,'10.0.0.1','10.0.0.2','secret',1400);").unwrap();
-    conn.run_migrations(&migrations[migrations.len() - 1..]).unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
     let row = l2tp_v2_rows(&mut conn).unwrap().remove(0);
     assert_eq!((row.secret.as_str(), row.mtu, row.wireguard_tunnel_id), ("secret", 1400, None));
     conn.batch_execute("UPDATE l2tpv2_tunnels SET wireguard_tunnel_id=1, mtu=65000 WHERE id=1").unwrap();
@@ -311,6 +324,9 @@ fn l2tpv2_wireguard_validation_and_underlay_cascade() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     migrate(&mut conn, true).unwrap();
     conn.batch_execute("INSERT INTO nodes(id,name,auth_key) VALUES(1,'a','a'),(2,'b','b'),(3,'c','c'); INSERT INTO application_kv SELECT 'wireguard_key/' || id, json_object('public_key',auth_key,'created_at','2026-01-01') FROM nodes; INSERT INTO node_control_identities(node_id,peer_id,signing_key,encryption_key) VALUES(1,'a','a','a'),(2,'b','b','b'),(3,'c','c','c');").unwrap();
+    for node in [1, 2] {
+        set_feature_support(&mut conn, node, cat4igp_shared::control::FeatureSupport { wireguard: true, l2tp_v2: true, l2tp_v3: true, ..Default::default() }).unwrap();
+    }
     create_wireguard_tunnel(&mut conn, 1, 2, 1420, false).unwrap();
     let wg = get_wireguard_answers(&mut conn, 1).unwrap()[0].id;
     conn.batch_execute("UPDATE wireguard_tunnels SET endpoint_peer1='198.51.100.1:51820' WHERE id=1").unwrap();
@@ -346,6 +362,11 @@ fn l2tpv2_provisioning_validation_snapshots_and_cascade() {
         node_id_peer1: 1, node_id_peer2: 2, endpoint_peer1: "192.0.2.1".into(), endpoint_peer2: endpoint.into(),
         udp_port_peer1: 1701, udp_port_peer2: 1702, address_peer1: "10.0.0.1".into(), address_peer2: "10.0.0.2".into(), secret: secret.into(), mtu, wireguard_tunnel_id: None,
     };
+    assert!(crate::admin::apply(&mut conn, &command("unknown", create("secret", 1400, "192.0.2.2"))).unwrap().is_err());
+    set_feature_support(&mut conn, 1, cat4igp_shared::control::FeatureSupport { l2tp_v2: true, ..Default::default() }).unwrap();
+    set_feature_support(&mut conn, 2, cat4igp_shared::control::FeatureSupport::default()).unwrap();
+    assert!(crate::admin::apply(&mut conn, &command("unsupported", create("secret", 1400, "192.0.2.2"))).unwrap().is_err());
+    set_feature_support(&mut conn, 2, cat4igp_shared::control::FeatureSupport { l2tp_v2: true, ..Default::default() }).unwrap();
     for (i, (secret, mtu, endpoint)) in [("bad\nsecret", 1400, "192.0.2.2"), ("bad#secret", 1400, "192.0.2.2"), ("ok", 1279, "192.0.2.2"), ("ok", 1400, "::1")].into_iter().enumerate() {
         assert!(crate::admin::apply(&mut conn, &command(&format!("invalid-{i}"), create(secret, mtu, endpoint))).unwrap().is_err());
     }

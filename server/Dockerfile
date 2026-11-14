@@ -17,8 +17,12 @@ RUN apk add --no-cache ca-certificates libgcc sqlite-libs \
     && adduser -S -D -H -u 10001 -G cat4igp cat4igp \
     && mkdir /data && chown cat4igp:cat4igp /data && chmod 0700 /data
 COPY --from=build /src/target/release/cat4igp-server /usr/bin/cat4igp-server
+COPY server/entrypoint.sh /usr/local/bin/cat4igp-entrypoint
 COPY LICENSE /usr/share/licenses/cat4igp/LICENSE
-ENV DATABASE_URL=/data/cat4igp.db
+ENV DATABASE_URL=/data/cat4igp.db \
+    BIND_HOST_PORT=0.0.0.0:8080 \
+    CONTROL_BIND_MULTIADDR=/ip4/0.0.0.0/tcp/9000
 WORKDIR /data
 USER 10001:10001
-ENTRYPOINT ["/usr/bin/cat4igp-server"]
+EXPOSE 8080 9000
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/cat4igp-entrypoint"]

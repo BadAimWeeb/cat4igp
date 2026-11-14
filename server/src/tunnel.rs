@@ -59,6 +59,11 @@ mod tests {
         let mut conn = SqliteConnection::establish(":memory:").unwrap();
         crate::db::migrate(&mut conn, true).unwrap();
         conn.batch_execute("INSERT INTO nodes(id,name,auth_key) VALUES(1,'a','a'),(2,'b','b');").unwrap();
+        conn.batch_execute("INSERT INTO node_control_identities(node_id,peer_id,signing_key,encryption_key) VALUES(1,'a','a','a'),(2,'b','b','b');").unwrap();
+        conn.batch_execute("INSERT INTO application_kv(key,value) VALUES('wireguard_key/1',json_object('public_key','a')),('wireguard_key/2',json_object('public_key','b'));").unwrap();
+        for node in [1, 2] {
+            crate::db::set_feature_support(&mut conn, node, cat4igp_shared::control::FeatureSupport { l2tp_v2: true, l2tp_v3: true, ..Default::default() }).unwrap();
+        }
         crate::db::create_wireguard_tunnel(&mut conn, 1, 2, 1420, false).unwrap();
         let mutation = |request_id: &str, action| Mutation { request_id: request_id.into(), action, applied_at: chrono::Utc::now().naive_utc() };
         let v2 = Action::CreateL2tpV2Tunnel { node_id_peer1: 1, node_id_peer2: 2, endpoint_peer1: "192.0.2.1".into(), endpoint_peer2: "192.0.2.2".into(), udp_port_peer1: 1701, udp_port_peer2: 1702, address_peer1: "10.0.0.1".into(), address_peer2: "10.0.0.2".into(), secret: "secret".into(), mtu: 1400, wireguard_tunnel_id: None };

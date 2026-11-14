@@ -341,124 +341,6 @@ async fn ipc_process_kill_retries_durable_wire_result() {
     .await;
 }
 
-#[tokio::test]
-#[ignore = "external authenticated Raft endpoint fixture supplied by server test"]
-async fn ipc_external_endpoint() {
-    use std::io::{BufRead, Read, Write};
-    struct Child(std::process::Child);
-    impl Drop for Child {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    tokio::time::timeout(Duration::from_secs(25), async {
-        let directory =
-            std::path::PathBuf::from(std::env::var_os("CAT4IGP_IPC_ENDPOINT_DIR").unwrap());
-        let bundle = std::fs::read_to_string(directory.join("bundle.json")).unwrap();
-        let mut child = Child(
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "daemon::tests::ipc_process_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("CAT4IGP_IPC_CHILD", &directory)
-                .env("CAT4IGP_IPC_RUN", "true")
-                .env("HOSTNAME", std::env::var("CAT4IGP_IPC_HOSTNAME").unwrap())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit())
-                .spawn()
-                .unwrap(),
-        );
-        let stdout = child.0.stdout.take().unwrap();
-        let (ready, waiting) = tokio::sync::oneshot::channel();
-        let (synced, snapshot) = tokio::sync::oneshot::channel();
-        let reader = std::thread::spawn(move || {
-            let mut ready = Some(ready);
-            let mut synced = Some(synced);
-            for line in std::io::BufReader::new(stdout.take(8192)).lines() {
-                match line.unwrap().as_str() {
-                    "IPC_READY" => {
-                        let _ = ready.take().unwrap().send(());
-                    }
-                    "IPC_SYNCED" => {
-                        let _ = synced.take().unwrap().send(());
-                    }
-                    _ => {}
-                }
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(10), waiting)
-            .await
-            .unwrap()
-            .unwrap();
-        let client = client::DaemonClient::new(&directory.join("daemon.sock"), &directory).unwrap();
-        let request = tokio::spawn(async move {
-            client
-                .send_request(DaemonRequest::RegisterBundle { bundle })
-                .await
-        });
-        if std::env::var("CAT4IGP_IPC_EXPECT_SUCCESS").unwrap() == "true" {
-            let response = request.await.unwrap().unwrap();
-            assert!(matches!(response, DaemonResponse::Ok(_)), "{response:?}");
-            let completed = ServerConfig::load(&directory).unwrap();
-            assert!(
-                completed.control_node_id.is_some(),
-                "IPC success must persist enrollment"
-            );
-            assert!(completed.control_private_key.is_some());
-            assert!(completed.controller_signing_key.is_some());
-            snapshot
-                .await
-                .expect("full run must apply live empty topology");
-        } else {
-            use std::io::Write;
-            println!("IPC_PENDING");
-            std::io::stdout().flush().unwrap();
-            let (send, wait) = tokio::sync::oneshot::channel();
-            std::thread::spawn(move || {
-                let mut line = String::new();
-                std::io::stdin()
-                    .lock()
-                    .take(16)
-                    .read_line(&mut line)
-                    .unwrap();
-                assert_eq!(line.trim(), "kill");
-                let _ = send.send(());
-            });
-            wait.await.unwrap();
-            child.0.kill().unwrap();
-            use std::os::unix::process::ExitStatusExt;
-            assert_eq!(child.0.wait().unwrap().signal(), Some(9));
-            reader.join().unwrap();
-            // The reply may already report the dropped wire response, or IPC may be closed by SIGKILL.
-            assert!(!matches!(request.await.unwrap(), Ok(DaemonResponse::Ok(_))));
-            let pending = ServerConfig::load(&directory).unwrap();
-            assert!(
-                pending.control_node_id.is_none(),
-                "lost reply must retain pending enrollment"
-            );
-            assert!(
-                pending.control_private_key.is_some(),
-                "restart must reuse persisted identity"
-            );
-            println!("IPC_KILLED");
-            std::io::stdout().flush().unwrap();
-            return;
-        }
-        // ponytail: full run with empty topology; OS tunnel traffic remains a separate gate.
-        child.0.kill().unwrap();
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(child.0.wait().unwrap().signal(), Some(9));
-        reader.join().unwrap();
-        println!("IPC_COMPLETED");
-        std::io::stdout().flush().unwrap();
-    })
-    .await
-    .expect("bounded external endpoint IPC fixture");
-}
 
 #[tokio::test]
 #[ignore = "spawned explicitly by the control wire test"]
@@ -582,8 +464,7 @@ async fn ipc_pending_bundle_retry_preserves_identity_and_fingerprint() {
         let directory = TempDir::new().unwrap();
         let authority = libp2p::identity::Keypair::generate_ed25519();
         let peer = authority.public().to_peer_id();
-        // An unavailable trusted public seed exercises production discovery failure,
-        // without sending credentials or needing a privileged dataplane.
+        // An unavailable controller exercises failed enrollment without releasing credentials.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -596,23 +477,18 @@ async fn ipc_pending_bundle_retry_preserves_identity_and_fingerprint() {
                 .map(|byte| format!("{byte:02x}")).collect(),
             private_network_key: format!("/key/swarm/psk/1.0.0/\n/base16/\n{}", "12".repeat(32)),
             invitation_code: "same-invite".into(),
-            bootstrap_addresses: vec![address.clone()],
-            discovery_bootstrap_addresses: vec![address],
+            bootstrap_addresses: vec![address],
         }).unwrap();
         let local = ClientConfig { data_dir: directory.path().to_path_buf(), ..Default::default() };
         let daemon = Arc::new(Daemon::new(local.clone()).await.unwrap());
         let secret = daemon.get_secret().to_string();
         let response = register(daemon.clone(), bundle.clone()).await;
-        assert!(matches!(response, DaemonResponse::Error(error) if error.starts_with("Registration discovery failed:")));
+        assert!(matches!(response, DaemonResponse::Error(_)));
         drop(daemon);
         let mut pending = ServerConfig::load(directory.path()).unwrap();
         assert!(pending.enrollment_node_name.is_some());
         assert!(pending.control_node_id.is_none());
         assert_eq!(pending.invite_code, "same-invite");
-        // Model the saved dial-seed replacement performed by verified discovery.
-        // This is NOT evidence of live controller enrollment or a process restart.
-        pending.control_bootstrap_addresses = vec![format!("/ip4/127.0.0.1/tcp/1/p2p/{peer}")];
-        pending.discovery_bootstrap_addresses = pending.control_bootstrap_addresses.clone();
         pending.enrollment_node_name = Some("original-node-before-restart".into());
         pending.save(directory.path()).unwrap();
         let identity = pending.ensure_control_keypair().unwrap().public().to_peer_id();
@@ -625,11 +501,11 @@ async fn ipc_pending_bundle_retry_preserves_identity_and_fingerprint() {
         assert!(matches!(register(restarted.clone(), changed).await,
             DaemonResponse::Error(error) if error.contains("Pending registration differs")));
         let mut changed: EnrollmentBundle = serde_json::from_str(&bundle).unwrap();
-        changed.discovery_bootstrap_addresses = pending.discovery_bootstrap_addresses.clone();
+        changed.bootstrap_addresses = vec![format!("/ip4/127.0.0.1/tcp/1/p2p/{peer}")];
         assert!(matches!(register(restarted.clone(), serde_json::to_string(&changed).unwrap()).await,
             DaemonResponse::Error(error) if error.contains("Pending registration differs")));
         let response = register(restarted.clone(), bundle).await;
-        assert!(matches!(response, DaemonResponse::Error(error) if error.starts_with("Registration discovery failed:")));
+        assert!(matches!(response, DaemonResponse::Error(_)));
         drop(restarted);
         let mut after = ServerConfig::load(directory.path()).unwrap();
         assert_eq!(serde_json::to_value(&after).unwrap(), before);

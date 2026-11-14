@@ -36,6 +36,7 @@ pub struct Daemon {
     memory: Arc<daemon_memory::DaemonMemory>,
     control_sync: Arc<Mutex<()>>,
     control_plane: Arc<std::sync::Mutex<Option<control::ControlPlane>>>,
+    server_features: Arc<std::sync::RwLock<Option<cat4igp_shared::control::FeatureSupport>>>,
     tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
     stopping: Arc<tokio::sync::Notify>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
@@ -77,6 +78,16 @@ struct IpcMessage {
 }
 
 impl Daemon {
+    fn feature_support(&self) -> cat4igp_shared::control::FeatureSupport {
+        let wireguard = self.config.tunnel_protocols.wireguard;
+        let l2tp = self.config.tunnel_protocols.l2tp && cfg!(target_os = "linux");
+        cat4igp_shared::control::FeatureSupport {
+            wireguard, l2tp_v2: l2tp, l2tp_v3: l2tp,
+            faketcp: wireguard && cfg!(target_os = "linux"), fec: wireguard,
+        }
+    }
+
+
     /// Create a new daemon instance
     pub async fn new(config: ClientConfig) -> io::Result<Self> {
         Self::new_with_config_path(config, None).await
@@ -123,6 +134,7 @@ impl Daemon {
             memory: Arc::new(daemon_memory::DaemonMemory::new(cfg_clone)),
             control_sync: Arc::new(Mutex::new(())),
             control_plane: Arc::new(std::sync::Mutex::new(None)),
+            server_features: Arc::new(std::sync::RwLock::new(None)),
             tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             stopping: Arc::new(tokio::sync::Notify::new()),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -194,7 +206,6 @@ impl Daemon {
             address: address.clone(),
             invite_code,
             enrollment_bootstrap_addresses: Vec::new(),
-            enrollment_discovery_bootstrap_addresses: None,
             enrollment_node_name: None,
             wg_private_key: None,
             wg_public_key: None,
@@ -204,8 +215,6 @@ impl Daemon {
             controller_signing_key: None,
             controller_encryption_key: None,
             control_bootstrap_addresses: Vec::new(),
-            discovery_bootstrap_addresses: Vec::new(),
-            discovery_proof: None,
             control_private_network_key: self.config.control_private_network_key.clone(),
             topology_revision: 0,
             control_node_id: None,
@@ -238,7 +247,6 @@ impl Daemon {
             address: address.clone(),
             invite_code,
             enrollment_bootstrap_addresses: Vec::new(),
-            enrollment_discovery_bootstrap_addresses: None,
             enrollment_node_name: None,
             wg_private_key: None,
             wg_public_key: None,
@@ -248,8 +256,6 @@ impl Daemon {
             controller_signing_key: None,
             controller_encryption_key: None,
             control_bootstrap_addresses: Vec::new(),
-            discovery_bootstrap_addresses: Vec::new(),
-            discovery_proof: None,
             control_private_network_key: self.config.control_private_network_key.clone(),
             topology_revision: 0,
             control_node_id: None,
@@ -287,11 +293,6 @@ impl Daemon {
                 && pending.controller_signing_key == config.controller_signing_key
                 && pending.control_network_id == config.control_network_id
                 && pending.control_private_network_key == config.control_private_network_key
-                && pending
-                    .enrollment_discovery_bootstrap_addresses
-                    .as_ref()
-                    .unwrap_or(&pending.discovery_bootstrap_addresses)
-                    == &config.discovery_bootstrap_addresses
             {
                 config = pending.clone();
             } else {
@@ -317,10 +318,6 @@ impl Daemon {
         if config.enrollment_bootstrap_addresses.is_empty() {
             config.enrollment_bootstrap_addresses = config.control_bootstrap_addresses.clone();
         }
-        // ponytail: legacy pending files cannot reconstruct pre-discovery seeds; fail closed on mismatch.
-        config
-            .enrollment_discovery_bootstrap_addresses
-            .get_or_insert_with(|| config.discovery_bootstrap_addresses.clone());
         let node_name = config
             .enrollment_node_name
             .get_or_insert_with(|| {
@@ -328,15 +325,7 @@ impl Daemon {
                 std::env::var("HOSTNAME").unwrap_or_else(|_| "cat4igp-client".to_string())
             })
             .clone();
-        // Keep the identity even if discovery fails before any enrollment is sent.
-        if let Err(error) = config.save(&self.config.data_dir) {
-            return DaemonResponse::Error(format!("Failed to save pending registration: {error}"));
-        }
-        *self.server_config.lock().await = Some(config.clone());
-        if let Err(error) = control::refresh_discovery(&mut config).await {
-            return DaemonResponse::Error(format!("Registration discovery failed: {error}"));
-        }
-        // Persist verified roster and stable enrollment identity before releasing the invite.
+        // Persist the stable enrollment identity before releasing the invite.
         if let Err(error) = config.save(&self.config.data_dir) {
             return DaemonResponse::Error(format!("Failed to save pending registration: {error}"));
         }
@@ -709,6 +698,7 @@ impl Daemon {
             memory: Arc::clone(&self.memory),
             control_sync: Arc::clone(&self.control_sync),
             control_plane: Arc::clone(&self.control_plane),
+            server_features: Arc::clone(&self.server_features),
             tasks: Arc::clone(&self.tasks),
             stopping: Arc::clone(&self.stopping),
             stopped: Arc::clone(&self.stopped),
@@ -730,11 +720,6 @@ impl Daemon {
             return Err("control plane is not enrolled".to_string());
         }
         let (updates, mut received) = mpsc::channel(8);
-        control::refresh_discovery(&mut config).await?;
-        config
-            .save(&self.config.data_dir)
-            .map_err(|error| error.to_string())?;
-        *self.server_config.lock().await = Some(config.clone());
         let mut tasks = self.tasks.lock().unwrap();
         if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("daemon stopped".into());
@@ -878,11 +863,6 @@ impl Daemon {
             return Err("control plane is not enrolled".to_string());
         }
 
-        control::refresh_discovery(&mut config).await?;
-        config
-            .save(&self.config.data_dir)
-            .map_err(|error| error.to_string())?;
-        *self.server_config.lock().await = Some(config.clone());
 
         let plane = self
             .control_plane
@@ -890,6 +870,12 @@ impl Daemon {
             .unwrap()
             .clone()
             .ok_or_else(|| "control plane is not enrolled".to_string())?;
+        let features = match plane.request(ControlRequest::Features(self.feature_support())).await? {
+            ControlResponse::Features(features) => features,
+            ControlResponse::Rejected(error) => return Err(error),
+            _ => return Err("controller does not advertise feature support".into()),
+        };
+        *self.server_features.write().unwrap() = Some(features);
         let response = plane
             .request(cat4igp_shared::control::ControlRequest::Snapshot)
             .await?;
@@ -967,6 +953,11 @@ impl Daemon {
                 WireguardAnswered::Unanswered | WireguardAnswered::Answered
             )
         }) {
+            let required = cat4igp_shared::control::FeatureSupport { wireguard: true, fec: tunnel.fec, faketcp: tunnel.faketcp, ..Default::default() };
+            if !self.feature_support().supports(required) || !self.server_features.read().unwrap().is_some_and(|features| features.supports(required)) {
+                eprintln!("[daemon] tunnel {} requires unsupported or unknown features", tunnel.tunnel_id);
+                continue;
+            }
             let node_id = config
                 .control_node_id
                 .ok_or_else(|| "control node id is not enrolled".to_string())?;
@@ -1055,10 +1046,8 @@ impl Daemon {
                     }
                 }
                 ControlResponse::Rejected(error) => {
-                    return Err(format!(
-                        "tunnel {} answer rejected: {error}",
-                        tunnel.tunnel_id
-                    ));
+                    eprintln!("[daemon] tunnel {} answer rejected: {error}", tunnel.tunnel_id);
+                    continue;
                 }
                 _ => {
                     return Err(format!(

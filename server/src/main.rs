@@ -4,7 +4,7 @@ mod tunnel;
 #[cfg(test)]
 extern crate rand08 as rand;
 
-// Compile the shipped client paths unchanged for the real listener/Raft wire check.
+// Compile the shipped client paths for control protocol tests.
 #[cfg(test)]
 #[path = "../../client/src/config/server.rs"]
 mod client_config;
@@ -182,8 +182,18 @@ fn control_response(
         }
     };
     match request {
+        cat4igp_shared::control::ControlRequest::Features(features) => {
+            let response = match crate::db::set_feature_support(conn, identity.node_id, features) {
+                Ok(()) => cat4igp_shared::control::ControlResponse::Features(cat4igp_shared::control::FeatureSupport::server()),
+                Err(error) => cat4igp_shared::control::ControlResponse::Rejected(error.to_string()),
+            };
+            (response, Vec::new())
+        }
         cat4igp_shared::control::ControlRequest::Snapshot => {
             let response = (|| {
+                if crate::db::feature_support(conn, identity.node_id)?.is_none() {
+                    return Err(diesel::result::Error::DeserializationError(Box::new(std::io::Error::other("client feature support unknown"))));
+                }
                 let snapshot = crate::db::topology_snapshot(
                     conn,
                     identity.node_id,
@@ -239,6 +249,11 @@ fn control_response(
                     );
                 }
             };
+            if answer.endpoint.is_some() {
+                if let Err(error) = crate::db::validate_answer_features(conn, identity.node_id, answer.tunnel_id) {
+                    return (cat4igp_shared::control::ControlResponse::Rejected(error), Vec::new());
+                }
+            }
             let command = crate::db::AnswerCommand {
                 node_id: identity.node_id,
                 request_id: envelope.meta.message_id,
@@ -389,8 +404,7 @@ async fn run_control_plane(
     );
     swarm.listen_on(listen_address.parse()?)?;
 
-    // ponytail: serialized local SQL, not consensus; replace submission with OpenRaft
-    // commit/apply before HA. At most 32 queued + 1 active + 32 completed jobs.
+    // Bound the serialized local SQL queue to 32 waiting, 1 active and 32 completed jobs.
     let (completed, mut results) = tokio::sync::mpsc::channel(DATABASE_QUEUE_CAPACITY);
     let worker_key = keypair.clone();
     let worker_network = network_id.clone();
@@ -483,7 +497,6 @@ fn database_worker(
                 reply,
             } => {
                 // A disconnected caller must not cancel a potentially committed write.
-                // ponytail: singleton ordered allocation; submit this selected command through OpenRaft before HA.
                 let result = (|| {
                     use diesel::prelude::*;
                     let last = crate::schema::invites::table
@@ -520,6 +533,9 @@ fn database_worker(
         );
         let mut pushes = Vec::new();
         for snapshot in snapshots {
+            if !matches!(crate::db::feature_support(&mut conn, snapshot.node_id), Ok(Some(_))) {
+                continue;
+            }
             let identity = crate::db::control_identity_for_node(&mut conn, snapshot.node_id)
                 .expect("cannot read committed topology recipient");
             let now = chrono::Utc::now().timestamp_millis();
@@ -611,42 +627,10 @@ async fn main() -> Result<(), String> {
     tokio::select! {
         result = axum::serve(listener, app) => result.unwrap(),
         result = &mut control => return Err(format!("control plane stopped: {result:?}")),
-        result = run_discovery() => return Err(format!("discovery stopped: {result}")),
     }
     Ok(())
 }
 
-async fn run_discovery() -> String {
-    async {
-        let path = match env::var("DISCOVERY_ROSTER_FILE") {
-            Err(env::VarError::NotPresent) => {
-                return std::future::pending::<Result<(), String>>().await;
-            }
-            Err(error) => return Err(error.to_string()),
-            Ok(path) => path,
-        };
-        // ponytail: operator-signed expiring roster only; replace with committed
-        // roster refresh when HA authority exists. No local membership fabrication.
-        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        let mut bytes = Vec::new();
-        use std::io::Read;
-        file.take(cat4igp_shared::discovery::MAX_MESSAGE_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        let roster = cat4igp_shared::discovery::decode(&bytes)?;
-        let key = control_keypair()?;
-        let mut swarm = cat4igp_shared::discovery::transport::swarm(&key)?;
-        let listen = env::var("DISCOVERY_LISTEN_ADDRESS")
-            .map_err(|_| "DISCOVERY_LISTEN_ADDRESS must be set")?
-            .parse()
-            .map_err(|_| "invalid discovery listen address")?;
-        swarm.listen_on(listen).map_err(|e| e.to_string())?;
-        cat4igp_shared::discovery::transport::serve(swarm, key, roster).await
-    }
-    .await
-    .err()
-    .unwrap_or_else(|| "unexpected completion".into())
-}
 
 #[cfg(test)]
 #[path = "main_test.rs"]

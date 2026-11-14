@@ -205,7 +205,6 @@ pub fn apply_invite(
     // One authenticated operator principal today; scope by operator ID when multi-operator auth exists.
     let fingerprint =
         serde_json::to_string(&(command.expires_at, command.max_uses, command.join_mesh)).unwrap();
-    // The Raft adapter supplies the outer immediate transaction; nested calls use savepoints.
     conn.transaction(|conn| {
         if let Some(previous) = diesel::sql_query("SELECT json_extract(value,'$.fingerprint') AS fingerprint, json_extract(value,'$.result') AS result FROM application_kv WHERE key = ?")
             .bind::<Text, _>(format!("operator_invite_result/{}", command.request_id)).get_result::<Previous>(conn).optional()? {
@@ -593,6 +592,40 @@ pub(crate) struct L2tpV2Row {
 
 pub(crate) fn l2tp_v2_rows(conn: &mut SqliteConnection) -> Result<Vec<L2tpV2Row>, diesel::result::Error> {
     diesel::sql_query("SELECT * FROM l2tpv2_tunnels ORDER BY id").load(conn)
+}
+
+/// Last report from the node's authenticated control identity; absence means unknown.
+pub(crate) fn feature_support(conn: &mut SqliteConnection, node: i32) -> QueryResult<Option<cat4igp_shared::control::FeatureSupport>> {
+    #[derive(QueryableByName)]
+    struct Value { #[diesel(sql_type = diesel::sql_types::Text)] value: String }
+    let value = diesel::sql_query("SELECT value FROM application_kv WHERE key=?")
+        .bind::<diesel::sql_types::Text, _>(format!("features/{node}"))
+        .get_result::<Value>(conn).optional()?;
+    value.map(|v| serde_json::from_str(&v.value).map_err(|e| diesel::result::Error::DeserializationError(Box::new(e)))).transpose()
+}
+
+pub(crate) fn set_feature_support(conn: &mut SqliteConnection, node: i32, features: cat4igp_shared::control::FeatureSupport) -> QueryResult<()> {
+    let value = serde_json::to_string(&features).map_err(|e| diesel::result::Error::SerializationError(Box::new(e)))?;
+    diesel::sql_query("INSERT INTO application_kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        .bind::<diesel::sql_types::Text, _>(format!("features/{node}"))
+        .bind::<diesel::sql_types::Text, _>(value).execute(conn)?;
+    Ok(())
+}
+
+/// Refuse positive answers until both authenticated peers support this tunnel.
+pub(crate) fn validate_answer_features(conn: &mut SqliteConnection, node: i32, tunnel_id: i32) -> Result<(), String> {
+    use cat4igp_shared::control::FeatureSupport;
+    let snapshot = topology_snapshot(conn, node, 0).map_err(|e| e.to_string())?;
+    let tunnel = snapshot.tunnels.iter().find(|t| t.tunnel_id == tunnel_id).ok_or("tunnel not found for node")?;
+    let required = FeatureSupport { wireguard: true, fec: tunnel.fec, faketcp: tunnel.faketcp, ..Default::default() };
+    for peer in [node, tunnel.peer_node_id] {
+        match feature_support(conn, peer).map_err(|e| e.to_string())? {
+            None => return Err(format!("node {peer} feature support unknown")),
+            Some(features) if !features.supports(required) => return Err(format!("node {peer} lacks required feature")),
+            _ => (),
+        }
+    }
+    Ok(())
 }
 
 /// The transport-independent desired WireGuard state for one node.

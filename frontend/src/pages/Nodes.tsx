@@ -42,6 +42,7 @@ export function Nodes({
               <TableCell scope="col">Node</TableCell>
               <TableCell scope="col">Created (SQLite time)</TableCell>
               <TableCell scope="col">Last seen (SQLite time)</TableCell>
+              <TableCell scope="col">Reported features</TableCell>
               <TableCell scope="col">Actions</TableCell>
             </TableRow>
           </TableHead>
@@ -54,6 +55,7 @@ export function Nodes({
                 </TableCell>
                 <TableCell>{n.created_at}</TableCell>
                 <TableCell>{n.last_seen ?? "Not observed"}</TableCell>
+                <TableCell>{n.features == null ? "Unknown" : (Object.entries(n.features).filter(([, enabled]) => enabled).map(([name]) => name).join(", ") || "None")}</TableCell>
                 <TableCell>
                   <ActionMenu
                     label={`Actions for node #${n.id}`}

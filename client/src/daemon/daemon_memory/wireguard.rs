@@ -409,7 +409,8 @@ impl DaemonMemory {
             .tunnels
             .iter()
             .filter(|t| {
-                matches!(t.local_answered, WireguardAnswered::Answered)
+                self.wireguard_enabled && (!t.faketcp || cfg!(target_os = "linux"))
+                    && matches!(t.local_answered, WireguardAnswered::Answered)
                     && matches!(t.remote_response, WireguardAnswered::Answered)
             })
             .map(|t| t.tunnel_id)
@@ -453,7 +454,8 @@ impl DaemonMemory {
         }
 
         for tunnel in &snapshot.tunnels {
-            let is_ready = matches!(tunnel.local_answered, WireguardAnswered::Answered)
+            let is_ready = self.wireguard_enabled && (!tunnel.faketcp || cfg!(target_os = "linux"))
+                && matches!(tunnel.local_answered, WireguardAnswered::Answered)
                 && matches!(tunnel.remote_response, WireguardAnswered::Answered);
             if !is_ready {
                 continue;

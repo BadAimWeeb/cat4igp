@@ -70,7 +70,7 @@ desired MTU; matching MTU alone does not imply an active interface.
 Provide a strong unique CHAP secret; the UI accepts 32–128 lowercase hex
 digits. CHAP authenticates PPP peers but does not encrypt or protect traffic.
 Use direct L2TPv2 only on trusted networks. The controller stores the secret
-in plaintext in its database and mutation receipts and replicates it to other
-controllers; protect their storage and backups. The secret is omitted from
+in plaintext in its database and mutation receipts; protect their storage and
+backups. The secret is omitted from
 administrator inventory. Each client creates private temporary PPP files and
 isolates them with a mount namespace; they are removed on normal shutdown.

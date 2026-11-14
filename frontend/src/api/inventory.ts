@@ -1,8 +1,10 @@
+type Features = { wireguard: boolean; l2tp_v2: boolean; l2tp_v3: boolean; faketcp: boolean; fec: boolean };
 type Node = {
   id: number;
   name: string;
   created_at: string;
   last_seen: string | null;
+  features?: Features | null;
 };
 type Mesh = { id: number; name: string; auto_wireguard: boolean; mtu: number; fec: boolean; faketcp?: boolean };
 type Membership = { mesh_id: number; node_id: number };
@@ -37,6 +39,7 @@ type L2tpV2Tunnel = {
   address_peer1: string; address_peer2: string; mtu: number; wireguard_tunnel_id?: number | null;
 };
 export type Inventory = {
+  server_features?: Features;
   nodes: Node[];
   meshes: Mesh[];
   memberships: Membership[];
@@ -50,6 +53,8 @@ export const integer = (x: unknown): x is number =>
 const text = (x: unknown): x is string => typeof x === "string";
 const nullableText = (x: unknown) => x === null || text(x);
 const nullableInteger = (x: unknown) => x === null || integer(x);
+const features = (x: unknown): x is Features => !!x && typeof x === "object" &&
+  ["wireguard", "l2tp_v2", "l2tp_v3", "faketcp", "fec"].every((k) => typeof (x as Record<string, unknown>)[k] === "boolean");
 const rows = (
   value: unknown,
   check: (row: Record<string, unknown>) => boolean,
@@ -64,6 +69,7 @@ export function inventoryFrom(value: unknown): Inventory {
   if (!value || typeof value !== "object")
     throw new Error("Invalid inventory response.");
   const data = value as Record<string, unknown>;
+  if (data.server_features !== undefined && !features(data.server_features)) throw new Error("Invalid server feature flags.");
   if (
     !rows(
       data.nodes,
@@ -71,7 +77,7 @@ export function inventoryFrom(value: unknown): Inventory {
         integer(r.id) &&
         text(r.name) &&
         text(r.created_at) &&
-        nullableText(r.last_seen),
+        nullableText(r.last_seen) && (r.features === undefined || r.features === null || features(r.features)),
     ) ||
     !rows(
       data.meshes,

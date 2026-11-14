@@ -10,6 +10,29 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
+/// Supported provisioning features. Missing fields are unsupported, never inferred.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FeatureSupport {
+    pub wireguard: bool,
+    pub l2tp_v2: bool,
+    pub l2tp_v3: bool,
+    pub faketcp: bool,
+    pub fec: bool,
+}
+
+impl FeatureSupport {
+    /// Features understood by the controller, independently of client backends.
+    pub fn server() -> Self {
+        Self { wireguard: true, l2tp_v2: true, l2tp_v3: true, faketcp: true, fec: true }
+    }
+
+    pub fn supports(&self, required: Self) -> bool {
+        (!required.wireguard || self.wireguard) && (!required.l2tp_v2 || self.l2tp_v2)
+            && (!required.l2tp_v3 || self.l2tp_v3) && (!required.faketcp || self.faketcp)
+            && (!required.fec || self.fec)
+    }
+}
 
 // ponytail: empty-capability reports only; add tested backend tuples and a leader-fenced exchange before provisioning.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -62,8 +85,6 @@ pub struct EnrollmentBundle {
     pub network_id: String,
     pub private_network_key: String,
     pub invitation_code: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub discovery_bootstrap_addresses: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -533,6 +554,7 @@ pub fn open_tunnel_answer(
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ControlRequest {
     Enroll(EnrollmentRequest),
+    Features(FeatureSupport),
     Snapshot,
     TunnelAnswerEnvelope(EncryptedEnvelope),
 }
@@ -540,6 +562,7 @@ pub enum ControlRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ControlResponse {
     Enrolled(EnrollmentResponse),
+    Features(FeatureSupport),
     SnapshotEnvelope(EncryptedEnvelope),
     Accepted,
     Rejected(String),

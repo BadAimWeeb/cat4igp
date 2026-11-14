@@ -1,4 +1,4 @@
-name: Native HA tests
+name: Native tests
 
 on:
   push: {}
@@ -17,5 +17,4 @@ jobs:
         with:
           persist-credentials: false
       # Cargo uses the repository's pinned rust-toolchain.toml.
-      - run: python3 .github/ha-tests.py
       - run: cargo test --locked -p cat4igp-client -p cat4igp-server -p cat4igp-shared
