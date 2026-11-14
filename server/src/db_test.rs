@@ -138,6 +138,38 @@ fn enrollment_kv_migration_preserves_global_request_uniqueness() {
 }
 
 #[test]
+fn rejected_enrollment_receipts_are_removed_on_upgrade() {
+    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
+    migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
+    let target = migrations.iter().position(|migration| migration.name().version().to_string() == "202611160000000000").unwrap();
+    assert!(conn.applied_migrations().unwrap().is_empty());
+    conn.run_migrations(&migrations[..target]).unwrap();
+    conn.batch_execute("INSERT INTO application_kv VALUES ('control_enrollment_result/rejected',json_object('request_id','r','fingerprint','f','result','{\"Rejected\":\"no\"}')), ('control_enrollment_result/success',json_object('request_id','s','fingerprint','f','result','{\"Enrolled\":{\"node_id\":1}}')), ('control_enrollment_result/unknown',json_object('request_id','u','fingerprint','f','result','not-json')), ('other',json_object('result','{\"Rejected\":\"no\"}')); ").unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
+    conn.batch_execute("CREATE TEMP TABLE receipt_check(ok INTEGER CHECK(ok=1)); INSERT INTO receipt_check SELECT count(*)=0 FROM application_kv WHERE key='control_enrollment_result/rejected'; INSERT INTO receipt_check SELECT count(*)=3 FROM application_kv WHERE key IN ('control_enrollment_result/success','control_enrollment_result/unknown','other');").unwrap();
+    conn.revert_last_migration(MIGRATIONS).unwrap();
+    conn.batch_execute("INSERT INTO receipt_check SELECT count(*)=3 FROM application_kv WHERE key IN ('control_enrollment_result/success','control_enrollment_result/unknown','other');").unwrap();
+}
+
+#[test]
+fn enrollment_request_ids_become_peer_scoped_on_upgrade() {
+    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
+    migrations.sort_by(|a, b| a.name().version().cmp(&b.name().version()));
+    let target = migrations.iter().position(|m| m.name().version().to_string() == "202611170000000000").unwrap();
+    assert!(conn.applied_migrations().unwrap().is_empty());
+    conn.run_migrations(&migrations[..target]).unwrap();
+    conn.batch_execute("INSERT INTO application_kv VALUES('control_enrollment_result/one',json_object('request_id','same','fingerprint','f','result','r')); ").unwrap();
+    conn.run_migrations(&migrations[target..=target]).unwrap();
+    conn.batch_execute("INSERT INTO application_kv VALUES('control_enrollment_result/two',json_object('request_id','same','fingerprint','f','result','r')); ").unwrap();
+    assert!(conn.revert_last_migration(MIGRATIONS).is_err());
+    conn.batch_execute("DELETE FROM application_kv WHERE key='control_enrollment_result/two';").unwrap();
+    conn.revert_last_migration(MIGRATIONS).unwrap();
+    assert!(conn.batch_execute("INSERT INTO application_kv VALUES('control_enrollment_result/two',json_object('request_id','same','fingerprint','f','result','r')); ").is_err());
+}
+
+#[test]
 fn answer_receipt_kv_round_trip_keeps_composite_keys() {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     let mut migrations = <EmbeddedMigrations as MigrationSource<diesel::sqlite::Sqlite>>::migrations(&MIGRATIONS).unwrap();
@@ -336,11 +368,23 @@ fn l2tpv2_wireguard_validation_and_underlay_cascade() {
         assert!(crate::admin::apply(&mut conn, &command(key, action)).unwrap().is_err());
     }
     assert!(crate::admin::apply(&mut conn, &command("create", create("10.9.0.1", "10.9.0.2", 1701, 65000, Some(wg)))).unwrap().is_ok());
-    let answer = AnswerCommand { node_id: 1, request_id: "outer-conflict".into(), answer: cat4igp_shared::control::TunnelAnswer { tunnel_id: wg, endpoint: Some("10.9.0.2:51820".into()), decline_type: None }, applied_at: chrono::Utc::now().naive_utc() };
+    let answer = AnswerCommand { node_id: 1, request_id: "outer-conflict".into(), answer: cat4igp_shared::control::TunnelAnswer { tunnel_id: wg, endpoint: Some("10.9.0.2:51820".into()), decline_type: None, refresh: None }, applied_at: chrono::Utc::now().naive_utc() };
     assert_eq!(apply_answer(&mut conn, &answer).unwrap(), "invalid tunnel endpoint");
     assert!(crate::admin::apply(&mut conn, &command("reuse", create("10.9.0.1", "10.9.0.3", 1703, 1400, Some(wg)))).unwrap().is_err());
     let v3 = Action::CreateL2tpTunnel { node_id_peer1: 1, node_id_peer2: 2, endpoint_peer1: "10.9.0.2".into(), endpoint_peer2: "10.9.0.3".into(), udp_port_peer1: 1703, udp_port_peer2: 1704, session_id_peer1: 11, session_id_peer2: 22, cookie_peer1: "0123456789abcdef".into(), cookie_peer2: "fedcba9876543210".into(), security_mode: "wireguard".into(), wireguard_tunnel_id: Some(wg), mtu: 1400 };
     assert!(crate::admin::apply(&mut conn, &command("v3-reuse", v3)).unwrap().is_err());
+    let v3 = Action::CreateL2tpTunnel { node_id_peer1: 1, node_id_peer2: 2, endpoint_peer1: "10.10.0.1".into(), endpoint_peer2: "10.10.0.2".into(), udp_port_peer1: 1713, udp_port_peer2: 1714, session_id_peer1: 31, session_id_peer2: 32, cookie_peer1: "0123456789abcdef".into(), cookie_peer2: "fedcba9876543210".into(), security_mode: "wireguard".into(), wireguard_tunnel_id: Some(wg), mtu: 1400 };
+    assert!(crate::admin::apply(&mut conn, &command("v3-create", v3)).unwrap().is_ok());
+    let mut v3_answer = answer.clone();
+    v3_answer.request_id = "v3-outer-conflict".into();
+    v3_answer.answer.endpoint = Some("10.10.0.2:51820".into());
+    assert_eq!(apply_answer(&mut conn, &v3_answer).unwrap(), "invalid tunnel endpoint");
+    for node in [1, 2] { set_feature_support(&mut conn, node, cat4igp_shared::control::FeatureSupport { wireguard: true, refresh_dual_link: true, ..Default::default() }).unwrap(); }
+    crate::refresh::set_mode(&mut conn, wg, cat4igp_shared::control::RefreshMode::DualLink).unwrap().unwrap();
+    v3_answer.request_id = "v3-refresh-conflict".into();
+    v3_answer.answer.endpoint = None;
+    v3_answer.answer.refresh = Some(cat4igp_shared::control::RefreshAnswer { generation: 1, stage: cat4igp_shared::control::RefreshStage::Offer, offer: Some(cat4igp_shared::control::RefreshOffer { endpoint: "10.10.0.2:51820".into(), public_key: "invalid".into() }) });
+    assert_eq!(apply_answer(&mut conn, &v3_answer).unwrap(), "invalid tunnel endpoint");
     let a = topology_snapshot(&mut conn, 1, 0).unwrap().l2tp_v2_tunnels.remove(0);
     let b = topology_snapshot(&mut conn, 2, 0).unwrap().l2tp_v2_tunnels.remove(0);
     assert_eq!(a.wireguard_tunnel_id, Some(wg));
@@ -997,6 +1041,7 @@ fn deterministic_answer_retry_and_atomic_rollback() {
             tunnel_id: 1,
             endpoint: Some("192.0.2.1:1234".into()),
             decline_type: None,
+            refresh: None,
         },
         applied_at: chrono::DateTime::from_timestamp(1_790_812_800, 0)
             .unwrap()
@@ -1087,7 +1132,7 @@ fn enrollment_retry_restart_conflict_and_rollback() {
             client_peer_id: "peer".into(),
             client_signing_key: "signing".into(),
             client_encryption_key: "encryption".into(),
-            wireguard_public_key: "wg".into(),
+            wireguard_public_key: "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
         },
         node_id: 2,
         auth_key: "explicit-auth".into(),
@@ -1102,6 +1147,13 @@ fn enrollment_retry_restart_conflict_and_rollback() {
             controller_encryption_key: "controller-encryption".into(),
         },
     };
+    for key in ["wg", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA!", "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA__"] {
+        command.request.wireguard_public_key = key.into();
+        assert!(matches!(apply_enrollment(&mut conn, &command).unwrap().0, ControlResponse::Rejected(_)));
+        assert_eq!(get_invites(&mut conn).unwrap()[0].used_count, 0);
+        assert_eq!(get_node_list(&mut conn).unwrap().len(), 1);
+    }
+    command.request.wireguard_public_key = "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into();
     conn.batch_execute("CREATE TRIGGER fail_enrollment BEFORE INSERT ON application_kv WHEN substr(NEW.key,1,26)='control_enrollment_result/' BEGIN SELECT RAISE(ABORT, 'disk failure'); END;").unwrap();
     assert!(apply_enrollment(&mut conn, &command).is_err());
     assert_eq!(get_invites(&mut conn).unwrap()[0].used_count, 0);
@@ -1152,6 +1204,7 @@ fn enrollment_retry_restart_conflict_and_rollback() {
         apply_enrollment(&mut conn, &command).unwrap().0,
         ControlResponse::Rejected(_)
     ));
+    command.request.wireguard_public_key = "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into();
     command.request.request_id = "another-id".into();
     assert!(matches!(
         apply_enrollment(&mut conn, &command).unwrap().0,
@@ -1160,19 +1213,35 @@ fn enrollment_retry_restart_conflict_and_rollback() {
     assert_eq!(get_invites(&mut conn).unwrap()[0].used_count, 1);
     assert_eq!(get_node_list(&mut conn).unwrap().len(), 2);
     assert_eq!(get_wireguard_answers(&mut conn, 2).unwrap().len(), 2);
-    // Capacity/expiry and invalid legacy mesh references are durable outcomes too.
+    // Rejections do not reserve an identity or request ID, including across restart.
     command.request.client_peer_id = "rejected-peer".into();
     command.request.request_id = "rejected-request".into();
-    let rejected = apply_enrollment(&mut conn, &command).unwrap().0;
-    assert!(matches!(rejected, ControlResponse::Rejected(_)));
-    conn.batch_execute("UPDATE invites SET max_uses = 10")
-        .unwrap();
+    assert!(matches!(apply_enrollment(&mut conn, &command).unwrap().0, ControlResponse::Rejected(_)));
+    conn.batch_execute("CREATE TEMP TABLE rejected_check(ok INTEGER CHECK(ok=1)); INSERT INTO rejected_check SELECT count(*)=0 FROM application_kv WHERE key='control_enrollment_result/rejected-peer'; UPDATE invites SET max_uses = 10;").unwrap();
     drop(conn);
     let mut conn = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
-    assert_eq!(
-        serde_json::to_string(&rejected).unwrap(),
-        serde_json::to_string(&apply_enrollment(&mut conn, &command).unwrap().0).unwrap()
-    );
+    command.request.client_peer_id = "new-peer".into();
+    command.request.request_id = "retry".into();
+    command.node_id = 3;
+    command.allocation = prepare_enrollment_allocation(&mut conn, "invite").unwrap();
+    let success = apply_enrollment(&mut conn, &command).unwrap().0;
+    assert!(matches!(success, ControlResponse::Enrolled(_)));
+    assert_eq!(serde_json::to_string(&success).unwrap(), serde_json::to_string(&apply_enrollment(&mut conn, &command).unwrap().0).unwrap());
+    assert_eq!(get_invites(&mut conn).unwrap()[0].used_count, 2);
+    assert_eq!(get_node_list(&mut conn).unwrap().len(), 3);
+    // A historical successful receipt remains retryable even if its key is now invalid.
+    let mut legacy = command.clone();
+    legacy.request.client_peer_id = "legacy-peer".into();
+    legacy.request.wireguard_public_key = "legacy-invalid".into();
+    let fingerprint = serde_json::to_string(&legacy.request).unwrap();
+    let result = serde_json::to_string(&success).unwrap();
+    diesel::sql_query("INSERT INTO application_kv VALUES (?, json_object('request_id', ?, 'fingerprint', ?, 'result', ?))")
+        .bind::<diesel::sql_types::Text, _>("control_enrollment_result/legacy-peer")
+        .bind::<diesel::sql_types::Text, _>(&legacy.request.request_id)
+        .bind::<diesel::sql_types::Text, _>(fingerprint)
+        .bind::<diesel::sql_types::Text, _>(result)
+        .execute(&mut conn).unwrap();
+    assert_eq!(serde_json::to_string(&apply_enrollment(&mut conn, &legacy).unwrap().0).unwrap(), serde_json::to_string(&success).unwrap());
     for (peer, update) in [
         (
             "expired",
@@ -1191,8 +1260,8 @@ fn enrollment_retry_restart_conflict_and_rollback() {
             ControlResponse::Rejected(_)
         ));
     }
-    assert_eq!(get_invites(&mut conn).unwrap()[0].used_count, 1);
-    assert_eq!(get_node_list(&mut conn).unwrap().len(), 2);
+    assert_eq!(get_invites(&mut conn).unwrap()[0].used_count, 2);
+    assert_eq!(get_node_list(&mut conn).unwrap().len(), 3);
     drop(conn);
     std::fs::remove_file(path).unwrap();
 }

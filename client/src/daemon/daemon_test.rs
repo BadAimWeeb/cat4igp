@@ -1,6 +1,46 @@
 use super::*;
 use tempfile::TempDir;
 
+#[test]
+fn executable_discovery_requires_executable_regular_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().as_os_str();
+    assert!(!executable_in_path("nft", None));
+    assert!(!executable_in_path("nft", Some(path)));
+    let file = directory.path().join("nft");
+    std::fs::write(&file, b"test").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!executable_in_path("nft", Some(path)));
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(executable_in_path("nft", Some(path)));
+    assert!(!executable_in_path("pppd", Some(path)));
+}
+
+#[test]
+fn definitive_rejection_allows_new_invitation_without_losing_identity() {
+    let directory = TempDir::new().unwrap();
+    let mut config = ServerConfig::new("seed".into(), "old-invite".into());
+    config.ensure_control_keypair().unwrap();
+    config.ensure_wireguard_keypair().unwrap();
+    config.ensure_control_encryption_key().unwrap();
+    config.save(directory.path()).unwrap();
+    let identity = config.control_private_key.clone();
+    let wireguard = config.wg_private_key.clone();
+    assert!(!persist_enrollment_rejection(&mut config, directory.path(), "identity permanently revoked").unwrap());
+    assert_eq!(ServerConfig::load(directory.path()).unwrap().invite_code, "old-invite");
+    assert!(persist_enrollment_rejection(&mut config, directory.path(), "enrollment rejected").unwrap());
+    let saved = ServerConfig::load(directory.path()).unwrap();
+    assert!(saved.invite_code.is_empty());
+    assert_eq!(saved.control_private_key, identity);
+    assert_eq!(saved.wg_private_key, wireguard);
+    let invalid_dir = directory.path().join("not-a-directory");
+    std::fs::write(&invalid_dir, b"file").unwrap();
+    config.invite_code = "pending".into();
+    assert!(persist_enrollment_rejection(&mut config, &invalid_dir, "enrollment rejected").is_err());
+    assert_eq!(config.invite_code, "pending");
+}
+
 #[tokio::test]
 async fn ipc_modify_config_updates_and_persists_hostnames() {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -103,6 +143,8 @@ async fn ipc_modify_config_updates_and_persists_hostnames() {
         faketcp: false,
         created_at: 0,
         updated_at: 0,
+        refresh_mode: Default::default(),
+        refresh: Default::default(),
     };
     assert_eq!(
         daemon

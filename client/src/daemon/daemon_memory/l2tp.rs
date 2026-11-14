@@ -117,6 +117,12 @@ fn cookie(value: &str) -> Result<[u8; 8], String> {
 }
 
 impl DaemonMemory {
+    pub(super) async fn invalidate_l2tp_underlay(&self, wireguard_id: i32) {
+        for tunnel in self.l2tp.lock().await.values_mut() {
+            if tunnel.info.wireguard_tunnel_id == Some(wireguard_id) { tunnel.cleanup_pending = true; }
+        }
+    }
+
     pub(super) async fn remove_stale_l2tp(&self, snapshot: &TopologySnapshot) -> Result<(), String> {
         let mut active = self.l2tp.lock().await;
         let desired: HashSet<_> = snapshot.l2tp_tunnels.iter().map(|t| t.tunnel_id).collect();

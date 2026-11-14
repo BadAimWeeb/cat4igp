@@ -44,6 +44,7 @@ export function Tunnels({
                 <TableCell scope="col">Peers</TableCell>
                 <TableCell scope="col">Endpoints</TableCell>
                 <TableCell scope="col">MTU</TableCell>
+                <TableCell scope="col">Refresh mode</TableCell>
                 <TableCell scope="col">Intents / actions</TableCell>
               </TableRow>
             </TableHead>
@@ -70,6 +71,14 @@ export function Tunnels({
                     </div>
                   </TableCell>
                   <TableCell>{t.mtu}</TableCell>
+                  <TableCell>
+                    <TextField select size="small" label={`Refresh mode for tunnel #${t.id}`} value={t.refresh_mode || "current"} disabled={disabled}
+                      onChange={e => confirmed({ action: "set_tunnel_refresh_mode", tunnel_id: t.id, mode: e.target.value }, `Change refresh mode for tunnel #${t.id}`, "Both peers must support this mode. Mode cannot change during a dual-link transition. Switching between current and proxy rebinds the public UDP port and may briefly interrupt traffic. Proxy pins the peer IP and port and disables authenticated WireGuard endpoint roaming; it cannot be combined with FakeTCP. FEC uses its own socket.")}>
+                      <MenuItem value="current">Current</MenuItem>
+                      <MenuItem value="proxy">Userspace proxy</MenuItem>
+                      <MenuItem value="dual_link">New tunnel link</MenuItem>
+                    </TextField>
+                  </TableCell>
                   <TableCell>
                     {t.intents.length
                       ? t.intents.map((intent, i) => (

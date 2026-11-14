@@ -19,9 +19,15 @@ use tokio::time::{self, Duration};
 pub struct Runtime {
     local_task: JoinHandle<()>,
     fec_task: JoinHandle<()>,
+    fec_socket: Arc<UdpSocket>,
+    stun: Arc<crate::stun::Stun>,
 }
 
 impl Runtime {
+    pub async fn mapped_addr(&self, server: SocketAddr, timeout: Duration) -> Result<SocketAddr, String> {
+        self.stun.mapped_addr(&self.fec_socket, server, timeout).await
+    }
+
     pub async fn shutdown(mut self) {
         self.local_task.abort();
         self.fec_task.abort();
@@ -248,6 +254,7 @@ pub async fn spawn(
 ) -> Result<(Runtime, BoundAddrs), std::io::Error> {
     let fec_socket = Arc::new(UdpSocket::bind(config.fec_bind).await?);
     let local_socket = Arc::new(UdpSocket::bind(config.local_bind).await?);
+    let stun = Arc::new(crate::stun::Stun::default());
 
     let bound = BoundAddrs {
         fec_addr: fec_socket.local_addr()?,
@@ -438,10 +445,14 @@ pub async fn spawn(
         let local_socket = Arc::clone(&local_socket);
         let fec_socket = Arc::clone(&fec_socket);
         let session = Arc::clone(&session);
+        let stun = Arc::clone(&stun);
         tokio::spawn(async move {
             let mut fec_decoder = FecDecoder::new(cfg.decode_fast_send, cfg.replay_window_blocks);
             let mut buf = vec![0u8; 65535];
             while let Ok((n, src)) = fec_socket.recv_from(&mut buf).await {
+                if stun.receive(src, &buf[..n]) {
+                    continue;
+                }
                 counters.fec_rx_packets.fetch_add(1, Ordering::Relaxed);
 
                 let packet = match decode_packet(&buf[..n]) {
@@ -774,6 +785,8 @@ pub async fn spawn(
         Runtime {
             local_task,
             fec_task,
+            fec_socket,
+            stun,
         },
         bound,
     ))

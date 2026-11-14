@@ -42,7 +42,7 @@ async fn reconcile_wireguard_resources_are_shared_and_cleaned() {
     second.tunnel_id = 21;
     second.local_port = 42003;
     second.remote_port = 42004;
-    let wg_info = WireguardTunnelInfo { tunnel_id: 10, peer_node_id: 2, public_key: String::new(), preferred_port: 41000, remote_endpoint: Some("192.0.2.2:41000".into()), local_answered: WireguardAnswered::Answered, remote_response: WireguardAnswered::Answered, mtu: 1420, endpoint_ipv6: false, fec: false, faketcp: false, created_at: 0, updated_at: 0 };
+    let wg_info = WireguardTunnelInfo { tunnel_id: 10, peer_node_id: 2, public_key: String::new(), preferred_port: 41000, remote_endpoint: Some("192.0.2.2:41000".into()), local_answered: WireguardAnswered::Answered, remote_response: WireguardAnswered::Answered, mtu: 1420, endpoint_ipv6: false, fec: false, faketcp: false, created_at: 0, updated_at: 0, refresh_mode: Default::default(), refresh: Default::default() };
     let mut snapshot = TopologySnapshot { node_id: 1, revision: 1, tunnels: vec![wg_info], l2tp_tunnels: vec![info, second], l2tp_v2_tunnels: vec![], l2tp_availability: None };
     memory.reconcile_l2tp(&snapshot).await.unwrap();
     memory.reconcile_l2tp(&snapshot).await.unwrap();

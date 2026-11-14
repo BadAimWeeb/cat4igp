@@ -80,6 +80,7 @@ export function createMockApi() {
         node_id_peer2: 2,
         ipv6: false,
         mtu: 1420,
+        refresh_mode: "current",
         intents: [
           { kind: "mesh", mesh_id: 1 },
           { kind: "legacy", mesh_id: null },
@@ -275,6 +276,7 @@ export function createMockApi() {
         fields(b, ["action", "id", "faketcp"]);
         const m = mesh(b.id);
         requireValue(typeof b.faketcp === "boolean" && (m.auto_wireguard || !b.faketcp));
+        if (b.faketcp) requireValue(!inventory.tunnels.some(t => t.refresh_mode === "proxy" && t.intents.some(i => i.kind === "mesh" && i.mesh_id === m.id)), 409, "userspace UDP proxy cannot refresh FakeTCP transport");
         m.faketcp = b.faketcp as boolean;
         for (const t of inventory.tunnels)
           if (t.intents.some((i) => i.kind === "mesh" && i.mesh_id === m.id)) {
@@ -356,6 +358,20 @@ export function createMockApi() {
               message: "Mock invite invalidated by mesh deletion",
             };
           }
+        break;
+      }
+      case "set_tunnel_refresh_mode": {
+        fields(b, ["action", "tunnel_id", "mode"]);
+        requireValue(typeof b.mode === "string" && ["current", "proxy", "dual_link"].includes(b.mode), 400, "Invalid refresh mode");
+        requireValue(Number.isInteger(b.tunnel_id) && (b.tunnel_id as number) >= -2147483648 && (b.tunnel_id as number) <= 2147483647, 400, "Invalid tunnel ID");
+        const t = inventory.tunnels.find(t => t.id === b.tunnel_id);
+        requireValue(t, 404, "Tunnel not found");
+        if (b.mode === "proxy") requireValue(!t!.intents.some(i => i.kind === "mesh" && inventory.meshes.some(m => m.id === i.mesh_id && m.faketcp)), 409, "userspace UDP proxy cannot refresh FakeTCP transport");
+        if ((t!.refresh_mode ?? "current") !== b.mode) {
+          t!.refresh_mode = b.mode as "current" | "proxy" | "dual_link";
+          affected.add(t!.node_id_peer1);
+          affected.add(t!.node_id_peer2);
+        }
         break;
       }
       case "remove_tunnel_intent": {

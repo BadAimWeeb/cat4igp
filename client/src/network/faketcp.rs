@@ -17,6 +17,7 @@ const TCP_HEADER: usize = 20;
 
 pub struct FakeTcp {
     local_addr: SocketAddr,
+    path_mtu: u32,
     table: Option<(String, &'static str)>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<io::Result<()>>>,
@@ -38,6 +39,13 @@ impl FakeTcp {
         })?;
         probe.connect(peer)?;
         let source = probe.local_addr()?.ip();
+        let mut path_mtu: libc::c_int = 0;
+        let mut len = mem::size_of_val(&path_mtu) as libc::socklen_t;
+        let (level, option) = if peer.is_ipv4() { (libc::IPPROTO_IP, libc::IP_MTU) } else { (libc::IPPROTO_IPV6, libc::IPV6_MTU) };
+        if unsafe { libc::getsockopt(probe.as_raw_fd(), level, option, (&mut path_mtu as *mut libc::c_int).cast(), &mut len) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if path_mtu <= 0 { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid FakeTCP path MTU")); }
         let raw = raw_socket(source, peer)?;
         let udp = UdpSocket::bind(SocketAddr::new(local_udp.ip(), 0)).await?;
         udp.connect(local_udp).await?;
@@ -53,10 +61,11 @@ impl FakeTcp {
         nft(&["-f", "-"], Some(&script))?;
         let (shutdown, stopped) = oneshot::channel();
         let task = tokio::spawn(run(raw, udp, source, local_port, peer, key, stopped));
-        Ok(Self { local_addr, table: Some((table, family)), shutdown: Some(shutdown), task: Some(task) })
+        Ok(Self { local_addr, path_mtu: path_mtu as u32, table: Some((table, family)), shutdown: Some(shutdown), task: Some(task) })
     }
 
     pub fn local_addr(&self) -> SocketAddr { self.local_addr }
+    pub fn path_mtu(&self) -> u32 { self.path_mtu }
 
     pub fn is_running(&self) -> bool { self.task.as_ref().is_some_and(|task| !task.is_finished()) }
 
@@ -162,11 +171,11 @@ async fn send_packet(raw: &AsyncFd<OwnedFd>, source: IpAddr, peer: SocketAddr, p
     }
 }
 
-fn session_key(key: &[u8; 32], local: &[u8; 16], remote: &[u8; 16], port: u16, peer_port: u16) -> [u8; 32] {
+fn session_key(key: &[u8; 32], local: &[u8; 16], remote: &[u8; 16]) -> [u8; 32] {
     let mut mac = <Blake2sMac256 as KeyInit>::new_from_slice(key).expect("valid key");
-    Mac::update(&mut mac, b"cat4igp-faketcp-session-v1");
-    // A deterministic ordering gives both ends the same key, including equal ports.
-    let (first, second) = if (port, local) < (peer_port, remote) { (local, remote) } else { (remote, local) };
+    Mac::update(&mut mac, b"cat4igp-faketcp-session-v2");
+    // NAT may rewrite ports, so order the shared nonces rather than endpoint ports.
+    let (first, second) = if local < remote { (local, remote) } else { (remote, local) };
     Mac::update(&mut mac, first);
     Mac::update(&mut mac, second);
     mac.finalize().into_bytes().into()
@@ -185,6 +194,16 @@ fn accept_counter(high: &mut u32, bitmap: &mut u128, counter: u32) -> bool {
         if delta >= 128 || (*bitmap & (1u128 << delta)) != 0 { return false; }
         *bitmap |= 1u128 << delta;
         true
+    }
+}
+
+fn datagram_send_result(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => {
+            eprintln!("FakeTCP dropped a datagram exceeding the path MTU: {error}");
+            Ok(())
+        }
+        other => other,
     }
 }
 
@@ -214,7 +233,7 @@ async fn run(raw: AsyncFd<OwnedFd>, udp: UdpSocket, source: IpAddr, port: u16, p
                 if let Some((remote_nonce, _)) = remote {
                     if established {
                         counter += 1;
-                        let sk = session_key(&key, &local_nonce, &remote_nonce, port, peer.port());
+                        let sk = session_key(&key, &local_nonce, &remote_nonce);
                         send_packet(&raw, source, peer, port, seq, remote_next, 0x10, &local_nonce, counter, &[], &sk).await?;
                     } else {
                         send_packet(&raw, source, peer, port, initial, remote_next, 0x12, &local_nonce, 0, &[], &key).await?;
@@ -225,11 +244,15 @@ async fn run(raw: AsyncFd<OwnedFd>, udp: UdpSocket, source: IpAddr, port: u16, p
             }
             result = udp.recv(&mut outgoing) => {
                 let n = result?;
-                if n == 0 || n > MAX_PAYLOAD || !established || counter >= u32::MAX - 1 { continue; }
+                if n > MAX_PAYLOAD {
+                    eprintln!("FakeTCP dropped a datagram exceeding its maximum payload of {MAX_PAYLOAD} bytes");
+                    continue;
+                }
+                if n == 0 || !established || counter >= u32::MAX - 1 { continue; }
                 let Some((remote_nonce, _)) = remote else { continue };
                 counter += 1;
-                let sk = session_key(&key, &local_nonce, &remote_nonce, port, peer.port());
-                send_packet(&raw, source, peer, port, seq, remote_next, 0x18, &local_nonce, counter, &outgoing[..n], &sk).await?;
+                let sk = session_key(&key, &local_nonce, &remote_nonce);
+                datagram_send_result(send_packet(&raw, source, peer, port, seq, remote_next, 0x18, &local_nonce, counter, &outgoing[..n], &sk).await)?;
                 seq = seq.wrapping_add(n as u32);
             }
             result = raw.readable() => {
@@ -244,13 +267,13 @@ async fn run(raw: AsyncFd<OwnedFd>, udp: UdpSocket, source: IpAddr, port: u16, p
                     } else if flags == 0x12 && ack == initial.wrapping_add(1) && (!established || remote == Some((nonce, remote_seq))) {
                         if !established { remote = Some((nonce, remote_seq)); remote_next = remote_seq.wrapping_add(1); }
                         counter += 1;
-                        let sk = session_key(&key, &local_nonce, &nonce, port, peer.port());
+                        let sk = session_key(&key, &local_nonce, &nonce);
                         send_packet(&raw, source, peer, port, seq, remote_next, 0x10, &local_nonce, counter, &[], &sk).await?;
                     }
                     continue;
                 }
                 let Some((remote_nonce, _)) = remote else { continue };
-                let sk = session_key(&key, &local_nonce, &remote_nonce, port, peer.port());
+                let sk = session_key(&key, &local_nonce, &remote_nonce);
                 let Some((flags, remote_seq, _ack, nonce, count, payload)) = parse_packet(bytes, peer.ip(), source, peer.port(), port, &sk) else { continue };
                 if nonce != remote_nonce || !matches!(flags, 0x10 | 0x18) || (flags == 0x10 && !payload.is_empty()) || (flags == 0x18 && payload.is_empty()) { continue; }
                 if !accept_counter(&mut high, &mut bitmap, count) { continue; }
@@ -306,8 +329,8 @@ fn make_packet(src: IpAddr, dst: IpAddr, sport: u16, dport: u16, seq: u32, ack: 
     packet[59] = 1;
     packet[60..].copy_from_slice(payload);
     let mut mac = <Blake2sMac<U16> as KeyInit>::new_from_slice(key).expect("valid key");
-    Mac::update(&mut mac, b"cat4igp-faketcp-v1");
-    Mac::update(&mut mac, &packet[0..16]);
+    Mac::update(&mut mac, b"cat4igp-faketcp-v2");
+    Mac::update(&mut mac, &packet[4..16]);
     Mac::update(&mut mac, &packet[22..42]);
     Mac::update(&mut mac, payload);
     packet[42..58].copy_from_slice(&mac.finalize().into_bytes());
@@ -336,8 +359,8 @@ fn parse_packet<'a>(packet: &'a [u8], src: IpAddr, dst: IpAddr, sport: u16, dpor
         || tcp[12] != 15 << 4 || !matches!(tcp[13], 0x02 | 0x12 | 0x10 | 0x18)
         || tcp[20] != 254 || tcp[21] != 38 || tcp[58..60] != [1, 1] || checksum(src, dst, tcp) != 0 { return None; }
     let mut mac = <Blake2sMac<U16> as KeyInit>::new_from_slice(key).expect("valid key");
-    Mac::update(&mut mac, b"cat4igp-faketcp-v1");
-    Mac::update(&mut mac, &tcp[0..16]);
+    Mac::update(&mut mac, b"cat4igp-faketcp-v2");
+    Mac::update(&mut mac, &tcp[4..16]);
     Mac::update(&mut mac, &tcp[22..42]);
     Mac::update(&mut mac, &tcp[60..]);
     mac.verify_slice(&tcp[42..58]).ok()?;
@@ -359,6 +382,269 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires root, network namespaces, iproute2, nftables, conntrack-tools and kernel conntrack NAT"]
+    async fn routed_conntrack_nat_outage_and_recovery() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        const TEST: &str = "network::faketcp::tests::routed_conntrack_nat_outage_and_recovery";
+        fn ip(args: &[&str]) {
+            let result = Command::new("ip").args(args).output().unwrap();
+            assert!(result.status.success(), "ip {args:?}: {}", String::from_utf8_lossy(&result.stderr));
+        }
+        fn spawn(role: &str) -> tokio::process::Child {
+            tokio::process::Command::new("unshare")
+                .arg("--net").arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--ignored", "--nocapture"])
+                .env("CAT4IGP_FAKETCP_NS_TEST", role)
+                .stdin(Stdio::piped()).stdout(if role == "router" { Stdio::inherit() } else { Stdio::piped() }).kill_on_drop(true)
+                .spawn().unwrap()
+        }
+        async fn marker(reader: &mut BufReader<tokio::process::ChildStdout>, expected: &str) {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line)).await.expect(expected).unwrap();
+                assert_ne!(n, 0, "child exited before {expected}");
+                if line.trim().ends_with(expected) { return; }
+            }
+        }
+        async fn translated_flow() -> String {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+            loop {
+                let result = Command::new("conntrack").args([
+                    "-L", "-p", "tcp", "--orig-src", "192.0.2.2", "--orig-dst", "198.51.100.1",
+                    "--sport", "41001", "--dport", "42002", "-o", "id",
+                ]).output().unwrap();
+                let output = String::from_utf8_lossy(&result.stdout);
+                if result.status.success()
+                    && output.contains("src=192.0.2.2 dst=198.51.100.1 sport=41001 dport=42002")
+                    && output.contains("src=198.51.100.2 dst=198.51.100.1 sport=41002 dport=42001") {
+                    return output.split("id=").nth(1).expect("conntrack entry has no ID")
+                        .split(|c: char| !c.is_ascii_digit()).next().unwrap().to_owned();
+                }
+                assert!(tokio::time::Instant::now() < deadline, "translated conntrack flow not found: {output} {}", String::from_utf8_lossy(&result.stderr));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+
+        let role = std::env::var("CAT4IGP_FAKETCP_NS_TEST").unwrap_or_default();
+        if role.is_empty() {
+            let status = spawn("router").wait().await.unwrap();
+            assert!(status.success(), "isolated router process failed");
+            return;
+        }
+        if role == "a" || role == "b" {
+            println!("WAITING");
+            let mut input = BufReader::new(tokio::io::stdin());
+            let mut line = String::new();
+            assert_ne!(input.read_line(&mut line).await.unwrap(), 0);
+            let (address, gateway, local_port, peer) = if role == "a" {
+                ("192.0.2.2/24", "192.0.2.1", 41001, "198.51.100.1:42002")
+            } else {
+                ("198.51.100.2/24", "198.51.100.1", 41002, "198.51.100.1:42001")
+            };
+            ip(&["link", "set", "lo", "up"]);
+            ip(&["link", "set", "endpoint", "up"]);
+            ip(&["address", "add", address, "dev", "endpoint"]);
+            ip(&["route", "add", "default", "via", gateway]);
+            println!("LINK_READY");
+            line.clear();
+            assert_ne!(input.read_line(&mut line).await.unwrap(), 0);
+            let udp = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let mut bridge = FakeTcp::start(local_port, peer.parse().unwrap(), udp.local_addr().unwrap(), [7; 32]).await.unwrap();
+            let table = bridge.table.clone().unwrap();
+            let bridge_addr = bridge.local_addr();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let receiver = udp.clone();
+            let task = tokio::spawn(async move {
+                let mut buf = [0u8; 128];
+                loop {
+                    let (n, from) = receiver.recv_from(&mut buf).await.unwrap();
+                    if from != bridge_addr { continue; }
+                    if &buf[..n] == b"request" {
+                        receiver.send_to(b"response", bridge_addr).await.unwrap();
+                    } else if &buf[..n] == b"response" {
+                        tx.send(()).unwrap();
+                    }
+                }
+            });
+            println!("READY");
+            loop {
+                line.clear();
+                assert_ne!(input.read_line(&mut line).await.unwrap(), 0);
+                match line.trim() {
+                    "probe" | "quiet" => {
+                        while rx.try_recv().is_ok() {}
+                        let quiet = line.trim() == "quiet";
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(if quiet { 3 } else { 12 });
+                        let mut delivered = false;
+                        while tokio::time::Instant::now() < deadline {
+                            udp.send_to(b"request", bridge_addr).await.unwrap();
+                            if tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_ok() {
+                                delivered = true;
+                                break;
+                            }
+                        }
+                        assert_eq!(delivered, !quiet, "unexpected delivery state in {role}");
+                        assert!(bridge.is_running(), "bridge stopped in {role}");
+                        println!("DONE");
+                    }
+                    "stop" => break,
+                    other => panic!("unknown command: {other}"),
+                }
+            }
+            task.abort();
+            bridge.stop().await.unwrap();
+            assert!(!Command::new("nft").args(["list", "table", table.1, &table.0]).output().unwrap().status.success());
+            println!("STOPPED");
+            return;
+        }
+        assert_eq!(role, "router");
+        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
+        ip(&["link", "set", "lo", "up"]);
+        let mut a = spawn("a");
+        let mut b = spawn("b");
+        let mut a_out = BufReader::new(a.stdout.take().unwrap());
+        let mut b_out = BufReader::new(b.stdout.take().unwrap());
+        let mut a_in = a.stdin.take().unwrap();
+        let mut b_in = b.stdin.take().unwrap();
+        marker(&mut a_out, "WAITING").await;
+        marker(&mut b_out, "WAITING").await;
+        for (router, child, address, pid) in [
+            ("left", "endpoint", "192.0.2.1/24", a.id().unwrap()),
+            ("right", "endpoint", "198.51.100.1/24", b.id().unwrap()),
+        ] {
+            ip(&["link", "add", router, "type", "veth", "peer", "name", child]);
+            ip(&["link", "set", child, "netns", &pid.to_string()]);
+            ip(&["address", "add", address, "dev", router]);
+            ip(&["link", "set", router, "up"]);
+        }
+        nft(&["-f", "-"], Some(concat!(
+            "add table ip ft_test\n",
+            "add chain ip ft_test gate { type filter hook prerouting priority raw; policy accept; }\n",
+            "add rule ip ft_test gate iifname \"right\" meta l4proto tcp drop\n",
+            "add chain ip ft_test prerouting { type nat hook prerouting priority dstnat; policy accept; }\n",
+            "add chain ip ft_test postrouting { type nat hook postrouting priority srcnat; policy accept; }\n",
+            "add rule ip ft_test prerouting ip saddr 192.0.2.2 ip daddr 198.51.100.1 tcp sport 41001 tcp dport 42002 counter dnat to 198.51.100.2:41002\n",
+            "add rule ip ft_test postrouting ip saddr 192.0.2.2 ip daddr 198.51.100.2 tcp sport 41001 tcp dport 41002 counter snat to 198.51.100.1:42001\n",
+        ))).unwrap();
+        a_in.write_all(b"go\n").await.unwrap();
+        b_in.write_all(b"go\n").await.unwrap();
+        marker(&mut a_out, "LINK_READY").await;
+        marker(&mut b_out, "LINK_READY").await;
+        a_in.write_all(b"start\n").await.unwrap();
+        b_in.write_all(b"start\n").await.unwrap();
+        marker(&mut a_out, "READY").await;
+        marker(&mut b_out, "READY").await;
+        // Seed the one NAT mapping from A before permitting B's simultaneous-open SYN.
+        let original_flow = translated_flow().await;
+        println!("Initial translated conntrack flow ID: {original_flow}");
+        nft(&["flush", "chain", "ip", "ft_test", "gate"], None).unwrap();
+        for (input, output) in [(&mut a_in, &mut a_out), (&mut b_in, &mut b_out)] {
+            input.write_all(b"probe\n").await.unwrap();
+            marker(output, "DONE").await;
+        }
+        // A short outage must recover on the same conntrack mapping.
+        nft(&["add", "rule", "ip", "ft_test", "gate", "meta", "l4proto", "tcp", "drop"], None).unwrap();
+        a_in.write_all(b"quiet\n").await.unwrap();
+        b_in.write_all(b"quiet\n").await.unwrap();
+        marker(&mut a_out, "DONE").await;
+        marker(&mut b_out, "DONE").await;
+        nft(&["flush", "chain", "ip", "ft_test", "gate"], None).unwrap();
+        for (input, output) in [(&mut a_in, &mut a_out), (&mut b_in, &mut b_out)] {
+            input.write_all(b"probe\n").await.unwrap();
+            marker(output, "DONE").await;
+        }
+        assert_eq!(translated_flow().await, original_flow, "short outage replaced the conntrack flow");
+        println!("Short outage recovered on conntrack flow ID: {original_flow}");
+        nft(&["add", "rule", "ip", "ft_test", "gate", "meta", "l4proto", "tcp", "drop"], None).unwrap();
+        a_in.write_all(b"quiet\n").await.unwrap();
+        b_in.write_all(b"quiet\n").await.unwrap();
+        marker(&mut a_out, "DONE").await;
+        marker(&mut b_out, "DONE").await;
+        // Exercise re-handshake after the 15-second session timeout without
+        // flushing conntrack: ordinary network recovery must not need operator action.
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        nft(&["flush", "chain", "ip", "ft_test", "gate"], None).unwrap();
+        println!("Long outage ended; probing without clearing conntrack");
+        for (input, output) in [(&mut a_in, &mut a_out), (&mut b_in, &mut b_out)] {
+            input.write_all(b"probe\n").await.unwrap();
+            marker(output, "DONE").await;
+        }
+        println!("Long outage recovered on conntrack flow ID: {}", translated_flow().await);
+        a_in.write_all(b"stop\n").await.unwrap();
+        b_in.write_all(b"stop\n").await.unwrap();
+        marker(&mut a_out, "STOPPED").await;
+        marker(&mut b_out, "STOPPED").await;
+        assert!(a.wait().await.unwrap().success());
+        assert!(b.wait().await.unwrap().success());
+        nft(&["delete", "table", "ip", "ft_test"], None).unwrap();
+    }
+
+    #[test]
+    fn translated_addresses_and_ports_keep_authentication_valid() {
+        let source: IpAddr = "192.0.2.2".parse().unwrap();
+        let public: IpAddr = "198.51.100.1".parse().unwrap();
+        let destination: IpAddr = "198.51.100.2".parse().unwrap();
+        let session = session_key(&[7; 32], &[1; 16], &[2; 16]);
+        let mut tcp = make_packet(source, public, 41001, 42002, 1, 2, 0x18, &[1; 16], 1, b"data", &session);
+        tcp[0..2].copy_from_slice(&42001u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&41002u16.to_be_bytes());
+        tcp[16..18].fill(0);
+        let sum = checksum(public, destination, &tcp);
+        tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+        let mut packet = vec![0; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&((20 + tcp.len()) as u16).to_be_bytes());
+        packet[9] = libc::IPPROTO_TCP as u8;
+        let IpAddr::V4(src) = public else { unreachable!() };
+        let IpAddr::V4(dst) = destination else { unreachable!() };
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        packet.extend_from_slice(&tcp);
+        assert!(parse_packet(&packet, public, destination, 42001, 41002, &session).is_some());
+        assert!(parse_packet(&packet, source, destination, 42001, 41002, &session).is_none());
+        assert!(parse_packet(&packet, public, destination, 41001, 41002, &session).is_none());
+        packet[80] ^= 1;
+        packet[36..38].fill(0);
+        let sum = checksum(public, destination, &packet[20..]);
+        packet[36..38].copy_from_slice(&sum.to_be_bytes());
+        assert!(parse_packet(&packet, public, destination, 42001, 41002, &session).is_none());
+    }
+
+    #[test]
+    fn translated_ports_keep_authentication_valid() {
+        let src: IpAddr = "2001:db8::1".parse().unwrap();
+        let dst: IpAddr = "2001:db8::2".parse().unwrap();
+        let key = [7; 32];
+        let session = session_key(&key, &[1; 16], &[2; 16]);
+        assert_eq!(session, session_key(&key, &[2; 16], &[1; 16]));
+        let mut packet = make_packet(src, dst, 1000, 2000, 1, 2, 0x18, &[1; 16], 1, b"data", &session);
+        packet[0..2].copy_from_slice(&3000u16.to_be_bytes());
+        packet[2..4].copy_from_slice(&4000u16.to_be_bytes());
+        packet[16..18].fill(0);
+        let sum = checksum(src, dst, &packet);
+        packet[16..18].copy_from_slice(&sum.to_be_bytes());
+        assert!(parse_packet(&packet, src, dst, 3000, 4000, &session).is_some());
+        assert!(parse_packet(&packet, src, dst, 1000, 4000, &session).is_none());
+        packet[60] ^= 1;
+        packet[16..18].fill(0);
+        let sum = checksum(src, dst, &packet);
+        packet[16..18].copy_from_slice(&sum.to_be_bytes());
+        assert!(parse_packet(&packet, src, dst, 3000, 4000, &session).is_none());
+    }
+
+    #[test]
+    fn mtu_errors_drop_only_the_affected_datagram() {
+        assert!(datagram_send_result(Err(io::Error::from_raw_os_error(libc::EMSGSIZE))).is_ok());
+        assert!(datagram_send_result(Ok(())).is_ok());
+        assert_eq!(datagram_send_result(Err(io::Error::from_raw_os_error(libc::EACCES))).unwrap_err().raw_os_error(), Some(libc::EACCES));
+    }
+
 
     #[test]
     fn ipv4_packet_validation() {

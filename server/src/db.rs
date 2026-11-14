@@ -617,7 +617,7 @@ pub(crate) fn validate_answer_features(conn: &mut SqliteConnection, node: i32, t
     use cat4igp_shared::control::FeatureSupport;
     let snapshot = topology_snapshot(conn, node, 0).map_err(|e| e.to_string())?;
     let tunnel = snapshot.tunnels.iter().find(|t| t.tunnel_id == tunnel_id).ok_or("tunnel not found for node")?;
-    let required = FeatureSupport { wireguard: true, fec: tunnel.fec, faketcp: tunnel.faketcp, ..Default::default() };
+    let required = FeatureSupport { wireguard: true, fec: tunnel.fec, faketcp: tunnel.faketcp, refresh_proxy: tunnel.refresh_mode == cat4igp_shared::control::RefreshMode::Proxy, refresh_dual_link: tunnel.refresh_mode == cat4igp_shared::control::RefreshMode::DualLink || tunnel.refresh.active_generation != 0, ..Default::default() };
     for peer in [node, tunnel.peer_node_id] {
         match feature_support(conn, peer).map_err(|e| e.to_string())? {
             None => return Err(format!("node {peer} feature support unknown")),
@@ -667,10 +667,11 @@ pub fn topology_snapshot(
             } else {
                 tunnel.endpoint_peer2.clone()
             };
+            let refresh = crate::refresh::load(conn, tunnel.id)?;
             Ok(cat4igp_shared::control::WireguardTunnelInfo {
                 tunnel_id: tunnel.id,
                 peer_node_id,
-                public_key: get_wireguard_pubkey(conn, peer_node_id)?,
+                public_key: match crate::refresh::remote_key(&refresh, self_p1) { Some(key) => key, None => get_wireguard_pubkey(conn, peer_node_id)? },
                 preferred_port: local_endpoint
                     .as_deref()
                     .and_then(|endpoint| endpoint.parse::<std::net::SocketAddr>().ok())
@@ -696,6 +697,8 @@ pub fn topology_snapshot(
                 faketcp: tunnel.faketcp || faketcp_tunnels.contains(&tunnel.id),
                 created_at: tunnel.created_at.and_utc().timestamp_millis(),
                 updated_at: tunnel.updated_at.and_utc().timestamp_millis(),
+                refresh_mode: refresh.mode,
+                refresh: crate::refresh::snapshot(&refresh, self_p1),
             })
         })
         .collect::<Result<Vec<_>, diesel::result::Error>>()?;
@@ -876,6 +879,17 @@ fn json_error(error: serde_json::Error) -> diesel::result::Error {
     diesel::result::Error::DeserializationError(Box::new(error))
 }
 
+pub(crate) fn valid_wireguard_public_key(value: &str) -> bool {
+    use base64::Engine;
+    let mut key = [0u8; 32];
+    if value.len() != 44 || base64::engine::general_purpose::STANDARD.decode_slice(value, &mut key).ok() != Some(32) {
+        return false;
+    }
+    x25519_dalek::StaticSecret::from([0x42; 32])
+        .diffie_hellman(&x25519_dalek::PublicKey::from(key))
+        .was_contributory()
+}
+
 pub fn apply_enrollment(
     conn: &mut SqliteConnection,
     command: &EnrollmentCommand,
@@ -916,15 +930,17 @@ pub fn apply_enrollment(
         if identity_revoked(conn, &request.client_peer_id)? {
             return Ok((ControlResponse::Rejected("identity permanently revoked".into()), vec![]));
         }
-        if let Some(previous) = diesel::sql_query("SELECT substr(key,27) AS peer_id, json_extract(value,'$.request_id') AS request_id, json_extract(value,'$.fingerprint') AS fingerprint, json_extract(value,'$.result') AS result FROM application_kv WHERE substr(key,1,26)='control_enrollment_result/' AND (key = ? OR (json_extract(value,'$.request_id') = ? AND json_extract(value,'$.request_id') <> '')) ORDER BY key LIMIT 1")
+        if let Some(previous) = diesel::sql_query("SELECT substr(key,27) AS peer_id, json_extract(value,'$.request_id') AS request_id, json_extract(value,'$.fingerprint') AS fingerprint, json_extract(value,'$.result') AS result FROM application_kv WHERE key = ?")
             .bind::<Text, _>(format!("control_enrollment_result/{}", request.client_peer_id))
-            .bind::<Text, _>(&request.request_id)
             .get_result::<EnrollmentResult>(conn).optional()? {
             return Ok((if previous.peer_id == request.client_peer_id && previous.request_id == request.request_id && previous.fingerprint == fingerprint {
                 serde_json::from_str(&previous.result).map_err(json_error)?
             } else {
                 ControlResponse::Rejected("enrollment identity or request ID reused with different request".into())
             }, vec![]));
+        }
+        if !valid_wireguard_public_key(&request.wireguard_public_key) {
+            return Ok((ControlResponse::Rejected("invalid enrollment request".into()), vec![]));
         }
         let inv = invites::table.filter(invites::code.eq(&request.invitation_code)).select(Invite::as_select()).first::<Invite>(conn).optional()?;
         let mesh = inv.as_ref().and_then(|inv| inv.override_join_mesh).filter(|id| *id != 0);
@@ -1005,10 +1021,12 @@ pub fn apply_enrollment(
         } else {
             ControlResponse::Rejected("enrollment rejected".into())
         };
-        diesel::sql_query("INSERT INTO application_kv (key, value) VALUES (?, json_object('request_id', ?, 'fingerprint', ?, 'result', ?))")
-            .bind::<Text, _>(format!("control_enrollment_result/{}", request.client_peer_id)).bind::<Text, _>(&request.request_id)
-            .bind::<Text, _>(&fingerprint).bind::<Text, _>(serde_json::to_string(&response).map_err(json_error)?)
-            .execute(conn)?;
+        if matches!(response, ControlResponse::Enrolled(_)) {
+            diesel::sql_query("INSERT INTO application_kv (key, value) VALUES (?, json_object('request_id', ?, 'fingerprint', ?, 'result', ?))")
+                .bind::<Text, _>(format!("control_enrollment_result/{}", request.client_peer_id)).bind::<Text, _>(&request.request_id)
+                .bind::<Text, _>(&fingerprint).bind::<Text, _>(serde_json::to_string(&response).map_err(json_error)?)
+                .execute(conn)?;
+        }
         Ok((response, snapshots))
     })
 }
@@ -1057,6 +1075,31 @@ pub fn apply_answer(
         }
         let peers = tunnel_peer_node_ids(conn, command.answer.tunnel_id).optional()?;
         let result = match peers {
+            Some((peer1, peer2)) if [peer1, peer2].contains(&command.node_id) && command.answer.refresh.is_some() => {
+                if command.answer.endpoint.is_some() || command.answer.decline_type.is_some() {
+                    "refresh answer cannot include a legacy answer".to_string()
+                } else if let Err(error) = if command.answer.refresh.as_ref().is_some_and(|r| matches!(r.stage, cat4igp_shared::control::RefreshStage::Abort | cat4igp_shared::control::RefreshStage::RolledBack)) { Ok(()) } else { validate_answer_features(conn, command.node_id, command.answer.tunnel_id) } {
+                    error
+                } else {
+                    use crate::schema::wireguard_tunnels::dsl as wg;
+                    let tunnel = wg::wireguard_tunnels.find(command.answer.tunnel_id).first::<crate::models::WireguardTunnel>(conn)?;
+                    let refresh = command.answer.refresh.as_ref().unwrap();
+                    let conflict = if let Some(endpoint) = refresh.offer.as_ref().and_then(|o| o.endpoint.parse::<std::net::SocketAddr>().ok()) {
+                        l2tp_v2_rows(conn)?.iter().filter(|r| r.wireguard_tunnel_id.is_some()).any(|r| [&r.endpoint_peer1, &r.endpoint_peer2].iter().any(|s| s.parse::<std::net::IpAddr>().ok() == Some(endpoint.ip())))
+                            || all_l2tp_rows(conn)?.iter().filter(|r| r.wireguard_tunnel_id.is_some()).any(|r| [&r.endpoint_peer1, &r.endpoint_peer2].iter().any(|s| s.parse::<std::net::IpAddr>().ok() == Some(endpoint.ip())))
+                    } else { false };
+                    if conflict { "invalid tunnel endpoint".into() } else {
+                        match crate::refresh::apply(conn, &tunnel, command.node_id, refresh, command.applied_at)? {
+                            Err(error) => error,
+                            Ok(()) => {
+                                bump_control_revision_at(conn, peer1, command.applied_at)?;
+                                if peer2 != peer1 { bump_control_revision_at(conn, peer2, command.applied_at)?; }
+                                "accepted".into()
+                            }
+                        }
+                    }
+                }
+            }
             Some((peer1, peer2)) if [peer1, peer2].contains(&command.node_id) => {
                 let invalid_endpoint = command.answer.endpoint.as_deref().is_some_and(|value| {
                     match value.parse::<std::net::SocketAddr>() {
@@ -1070,8 +1113,12 @@ pub fn apply_answer(
                 };
                 let underlay_conflict = if let Some(ip) = command.answer.endpoint.as_deref().and_then(|s| s.parse::<std::net::SocketAddr>().ok()).map(|s| s.ip()) {
                     l2tp_v2_rows(conn)?.iter().filter(|r| r.wireguard_tunnel_id.is_some()).any(|r| [&r.endpoint_peer1, &r.endpoint_peer2].iter().any(|s| s.parse::<std::net::IpAddr>().ok() == Some(ip)))
+                        || all_l2tp_rows(conn)?.iter().filter(|r| r.wireguard_tunnel_id.is_some()).any(|r| [&r.endpoint_peer1, &r.endpoint_peer2].iter().any(|s| s.parse::<std::net::IpAddr>().ok() == Some(ip)))
                 } else { false };
-                if command.answer.decline_type.is_some_and(|value| !matches!(value, 2 | 3)) {
+                let refresh_pending = crate::refresh::has_pending(&crate::refresh::load(conn, command.answer.tunnel_id)?);
+                if refresh_pending {
+                    "refresh in progress".to_string()
+                } else if command.answer.decline_type.is_some_and(|value| !matches!(value, 2 | 3)) {
                     "invalid decline type".to_string()
                 } else if invalid_endpoint || wrong_family || underlay_conflict {
                     "invalid tunnel endpoint".to_string()

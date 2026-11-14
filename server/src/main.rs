@@ -1,5 +1,6 @@
 mod admin;
 mod tunnel;
+mod refresh;
 
 #[cfg(test)]
 extern crate rand08 as rand;
@@ -38,6 +39,14 @@ use libp2p::{
     tcp, yamux,
 };
 use std::env;
+
+fn refresh_snapshot_supported(snapshot: &cat4igp_shared::control::TopologySnapshot, features: cat4igp_shared::control::FeatureSupport) -> bool {
+    use cat4igp_shared::control::RefreshMode;
+    snapshot.tunnels.iter().all(|t| {
+        (t.refresh_mode != RefreshMode::Proxy || features.refresh_proxy)
+            && (t.refresh_mode != RefreshMode::DualLink && t.refresh.active_generation == 0 && t.refresh.pending.is_none() || features.refresh_dual_link)
+    })
+}
 
 const CONTROL_PROTOCOL: &str = "/cat4igp/control/1";
 
@@ -114,7 +123,7 @@ fn control_response(
             || request.wireguard_public_key.is_empty()
             || request.client_signing_key.is_empty()
             || request.client_encryption_key.is_empty()
-            || !matches!(hex_decode(&request.client_encryption_key), Ok(key) if key.len() == 32)
+            || cat4igp_shared::control::validate_encryption_public_key(&request.client_encryption_key).is_err()
         {
             return (
                 cat4igp_shared::control::ControlResponse::Rejected(
@@ -199,6 +208,10 @@ fn control_response(
                     identity.node_id,
                     identity.topology_revision,
                 )?;
+                let features = crate::db::feature_support(conn, identity.node_id)?.unwrap_or_default();
+                if !refresh_snapshot_supported(&snapshot, features) {
+                    return Err(diesel::result::Error::DeserializationError(Box::new(std::io::Error::other("client lacks required refresh capability"))));
+                }
                 let encryption_key =
                     crate::db::control_identity_for_node(conn, identity.node_id)?.encryption_key;
                 let now = chrono::Utc::now().timestamp_millis();
@@ -533,7 +546,7 @@ fn database_worker(
         );
         let mut pushes = Vec::new();
         for snapshot in snapshots {
-            if !matches!(crate::db::feature_support(&mut conn, snapshot.node_id), Ok(Some(_))) {
+            if !matches!(crate::db::feature_support(&mut conn, snapshot.node_id), Ok(Some(features)) if refresh_snapshot_supported(&snapshot, features)) {
                 continue;
             }
             let identity = crate::db::control_identity_for_node(&mut conn, snapshot.node_id)
@@ -625,7 +638,7 @@ async fn main() -> Result<(), String> {
     .await
     .unwrap();
     tokio::select! {
-        result = axum::serve(listener, app) => result.unwrap(),
+        result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result.unwrap(),
         result = &mut control => return Err(format!("control plane stopped: {result:?}")),
     }
     Ok(())

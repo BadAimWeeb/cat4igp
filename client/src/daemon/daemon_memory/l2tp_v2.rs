@@ -43,6 +43,12 @@ fn address_conflict(snapshot: &TopologySnapshot, info: &L2tpV2TunnelInfo) -> boo
 }
 
 impl DaemonMemory {
+    pub(super) async fn invalidate_l2tp_v2_underlay(&self, wireguard_id: i32) {
+        for tunnel in self.l2tp_v2.lock().await.values_mut() {
+            if tunnel.info.wireguard_tunnel_id == Some(wireguard_id) { tunnel.cleanup_pending = true; }
+        }
+    }
+
     pub(super) async fn cleanup_l2tp_v2(&self) -> Result<(), String> {
         let mut active = self.l2tp_v2.lock().await;
         while let Some(id) = active.keys().next().copied() {
@@ -207,7 +213,7 @@ mod tests {
         memory.wireguard.lock().await.insert(10, super::super::wireguard::WireguardTunnelC::new(10, 2, false, 1420, os, None));
         let mut value = info(); value.wireguard_tunnel_id = Some(10); value.mtu = 9000;
         let mut snapshot = snapshot(value);
-        snapshot.tunnels.push(WireguardTunnelInfo { tunnel_id: 10, peer_node_id: 2, public_key: String::new(), preferred_port: 41000, remote_endpoint: Some("192.0.2.3:41000".into()), local_answered: WireguardAnswered::Answered, remote_response: WireguardAnswered::Answered, mtu: 1420, endpoint_ipv6: false, fec: false, faketcp: false, created_at: 0, updated_at: 0 });
+        snapshot.tunnels.push(WireguardTunnelInfo { tunnel_id: 10, peer_node_id: 2, public_key: String::new(), preferred_port: 41000, remote_endpoint: Some("192.0.2.3:41000".into()), local_answered: WireguardAnswered::Answered, remote_response: WireguardAnswered::Answered, mtu: 1420, endpoint_ipv6: false, fec: false, faketcp: false, created_at: 0, updated_at: 0, refresh_mode: Default::default(), refresh: Default::default() });
         memory.reconcile_l2tp_v2(&snapshot).await.unwrap();
         memory.reconcile_l2tp_v2(&snapshot).await.unwrap();
         assert!(crate::interface::get_addr("wgtest".into()).await.unwrap().iter().any(|a| a.addr().to_string() == "192.0.2.1"));

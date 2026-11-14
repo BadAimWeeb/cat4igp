@@ -6,6 +6,30 @@ use std::{collections::HashSet, error::Error, net::SocketAddr, sync::Arc};
 use crate::daemon::daemon_memory::DaemonMemory;
 use crate::tunnel::shared::Tunnel as _;
 
+#[cfg(target_os = "linux")]
+fn faketcp_mtu(requested: i32, path_mtu: u32, ipv6: bool, fec: bool) -> Result<i32, Box<dyn Error>> {
+    // WireGuard adds 32 bytes and pads its inner packet to a 16-byte boundary.
+    // FEC adds an 8-byte envelope, 10-byte frame header and 2-byte shard length.
+    let overhead = (if ipv6 { 40 } else { 20 }) + 60 + (if fec { 20 } else { 0 }) + 32;
+    let available = path_mtu.min(65_535).checked_sub(overhead).ok_or("FakeTCP path MTU is too small")?;
+    let ceiling = (available & !15) as i32;
+    if requested < 1280 || ceiling < 1280 { return Err("FakeTCP requires an effective WireGuard MTU of at least 1280".into()); }
+    if ceiling < requested { eprintln!("FakeTCP reduced WireGuard MTU from {requested} to {ceiling} for path MTU {path_mtu}"); }
+    Ok(requested.min(ceiling))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn fake_tcp_mtu_accounts_for_outer_headers_and_fec() {
+    assert_eq!(faketcp_mtu(1420, 1500, false, false).unwrap(), 1376);
+    assert_eq!(faketcp_mtu(1420, 1500, true, false).unwrap(), 1360);
+    assert_eq!(faketcp_mtu(1420, 1500, false, true).unwrap(), 1360);
+    assert_eq!(faketcp_mtu(1420, 1500, true, true).unwrap(), 1344);
+    assert_eq!(faketcp_mtu(1300, 1500, true, true).unwrap(), 1300);
+    assert!(faketcp_mtu(1420, 1400, true, true).is_err());
+    assert!(faketcp_mtu(1279, 1500, false, false).is_err());
+}
+
 pub struct WireguardTunnelC {
     tunnel_id: i32,
     peer_node_id: i32,
@@ -13,9 +37,11 @@ pub struct WireguardTunnelC {
     os_tun: crate::tunnel::wireguard::WireGuardTunnel,
     mtu: i32,
     fec: Option<Arc<FEC::PeerEngine>>,
+    proxy: Option<crate::network::udp_proxy::UdpProxy>,
     #[cfg(target_os = "linux")]
     faketcp: Option<crate::network::faketcp::FakeTcp>,
     fake_peer: Option<SocketAddr>,
+    replacement_pending: bool,
 }
 
 impl WireguardTunnelC {
@@ -35,9 +61,11 @@ impl WireguardTunnelC {
             mtu,
             os_tun,
             fec,
+            proxy: None,
             #[cfg(target_os = "linux")]
             faketcp: None,
             fake_peer: None,
+            replacement_pending: false,
         }
     }
 
@@ -50,11 +78,26 @@ impl WireguardTunnelC {
             .reserve_tunnel_port(rest_info.tunnel_id)
             .await
             .map_err(std::io::Error::other)?;
+        let alternate = rest_info.refresh.active_slot != 0;
+        Self::new_with_port(rest_info, local_private_key, port, alternate).await
+    }
+
+    pub(super) async fn new_with_port(
+        rest_info: Arc<WireguardTunnelInfo>,
+        local_private_key: String,
+        port: u16,
+        alternate: bool,
+    ) -> Result<(Self, u16), Box<dyn Error>> {
+        if rest_info.faketcp && matches!(rest_info.refresh_mode, cat4igp_shared::control::RefreshMode::Proxy) {
+            return Err("UDP proxy refresh cannot be combined with FakeTCP; use current or dual_link".into());
+        }
         let peer = rest_info.remote_endpoint.as_deref().map(str::parse::<SocketAddr>).transpose()?;
         #[cfg(target_os = "linux")]
         let mut faketcp = None;
         let mut transport_info = (*rest_info).clone();
         let mut transport_port = port;
+        let mut tunnel_mtu = rest_info.mtu;
+        let mut proxy = None;
         if rest_info.faketcp {
             #[cfg(target_os = "linux")]
             {
@@ -64,12 +107,19 @@ impl WireguardTunnelC {
                 let key = FEC::tunnel_psk(local.0, remote.0, rest_info.tunnel_id).ok_or("invalid FakeTCP peer key")?;
                 transport_port = crate::network::ports::get_random_udp_port()?;
                 let bridge = crate::network::faketcp::FakeTcp::start(port, peer, ([127, 0, 0, 1], transport_port).into(), key).await?;
+                tunnel_mtu = faketcp_mtu(rest_info.mtu, bridge.path_mtu(), peer.is_ipv6(), rest_info.fec)?;
                 transport_info.remote_endpoint = Some(bridge.local_addr().to_string());
                 transport_info.endpoint_ipv6 = false;
                 faketcp = Some(bridge);
             }
             #[cfg(not(target_os = "linux"))]
             return Err("FakeTCP requires Linux".into());
+        } else if !rest_info.fec && matches!(rest_info.refresh_mode, cat4igp_shared::control::RefreshMode::Proxy) {
+            transport_port = crate::network::ports::get_random_udp_port()?;
+            let bridge = crate::network::udp_proxy::UdpProxy::start(port, rest_info.endpoint_ipv6, peer, ([127, 0, 0, 1], transport_port).into()).await?;
+            transport_info.remote_endpoint = Some(bridge.local_addr().to_string());
+            transport_info.endpoint_ipv6 = false;
+            proxy = Some(bridge);
         } else if let Some(peer) = peer {
             let _ = crate::network::ports::punch_udp(port, peer).await;
         }
@@ -85,17 +135,18 @@ impl WireguardTunnelC {
                     Some(fec1),
                     wg_port,
                     fec_listen_port,
+                    alternate,
                 ),
             )
         } else {
             (
                 None,
-                Self::gen_new_wg_tunnel(rest_info.clone(), local_private_key, None, transport_port, 0),
+                Self::gen_new_wg_tunnel(rest_info.clone(), local_private_key, None, transport_port, 0, alternate),
             )
         };
         let mut os_tun = os_tun;
-        if rest_info.faketcp && fec.is_none() {
-            os_tun.set_peer_endpoint(transport_info.remote_endpoint.as_deref().ok_or("missing FakeTCP bridge")?.parse()?);
+        if (rest_info.faketcp || proxy.is_some()) && fec.is_none() {
+            os_tun.set_local_bridge_endpoint(transport_info.remote_endpoint.as_deref().ok_or("missing local transport bridge")?.parse()?);
         }
 
         Ok((
@@ -103,11 +154,13 @@ impl WireguardTunnelC {
                 tunnel_id: rest_info.tunnel_id,
                 peer_node_id: rest_info.peer_node_id,
                 ipv6: rest_info.endpoint_ipv6,
-                mtu: rest_info.mtu,
+                mtu: tunnel_mtu,
                 fec,
+                proxy,
                 #[cfg(target_os = "linux")]
                 faketcp,
                 fake_peer: if rest_info.faketcp { peer } else { None },
+                replacement_pending: false,
                 os_tun,
             },
             port,
@@ -164,12 +217,13 @@ impl WireguardTunnelC {
         }
     }
 
-    fn gen_new_wg_tunnel(
+    pub(super) fn gen_new_wg_tunnel(
         rest_info: Arc<WireguardTunnelInfo>,
         local_private_key: String,
         fec: Option<Arc<FEC::PeerEngine>>,
         port: u16,
         fec_peerport: u16,
+        alternate: bool,
     ) -> crate::tunnel::wireguard::WireGuardTunnel {
         let mut bit_slice = [0u8; 8]; // 56 bits are required out of 64 bits.
 
@@ -197,7 +251,7 @@ impl WireguardTunnelC {
         if rest_info.faketcp {
             bit_slice[2] |= 0b0010;
         }
-        // Bit 4 is reserved for future use.
+        if alternate { bit_slice[2] |= 0b0001; }
 
         // Bit 5 to bit 20 are tunnel ID
         let tunnel_id = rest_info.tunnel_id;
@@ -222,7 +276,7 @@ impl WireguardTunnelC {
             None
         };
 
-        crate::tunnel::wireguard::WireGuardTunnel::new(
+        let mut tunnel = crate::tunnel::wireguard::WireGuardTunnel::new(
             format!(
                 "cat{}",
                 base32::encode(Crockford, bit_slice.as_slice())[..12].to_owned()
@@ -231,7 +285,11 @@ impl WireguardTunnelC {
             rest_info.public_key.clone(),
             pend,
             if port == 0 { None } else { Some(port) },
-        )
+        );
+        if fec.is_some() {
+            tunnel.set_local_bridge_endpoint(pend.expect("FEC endpoint is present"));
+        }
+        tunnel
     }
 
     pub async fn update_from_rest(
@@ -239,6 +297,9 @@ impl WireguardTunnelC {
         rest_info: Arc<WireguardTunnelInfo>,
         daemon_memory: Arc<DaemonMemory>,
     ) -> Result<(), Box<dyn Error>> {
+        if rest_info.faketcp && matches!(rest_info.refresh_mode, cat4igp_shared::control::RefreshMode::Proxy) {
+            return Err("UDP proxy refresh cannot be combined with FakeTCP; use current or dual_link".into());
+        }
         // Guard for tunnel ID and peer node ID consistency.
         if self.tunnel_id != rest_info.tunnel_id || self.peer_node_id != rest_info.peer_node_id {
             return Err("Tunnel ID or peer node ID mismatch".into());
@@ -247,15 +308,27 @@ impl WireguardTunnelC {
         let transport_failed = self.faketcp.as_ref().is_some_and(|bridge| !bridge.is_running());
         #[cfg(not(target_os = "linux"))]
         let transport_failed = false;
+        let transport_failed = transport_failed || self.proxy.as_ref().is_some_and(|bridge| !bridge.is_running());
         let new_peer = rest_info.remote_endpoint.as_deref().map(str::parse::<SocketAddr>).transpose()?;
-        if transport_failed || self.fake_peer.is_some() != rest_info.faketcp || (rest_info.faketcp && (self.fake_peer != new_peer || self.fec.is_some() != rest_info.fec || self.ipv6 != rest_info.endpoint_ipv6)) {
+        if self.replacement_pending || transport_failed || self.fake_peer.is_some() != rest_info.faketcp || (rest_info.faketcp && (self.fake_peer != new_peer || self.fec.is_some() != rest_info.fec || self.ipv6 != rest_info.endpoint_ipv6)) || (self.proxy.is_some() && (rest_info.fec || self.ipv6 != rest_info.endpoint_ipv6)) || (!rest_info.fec && !rest_info.faketcp && self.proxy.is_some() != matches!(rest_info.refresh_mode, cat4igp_shared::control::RefreshMode::Proxy)) {
+            self.replacement_pending = true;
             let private_key = self.os_tun.get_local_private_key().to_owned();
             self.teardown().await?;
             let (replacement, _) = Self::new_from_rest(rest_info, private_key, daemon_memory).await?;
             *self = replacement;
             return Ok(());
         }
-        if rest_info.faketcp { self.mtu = rest_info.mtu; return Ok(()); }
+        if rest_info.faketcp {
+            #[cfg(target_os = "linux")]
+            { self.mtu = faketcp_mtu(rest_info.mtu, self.faketcp.as_ref().ok_or("missing FakeTCP bridge")?.path_mtu(), new_peer.ok_or("FakeTCP requires a remote endpoint")?.is_ipv6(), rest_info.fec)?; }
+            return Ok(());
+        }
+
+        if let Some(proxy) = &self.proxy {
+            proxy.set_peer(new_peer).await?;
+            self.mtu = rest_info.mtu;
+            return Ok(());
+        }
 
         self.mtu = rest_info.mtu;
         if self.ipv6 != rest_info.endpoint_ipv6 || self.fec.is_some() != rest_info.fec {
@@ -287,12 +360,13 @@ impl WireguardTunnelC {
                         Some(fec1),
                         wg_port,
                         fec_listen_port,
+                        rest_info.refresh.active_slot != 0,
                     ),
                 )
             } else {
                 (
                     None,
-                    Self::gen_new_wg_tunnel(rest_info.clone(), local_private_key, None, port, 0),
+                    Self::gen_new_wg_tunnel(rest_info.clone(), local_private_key, None, port, 0, rest_info.refresh.active_slot != 0),
                 )
             };
 
@@ -340,6 +414,8 @@ impl WireguardTunnelC {
 
     pub async fn teardown(&mut self) -> Result<(), Box<dyn Error>> {
         self.os_tun.destroy().await?;
+        if let Some(proxy) = &mut self.proxy { proxy.stop().await?; }
+        self.proxy = None;
         #[cfg(target_os = "linux")]
         if let Some(bridge) = &mut self.faketcp { bridge.stop().await?; }
         #[cfg(target_os = "linux")]
@@ -377,6 +453,10 @@ impl WireguardTunnelC {
         self.tunnel_id
     }
 
+    pub(super) fn transport_flags(&self) -> (bool, bool, bool) {
+        (self.ipv6, self.fec.is_some(), self.fake_peer.is_some())
+    }
+
     pub fn get_peer_node_id(&self) -> i32 {
         self.peer_node_id
     }
@@ -399,11 +479,26 @@ impl WireguardTunnelC {
 }
 
 impl DaemonMemory {
+    pub async fn wireguard_mapped_addr(&self, tunnel_id: i32, server: SocketAddr, timeout: std::time::Duration) -> Result<SocketAddr, String> {
+        let tunnels = self.wireguard.lock().await;
+        let tunnel = tunnels.get(&tunnel_id).ok_or_else(|| format!("unknown WireGuard tunnel {tunnel_id}"))?;
+        if tunnel.fake_peer.is_some() {
+            return Err("STUN mapping is unsupported for FakeTCP".into());
+        }
+        if let Some(proxy) = &tunnel.proxy {
+            return proxy.mapped_addr(server, timeout).await;
+        }
+        let fec = tunnel.fec.as_ref().ok_or("STUN mapping is unsupported for kernel WireGuard")?;
+        fec.mapped_addr(server, timeout).await
+    }
+
     pub async fn reconcile_wireguard_tunnels(
         &self,
         snapshot: &TopologySnapshot,
         local_private_key: &str,
     ) -> Result<(), String> {
+        let mut switched = self.refresh_switched.lock().await;
+        let mut preserved = self.refresh_preserved.lock().await;
         let mut active = self.wireguard.lock().await;
         let desired_ids: HashSet<i32> = snapshot
             .tunnels
@@ -425,6 +520,18 @@ impl DaemonMemory {
             .collect();
         let mut removal_error = None;
         for id in stale_ids {
+            let mut candidates = self.refresh_wireguard.lock().await;
+            if let Some(candidate) = candidates.get_mut(&id) {
+                if let Err(error) = candidate.teardown().await {
+                    removal_error = Some(format!("failed to teardown refresh tunnel {id}: {error}"));
+                    continue;
+                }
+            }
+            candidates.remove(&id);
+            if let Some(port) = self.refresh_ports.lock().await.remove(&id) { self.port_mgmt.release(port); }
+            switched.remove(&id);
+            preserved.remove(&id);
+            drop(candidates);
             if let Some(stale) = active.get_mut(&id) {
                 let teardown = stale.teardown().await.map_err(|error| error.to_string());
                 match teardown {
@@ -463,6 +570,9 @@ impl DaemonMemory {
 
             let tunnel_arc = Arc::new(tunnel.clone());
             if let Some(existing) = active.get_mut(&tunnel.tunnel_id) {
+                if switched.contains(&tunnel.tunnel_id) || preserved.contains(&tunnel.tunnel_id) {
+                    continue;
+                }
                 existing
                     .update_from_rest(tunnel_arc, memory_arc.clone())
                     .await
@@ -532,6 +642,28 @@ async fn matching_mtu_still_brings_wireguard_up() {
     let output = std::process::Command::new("ip").args(["-o", "link", "show", "wgactivate"]).output().unwrap();
     assert!(String::from_utf8_lossy(&output.stdout).contains("UP"));
     assert!(std::process::Command::new("ip").args(["link", "del", "wgactivate"]).status().unwrap().success());
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[tokio::test]
+async fn failed_fake_tcp_replacement_is_retried() {
+    let memory = Arc::new(DaemonMemory::new(crate::config::ClientConfig::default()));
+    let private = wireguard_control::Key::generate_private();
+    let mut info: WireguardTunnelInfo = serde_json::from_value(serde_json::json!({
+        "tunnel_id": 71, "peer_node_id": 72, "public_key": "invalid", "preferred_port": 0,
+        "remote_endpoint": null, "local_answered": "Unanswered", "remote_response": "Unanswered",
+        "mtu": 1420, "endpoint_ipv6": false, "fec": false, "faketcp": false,
+        "created_at": 0, "updated_at": 0
+    })).unwrap();
+    let (mut tunnel, _) = WireguardTunnelC::new_from_rest(Arc::new(info.clone()), private.to_base64(), memory.clone()).await.unwrap();
+    tunnel.fake_peer = Some("127.0.0.1:12345".parse().unwrap());
+    info.faketcp = true;
+    info.remote_endpoint = Some("127.0.0.1:12346".into());
+    assert!(tunnel.update_from_rest(Arc::new(info.clone()), memory.clone()).await.is_err());
+    assert!(tunnel.replacement_pending);
+    info.remote_endpoint = Some("127.0.0.1:12345".into());
+    assert!(tunnel.update_from_rest(Arc::new(info), memory).await.is_err());
+    assert!(tunnel.replacement_pending);
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -615,9 +747,40 @@ fn wireguard_interface_names_include_full_tunnel_id() {
         remote_endpoint: None, local_answered: cat4igp_shared::custom_type::WireguardAnswered::Unanswered,
         remote_response: cat4igp_shared::custom_type::WireguardAnswered::Unanswered,
         mtu: 1420, endpoint_ipv6: false, fec: false, faketcp: false, created_at: 0, updated_at: 0,
+        refresh_mode: Default::default(), refresh: Default::default(),
     };
-    let first = WireguardTunnelC::gen_new_wg_tunnel(Arc::new(info.clone()), String::new(), None, 0, 0);
+    let first = WireguardTunnelC::gen_new_wg_tunnel(Arc::new(info.clone()), String::new(), None, 0, 0, false);
+    let alternate = WireguardTunnelC::gen_new_wg_tunnel(Arc::new(info.clone()), String::new(), None, 0, 0, true);
+    assert_ne!(first.get_interface_name(), alternate.get_interface_name());
     info.tunnel_id = 65537;
-    let second = WireguardTunnelC::gen_new_wg_tunnel(Arc::new(info), String::new(), None, 0, 0);
+    let second = WireguardTunnelC::gen_new_wg_tunnel(Arc::new(info), String::new(), None, 0, 0, false);
     assert_ne!(first.get_interface_name(), second.get_interface_name());
+}
+
+#[tokio::test]
+async fn active_kernel_mapping_refresh_does_not_rebind_or_disturb_socket() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config = crate::config::ClientConfig { data_dir: dir.path().to_owned(), ..Default::default() };
+    let daemon = crate::daemon::Daemon::new(config).await.unwrap();
+    let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = socket.local_addr().unwrap().port();
+    daemon.memory.reserved_ports.lock().await.insert(1, port);
+    let os = crate::tunnel::wireguard::WireGuardTunnel::new("unused".into(), String::new(), String::new(), None, Some(port));
+    daemon.memory.wireguard.lock().await.insert(1, WireguardTunnelC::new(1, 2, false, 1420, os, None));
+    let info: WireguardTunnelInfo = serde_json::from_value(serde_json::json!({
+        "tunnel_id": 1, "peer_node_id": 2, "public_key": "", "preferred_port": 0,
+        "remote_endpoint": null, "local_answered": "Answered", "remote_response": "Answered",
+        "mtu": 1420, "endpoint_ipv6": false, "fec": false, "faketcp": false,
+        "created_at": 0, "updated_at": 0
+    })).unwrap();
+    let error = daemon.local_endpoint(&info).await.unwrap_err();
+    assert!(error.contains("active kernel WireGuard mapping"), "{error}");
+    let detector = crate::network::PublicIpDetector::new();
+    assert!(daemon.memory.inactive_wireguard_mapped_addr(1, &detector, port, false).await.is_err());
+    assert!(daemon.memory.wireguard_mapped_addr(1, "127.0.0.1:9".parse().unwrap(), std::time::Duration::from_millis(10)).await.is_err());
+    assert_eq!(daemon.memory.reserve_tunnel_port(1).await.unwrap(), port);
+    socket.send_to(b"still alive", socket.local_addr().unwrap()).await.unwrap();
+    let mut buf = [0; 32];
+    let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(1), socket.recv_from(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(&buf[..n], b"still alive");
 }

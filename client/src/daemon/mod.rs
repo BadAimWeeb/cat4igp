@@ -18,6 +18,7 @@ use cat4igp_shared::{
 pub mod client;
 pub mod control;
 mod control_relay;
+mod refresh;
 mod topology_cache;
 mod daemon_memory;
 #[cfg(all(test, target_os = "linux"))]
@@ -36,6 +37,7 @@ pub struct Daemon {
     memory: Arc<daemon_memory::DaemonMemory>,
     control_sync: Arc<Mutex<()>>,
     control_plane: Arc<std::sync::Mutex<Option<control::ControlPlane>>>,
+    refresh_state: Arc<Mutex<refresh::Store>>,
     server_features: Arc<std::sync::RwLock<Option<cat4igp_shared::control::FeatureSupport>>>,
     tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
     stopping: Arc<tokio::sync::Notify>,
@@ -77,13 +79,34 @@ struct IpcMessage {
     request: DaemonRequest,
 }
 
+fn executable_in_path(name: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_some_and(|path| std::env::split_paths(path).any(|dir| {
+        std::fs::metadata(dir.join(name)).is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    }))
+}
+
+fn persist_enrollment_rejection(config: &mut ServerConfig, data_dir: &std::path::Path, error: &str) -> io::Result<bool> {
+    if error != "enrollment rejected" {
+        return Ok(false);
+    }
+    let mut rejected = config.clone();
+    rejected.invite_code.clear();
+    rejected.save(data_dir)?;
+    *config = rejected;
+    Ok(true)
+}
+
 impl Daemon {
     fn feature_support(&self) -> cat4igp_shared::control::FeatureSupport {
         let wireguard = self.config.tunnel_protocols.wireguard;
-        let l2tp = self.config.tunnel_protocols.l2tp && cfg!(target_os = "linux");
+        let linux = cfg!(target_os = "linux");
+        let path = std::env::var_os("PATH");
+        let l2tp = self.config.tunnel_protocols.l2tp && linux;
         cat4igp_shared::control::FeatureSupport {
-            wireguard, l2tp_v2: l2tp, l2tp_v3: l2tp,
-            faketcp: wireguard && cfg!(target_os = "linux"), fec: wireguard,
+            wireguard, l2tp_v2: l2tp && executable_in_path("xl2tpd", path.as_deref()) && executable_in_path("pppd", path.as_deref()), l2tp_v3: l2tp,
+            faketcp: wireguard && linux && executable_in_path("nft", path.as_deref()), fec: wireguard,
+            refresh_proxy: wireguard, refresh_dual_link: wireguard && linux,
         }
     }
 
@@ -120,6 +143,7 @@ impl Daemon {
             cfg.save(&config.data_dir)?;
         }
 
+        let refresh_state = refresh::Store::load(&config.data_dir)?;
         let cfg_clone = config.clone();
 
         Ok(Daemon {
@@ -134,6 +158,7 @@ impl Daemon {
             memory: Arc::new(daemon_memory::DaemonMemory::new(cfg_clone)),
             control_sync: Arc::new(Mutex::new(())),
             control_plane: Arc::new(std::sync::Mutex::new(None)),
+            refresh_state: Arc::new(Mutex::new(refresh_state)),
             server_features: Arc::new(std::sync::RwLock::new(None)),
             tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             stopping: Arc::new(tokio::sync::Notify::new()),
@@ -288,13 +313,15 @@ impl Daemon {
             } else {
                 &pending.enrollment_bootstrap_addresses
             };
-            if pending.invite_code == config.invite_code
+            if (pending.invite_code == config.invite_code || pending.invite_code.is_empty())
                 && original_seeds == &config.control_bootstrap_addresses
                 && pending.controller_signing_key == config.controller_signing_key
                 && pending.control_network_id == config.control_network_id
                 && pending.control_private_network_key == config.control_private_network_key
             {
+                let invite_code = config.invite_code;
                 config = pending.clone();
+                config.invite_code = invite_code;
             } else {
                 return DaemonResponse::Error(
                     "Pending registration differs; refusing to overwrite identity".into(),
@@ -338,11 +365,17 @@ impl Daemon {
                 return DaemonResponse::Error(format!("Registration failed: {}", e));
             }
         };
-        if !matches!(
-            registration,
-            cat4igp_shared::control::ControlResponse::Enrolled(_)
-        ) {
-            return DaemonResponse::Error("Registration rejected by controller".to_string());
+        match registration {
+            cat4igp_shared::control::ControlResponse::Enrolled(_) => {}
+            cat4igp_shared::control::ControlResponse::Rejected(error) => {
+                match persist_enrollment_rejection(&mut config, &self.config.data_dir, &error) {
+                    Ok(true) => *self.server_config.lock().await = Some(config),
+                    Ok(false) => {},
+                    Err(save_error) => return DaemonResponse::Error(format!("Registration rejected: {error}; failed to save rejection: {save_error}")),
+                }
+                return DaemonResponse::Error(format!("Registration rejected by controller: {error}"));
+            }
+            _ => return DaemonResponse::Error("Unexpected enrollment response; pending registration retained".into()),
         }
 
         config.invite_code.clear();
@@ -699,6 +732,7 @@ impl Daemon {
             control_sync: Arc::clone(&self.control_sync),
             control_plane: Arc::clone(&self.control_plane),
             server_features: Arc::clone(&self.server_features),
+            refresh_state: Arc::clone(&self.refresh_state),
             tasks: Arc::clone(&self.tasks),
             stopping: Arc::clone(&self.stopping),
             stopped: Arc::clone(&self.stopped),
@@ -770,12 +804,34 @@ impl Daemon {
                 return;
             }
         };
+        use rtnetlink::packet_core::NetlinkPayload;
+        use rtnetlink::packet_route::{RouteNetlinkMessage, link::LinkAttribute};
+        let mut cat_indexes = std::collections::HashSet::new();
         tokio::pin!(connection);
-        while tokio::select! {
-            _ = &mut connection => false,
-            message = messages.next() => message.is_some(),
-        } {
-            // ponytail: track interface indexes to skip CAT interfaces if event volume becomes material.
+        loop {
+            let Some((message, _)) = (tokio::select! {
+                _ = &mut connection => None,
+                message = messages.next() => message,
+            }) else { break };
+            let index = match message.payload {
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(link) | RouteNetlinkMessage::DelLink(link)) => {
+                    let index = link.header.index;
+                    if let Some(name) = link.attributes.iter().find_map(|a| match a { LinkAttribute::IfName(name) => Some(name), _ => None }) {
+                        if name.starts_with("cat") { cat_indexes.insert(index); continue; }
+                        cat_indexes.remove(&index);
+                    }
+                    index
+                }
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewAddress(address) | RouteNetlinkMessage::DelAddress(address)) => address.header.index,
+                _ => continue,
+            };
+            if cat_indexes.contains(&index) { continue; }
+            let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
+            if !unsafe { libc::if_indextoname(index, name.as_mut_ptr()) }.is_null() {
+                let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_string_lossy();
+                if name.starts_with("cat") { cat_indexes.insert(index); continue; }
+            }
+            if let Err(error) = self.trigger_network_refresh().await { eprintln!("[daemon] refresh scheduling failed: {error}"); }
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Err(error) = self.sync_control_snapshot().await {
                 if error != "control plane is not enrolled" {
@@ -788,7 +844,7 @@ impl Daemon {
         let _sync = self.control_sync.lock().await;
         let Some(mut config) = self.server_config.lock().await.clone() else { return Ok(()); };
         if config.control_node_id.is_none() { return Ok(()); }
-        let (snapshot, ports) = match topology_cache::load(&self.config.data_dir, &config) {
+        let (snapshot, mut ports) = match topology_cache::load(&self.config.data_dir, &config) {
             Ok(cache) => cache,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.to_string()),
@@ -798,6 +854,8 @@ impl Daemon {
             config.save(&self.config.data_dir).map_err(|e| e.to_string())?;
             *self.server_config.lock().await = Some(config.clone());
         }
+        self.restore_refresh_active(&snapshot).await?;
+        self.refresh_active_ports(&snapshot, &mut ports).await;
         self.memory.restore_ports(&ports).await?;
         let key = config.wg_private_key.as_deref().filter(|s| !s.is_empty())
             .ok_or("wireguard private key missing from server configuration")?;
@@ -834,6 +892,7 @@ impl Daemon {
             .filter(|key| !key.is_empty())
             .ok_or_else(|| "wireguard private key missing from server configuration".to_string())?
             .to_owned();
+        self.restore_refresh_active(&snapshot).await?;
         self.cache_topology(&mut config, &snapshot).await?;
         if let Err(error) = self.answer_pending_tunnels(&mut config, &snapshot).await {
             eprintln!("[daemon] topology answer failed: {error}");
@@ -842,6 +901,7 @@ impl Daemon {
         self.memory
             .apply_topology_snapshot(snapshot.clone(), &private_key)
             .await?;
+        self.reconcile_refresh(&mut config, &snapshot).await?;
         self.report_connectivity().await;
         self.cache_topology(&mut config, &snapshot).await?;
         if self.memory.disconnected_tunnel_ids().await.is_empty() {
@@ -922,6 +982,7 @@ impl Daemon {
                         "wireguard private key missing from server configuration".to_string()
                     })?
                     .to_owned();
+                self.restore_refresh_active(&snapshot).await?;
                 self.cache_topology(&mut config, &snapshot).await?;
                 if let Err(error) = self.answer_pending_tunnels(&mut config, &snapshot).await {
                     eprintln!("[daemon] topology answer failed: {error}");
@@ -930,6 +991,7 @@ impl Daemon {
                 self.memory
                     .apply_topology_snapshot(snapshot.clone(), &private_key)
                     .await?;
+                self.reconcile_refresh(&mut config, &snapshot).await?;
                 self.report_connectivity().await;
                 self.cache_topology(&mut config, &snapshot).await?;
                 if self.memory.disconnected_tunnel_ids().await.is_empty() {
@@ -953,7 +1015,8 @@ impl Daemon {
                 WireguardAnswered::Unanswered | WireguardAnswered::Answered
             )
         }) {
-            let required = cat4igp_shared::control::FeatureSupport { wireguard: true, fec: tunnel.fec, faketcp: tunnel.faketcp, ..Default::default() };
+            if tunnel.refresh_mode == cat4igp_shared::control::RefreshMode::DualLink && matches!(tunnel.local_answered, WireguardAnswered::Answered) { continue; }
+            let required = cat4igp_shared::control::FeatureSupport { wireguard: true, fec: tunnel.fec, faketcp: tunnel.faketcp, refresh_proxy: tunnel.refresh_mode == cat4igp_shared::control::RefreshMode::Proxy, refresh_dual_link: tunnel.refresh_mode == cat4igp_shared::control::RefreshMode::DualLink, ..Default::default() };
             if !self.feature_support().supports(required) || !self.server_features.read().unwrap().is_some_and(|features| features.supports(required)) {
                 eprintln!("[daemon] tunnel {} requires unsupported or unknown features", tunnel.tunnel_id);
                 continue;
@@ -999,7 +1062,10 @@ impl Daemon {
                             "[daemon] tunnel {} cannot advertise endpoint: {error}",
                             tunnel.tunnel_id
                         );
-                        if matches!(tunnel.local_answered, WireguardAnswered::Unanswered) {
+                        if self.memory.wireguard_is_active(tunnel.tunnel_id).await {
+                            // Retain the existing answer and port even if the snapshot says unanswered.
+                            continue;
+                        } else if matches!(tunnel.local_answered, WireguardAnswered::Unanswered) {
                             self.memory.release_tunnel_port(tunnel.tunnel_id).await;
                             (None, Some(3))
                         } else {
@@ -1012,6 +1078,7 @@ impl Daemon {
                 tunnel_id: tunnel.tunnel_id,
                 endpoint,
                 decline_type,
+                refresh: None,
             };
             let plane = self
                 .control_plane
@@ -1105,11 +1172,28 @@ impl Daemon {
         if tunnel.faketcp {
             return Err("FakeTCP requires a configured public hostname and TCP port forwarding; UDP STUN cannot discover its endpoint".into());
         }
+        let active = self.memory.wireguard_is_active(tunnel.tunnel_id).await;
+        if active && !tunnel.fec && tunnel.refresh_mode != cat4igp_shared::control::RefreshMode::Proxy {
+            return Err("cannot refresh an active kernel WireGuard mapping: its UDP socket is inaccessible; retain the existing endpoint or configure a public hostname and port forwarding".into());
+        }
         let mut detector = crate::network::PublicIpDetector::new();
         detector.init().await?;
-        detector
-            .mapped_addr_from_port(port, tunnel.endpoint_ipv6)
-            .await
+        if active {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut last_error = "no STUN server available for the requested address family".to_string();
+            for server in detector.mapping_servers(tunnel.endpoint_ipv6) {
+                match tokio::time::timeout_at(deadline, self.memory.wireguard_mapped_addr(tunnel.tunnel_id, server, detector.mapping_timeout())).await {
+                    Ok(Ok(mapped)) => return Ok(mapped),
+                    Ok(Err(error)) => last_error = error,
+                    Err(_) => { last_error = "STUN refresh timed out".into(); break; }
+                }
+            }
+            return Err(format!("active FEC mapping refresh failed: {last_error}"));
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.memory.inactive_wireguard_mapped_addr(tunnel.tunnel_id, &detector, port, tunnel.endpoint_ipv6),
+        ).await.map_err(|_| "STUN mapping discovery timed out".to_string())?
     }
 }
 

@@ -5,6 +5,7 @@ mod fec;
 mod handshake;
 mod proto;
 mod stats;
+mod stun;
 mod transport;
 
 pub use config::{Config, ConfigError};
@@ -98,6 +99,11 @@ impl PeerEngine {
     pub fn handle(&self) -> &EngineHandle {
         &self.handle
     }
+    /// Query a STUN server on the live FEC transport socket without interrupting data traffic.
+    pub async fn mapped_addr(&self, server: SocketAddr, timeout: std::time::Duration) -> Result<SocketAddr, String> {
+        self._runtime.mapped_addr(server, timeout).await
+    }
+
 
     pub async fn shutdown(self) {
         self._runtime.shutdown().await;

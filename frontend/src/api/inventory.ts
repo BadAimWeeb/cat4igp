@@ -25,6 +25,7 @@ type Tunnel = {
   endpoint_peer2?: string | null;
   ipv6: boolean;
   mtu: number;
+  refresh_mode?: "current" | "proxy" | "dual_link";
   intents: Intent[];
 };
 type L2tpTunnel = {
@@ -110,6 +111,7 @@ export function inventoryFrom(value: unknown): Inventory {
         (r.endpoint_peer2 === undefined || nullableText(r.endpoint_peer2)) &&
         typeof r.ipv6 === "boolean" &&
         integer(r.mtu) &&
+        (r.refresh_mode === undefined || r.refresh_mode === "current" || r.refresh_mode === "proxy" || r.refresh_mode === "dual_link") &&
         rows(r.intents, (i) =>
           i.kind === "mesh"
             ? integer(i.mesh_id)

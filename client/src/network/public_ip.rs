@@ -1,5 +1,6 @@
 use rand::prelude::*;
 use rand::seq::SliceRandom;
+use rand08::{rngs::OsRng, RngCore};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
@@ -266,19 +267,36 @@ impl PublicIpDetector {
         Err("Failed to detect public IPv6 address from any STUN server".to_string())
     }
 
+    pub fn mapping_servers(&self, ipv6: bool) -> Vec<std::net::SocketAddr> {
+        let mut servers: Vec<_> = if ipv6 {
+            self.ipv6_servers.iter().flat_map(|server| server.ipv6_addrs.iter().map(move |ip| std::net::SocketAddr::new(IpAddr::V6(*ip), server.port))).collect()
+        } else {
+            self.ipv4_servers.iter().flat_map(|server| server.ipv4_addrs.iter().map(move |ip| std::net::SocketAddr::new(IpAddr::V4(*ip), server.port))).collect()
+        };
+        servers.shuffle(&mut rand::rng());
+        servers
+    }
+
+    pub fn mapping_timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Discover the mapped address from the UDP port intended for the tunnel.
     pub async fn mapped_addr_from_port(
         &self,
         port: u16,
         ipv6: bool,
     ) -> Result<std::net::SocketAddr, String> {
+        if port == 0 {
+            return Err("cannot discover a tunnel mapping for UDP port 0".into());
+        }
         let socket = UdpSocket::bind(if ipv6 {
             format!("[::]:{port}")
         } else {
             format!("0.0.0.0:{port}")
         })
         .await
-        .map_err(|error| format!("failed to bind UDP port {port}: {error}"))?;
+        .map_err(|error| format!("failed to bind tunnel UDP port {port}: {error}; an active WireGuard or FEC transport owns its socket, so its mapping cannot be queried by binding another socket"))?;
         let mut servers = if ipv6 {
             self.ipv6_servers.clone()
         } else {
@@ -293,16 +311,22 @@ impl PublicIpDetector {
             };
             for ip in addresses {
                 let server = std::net::SocketAddr::new(ip, server.port);
-                socket
-                    .send_to(&self.create_stun_binding_request(), server)
-                    .await
-                    .map_err(|error| format!("failed to send STUN request: {error}"))?;
+                let request = self.create_stun_binding_request();
+                if socket.send_to(&request, server).await.is_err() {
+                    continue;
+                }
+                let deadline = tokio::time::Instant::now() + self.timeout;
                 let mut response = [0; 512];
-                if let Ok(Ok((length, _))) =
-                    tokio::time::timeout(self.timeout, socket.recv_from(&mut response)).await
+                while let Ok(Ok((length, source))) =
+                    tokio::time::timeout_at(deadline, socket.recv_from(&mut response)).await
                 {
+                    if source != server || length < 20 || response[8..20] != request[8..20] {
+                        continue;
+                    }
                     if let Ok(mapped) = self.parse_mapped_socket_addr(&response[..length]) {
-                        if mapped.is_ipv6() == ipv6 {
+                        if mapped.is_ipv6() == ipv6 && mapped.port() != 0
+                            && !mapped.ip().is_unspecified() && !mapped.ip().is_multicast()
+                        {
                             return Ok(mapped);
                         }
                     }
@@ -663,7 +687,9 @@ impl PublicIpDetector {
         let mut request = vec![0x00, 0x01]; // Message type: Binding Request
         request.extend_from_slice(&[0x00, 0x00]); // Message length: 0
         request.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]); // Magic cookie
-        request.extend_from_slice(&[0x00; 12]); // Transaction ID
+        let mut transaction_id = [0u8; 12];
+        OsRng.fill_bytes(&mut transaction_id);
+        request.extend_from_slice(&transaction_id);
         request
     }
 
@@ -723,6 +749,42 @@ impl PublicIpDetector {
         } else {
             Err("Unexpected STUN mapped address family".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mapping_requires_free_nonzero_port_and_correlated_reply() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut detector = PublicIpDetector::new();
+        detector.timeout = Duration::from_secs(1);
+        detector.ipv4_servers.push(StunServer { port: server.local_addr().unwrap().port(), ipv4_addrs: vec![Ipv4Addr::LOCALHOST], ipv6_addrs: vec![] });
+        assert!(detector.mapped_addr_from_port(0, false).await.is_err());
+        assert!(detector.mapped_addr_from_port(occupied.local_addr().unwrap().port(), false).await.is_err());
+        let port = occupied.local_addr().unwrap().port();
+        drop(occupied);
+        let serve = async {
+            let mut request = [0; 512];
+            let (n, client) = server.recv_from(&mut request).await.unwrap();
+            assert_eq!(client.port(), port);
+            let mut reply = request[..n].to_vec();
+            reply[0..2].copy_from_slice(&[1, 1]);
+            reply[2..4].copy_from_slice(&12u16.to_be_bytes());
+            reply.extend_from_slice(&[0, 1, 0, 8, 0, 1, 0x12, 0x34, 203, 0, 113, 9]);
+            let mut forged = reply.clone();
+            forged[31] = 99;
+            attacker.send_to(&forged, client).await.unwrap();
+            forged[8] ^= 1;
+            server.send_to(&forged, client).await.unwrap();
+            server.send_to(&reply, client).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(detector.mapped_addr_from_port(port, false), serve);
+        assert_eq!(result.unwrap(), "203.0.113.9:4660".parse().unwrap());
     }
 }
 

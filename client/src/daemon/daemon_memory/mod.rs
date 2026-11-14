@@ -9,16 +9,25 @@ use crate::config::ClientConfig;
 use crate::network::ports::PortRange;
 
 pub mod wireguard;
+mod refresh;
+#[cfg(target_os = "linux")]
+mod refresh_guard;
 #[cfg(target_os = "linux")]
 mod l2tp;
 #[cfg(target_os = "linux")]
 mod l2tp_v2;
 #[cfg(target_os = "linux")]
 pub(crate) mod l2tp_v2_policy;
+#[cfg(all(test, target_os = "linux"))]
+mod refresh_integration_test;
 
 #[derive(Clone)]
 pub struct DaemonMemory {
     wireguard: Arc<Mutex<HashMap<i32, wireguard::WireguardTunnelC>>>,
+    refresh_wireguard: Arc<Mutex<HashMap<i32, wireguard::WireguardTunnelC>>>,
+    refresh_ports: Arc<Mutex<HashMap<i32, u16>>>,
+    refresh_switched: Arc<Mutex<std::collections::HashSet<i32>>>,
+    refresh_preserved: Arc<Mutex<std::collections::HashSet<i32>>>,
     #[cfg(target_os = "linux")]
     l2tp: Arc<Mutex<HashMap<i32, l2tp::ActiveL2tp>>>,
     #[cfg(target_os = "linux")]
@@ -46,6 +55,10 @@ impl DaemonMemory {
     pub fn new(client_config: ClientConfig) -> Self {
         Self {
             wireguard: Arc::new(Mutex::new(HashMap::new())),
+            refresh_wireguard: Arc::new(Mutex::new(HashMap::new())),
+            refresh_ports: Arc::new(Mutex::new(HashMap::new())),
+            refresh_switched: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            refresh_preserved: Arc::new(Mutex::new(std::collections::HashSet::new())),
             #[cfg(target_os = "linux")]
             l2tp: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(target_os = "linux")]
@@ -99,6 +112,18 @@ impl DaemonMemory {
 
     pub async fn wireguard_len(&self) -> usize {
         self.wireguard.lock().await.len()
+    }
+
+    pub async fn wireguard_is_active(&self, tunnel_id: i32) -> bool {
+        self.wireguard.lock().await.contains_key(&tunnel_id)
+    }
+
+    pub async fn inactive_wireguard_mapped_addr(&self, tunnel_id: i32, detector: &crate::network::PublicIpDetector, port: u16, ipv6: bool) -> Result<std::net::SocketAddr, String> {
+        let tunnels = self.wireguard.lock().await;
+        if tunnels.contains_key(&tunnel_id) {
+            return Err("tunnel became active before STUN mapping discovery".into());
+        }
+        detector.mapped_addr_from_port(port, ipv6).await
     }
 
     pub async fn disconnected_tunnel_ids(&self) -> Vec<i32> {

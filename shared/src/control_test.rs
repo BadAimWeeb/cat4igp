@@ -216,6 +216,7 @@ fn encrypted_tunnel_answer_rejects_tampering() {
         tunnel_id: 7,
         decline_type: None,
         endpoint: Some("127.0.0.1:51820".into()),
+        refresh: None,
     };
     let envelope = seal_tunnel_answer(
         &signing,
@@ -265,4 +266,41 @@ fn encrypted_tunnel_answer_rejects_tampering() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn low_order_x25519_keys_are_rejected_at_all_control_boundaries() {
+    let signing = identity::Keypair::generate_ed25519();
+    let private = x25519_dalek::StaticSecret::from([7; 32]);
+    let public = hex_encode(x25519_dalek::PublicKey::from(&private).as_bytes());
+    let signing_public = hex_encode(&signing.public().encode_protobuf());
+    let meta = MessageMeta {
+        message_id: "a".repeat(32), network_id: "private".into(), recipient_node_id: 7,
+        issued_at_ms: 10, expires_at_ms: 20, topology_revision: 1,
+    };
+    let snapshot = TopologySnapshot {
+        node_id: 7, revision: 1, tunnels: vec![], l2tp_tunnels: vec![],
+        l2tp_v2_tunnels: vec![], l2tp_availability: None,
+    };
+    let answer = TunnelAnswer { tunnel_id: 7, decline_type: None, endpoint: None, refresh: None };
+    assert!(validate_encryption_public_key(&public).is_ok());
+    assert!(validate_encryption_public_key("not a key").is_err());
+    for low_order in [[0u8; 32], {
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        one
+    }] {
+        let low_order = hex_encode(&low_order);
+        assert_eq!(validate_encryption_public_key(&low_order), Err("invalid X25519 public key"));
+        assert!(matches!(seal_topology_snapshot(&signing, &low_order, meta.clone(), &snapshot), Err("invalid X25519 public key")));
+        assert!(matches!(seal_tunnel_answer(&signing, &low_order, meta.clone(), &answer), Err("invalid X25519 public key")));
+        let mut topology = seal_topology_snapshot(&signing, &public, meta.clone(), &snapshot).unwrap();
+        topology.ephemeral_public_key = low_order.clone();
+        topology.signature = hex_encode(&signing.sign(&envelope_bytes(&topology).unwrap()).unwrap());
+        assert!(matches!(open_topology_snapshot(&signing_public, &hex_encode(&private.to_bytes()), "private", 7, 20, &topology), Err("invalid X25519 public key")));
+        let mut tunnel = seal_tunnel_answer(&signing, &public, meta.clone(), &answer).unwrap();
+        tunnel.ephemeral_public_key = low_order;
+        tunnel.signature = hex_encode(&signing.sign(&envelope_bytes(&tunnel).unwrap()).unwrap());
+        assert!(matches!(open_tunnel_answer(&signing_public, &hex_encode(&private.to_bytes()), "private", 7, 20, &tunnel), Err("invalid X25519 public key")));
+    }
 }

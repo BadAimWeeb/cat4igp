@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, net::{IpAddr, SocketAddr}, sync::Arc, time::{Duration, Instant}};
 
 use crate::schema::{
     application_kv,
@@ -8,7 +8,7 @@ use crate::schema::{
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -106,6 +106,7 @@ pub(crate) enum Action {
         tunnel_id: i32,
         kind: IntentKind,
     },
+    SetTunnelRefreshMode { tunnel_id: i32, mode: cat4igp_shared::control::RefreshMode },
     CreateL2tpTunnel {
         node_id_peer1: i32, node_id_peer2: i32,
         endpoint_peer1: String, endpoint_peer2: String,
@@ -229,7 +230,7 @@ fn topology_mutation(
         Action::DeleteNode { id } => (!(*id > 0
             && diesel::select(exists(nodes::table.find(id))).get_result::<bool>(conn)?))
         .then_some("node not found"),
-        Action::RemoveTunnelIntent { tunnel_id, .. } => (!(*tunnel_id > 0
+        Action::RemoveTunnelIntent { tunnel_id, .. } | Action::SetTunnelRefreshMode { tunnel_id, .. } => (!(*tunnel_id > 0
             && diesel::select(exists(wireguard_tunnels::table.find(tunnel_id)))
                 .get_result::<bool>(conn)?))
         .then_some("tunnel not found"),
@@ -240,6 +241,27 @@ fn topology_mutation(
     };
     if let Some(message) = missing {
         return Ok(Err(message.into()));
+    }
+    if let Action::SetTunnelRefreshMode { tunnel_id, mode } = &command.action {
+        let state = crate::refresh::load(conn, *tunnel_id)?;
+        if *mode == cat4igp_shared::control::RefreshMode::Proxy {
+            let (node, _) = crate::db::tunnel_peer_node_ids(conn, *tunnel_id)?;
+            if crate::db::topology_snapshot(conn, node, 0)?.tunnels.iter().any(|t| t.tunnel_id == *tunnel_id && t.faketcp) {
+                return Ok(Err("userspace UDP proxy cannot refresh FakeTCP transport".into()));
+            }
+        }
+        if !crate::refresh::mode_change_allowed(&state, *mode) { return Ok(Err("cannot change mode during a dual-link transition".into())); }
+        if *mode != cat4igp_shared::control::RefreshMode::Current {
+            let (a, b) = crate::db::tunnel_peer_node_ids(conn, *tunnel_id)?;
+            for node in [a, b] {
+                let supported = crate::db::feature_support(conn, node)?.is_some_and(|f| match mode {
+                    cat4igp_shared::control::RefreshMode::Proxy => f.refresh_proxy,
+                    cat4igp_shared::control::RefreshMode::DualLink => f.refresh_dual_link,
+                    _ => true,
+                });
+                if !supported { return Ok(Err(format!("node {node} lacks refresh capability"))); }
+            }
+        }
     }
     let l2tp_requirements = match &command.action {
         Action::CreateL2tpTunnel { node_id_peer1, node_id_peer2, wireguard_tunnel_id, .. } => Some((*node_id_peer1, *node_id_peer2, false, wireguard_tunnel_id.is_some())),
@@ -316,6 +338,22 @@ fn topology_mutation(
             return Ok(Err("FakeTCP requires Auto WireGuard".into()));
         }
     }
+    if let Action::SetMeshFaketcp { id, faketcp: true } = &command.action {
+        let ids = tunnel_intents::table.filter(tunnel_intents::kind.eq("mesh")).filter(tunnel_intents::mesh_id.eq(id)).select(tunnel_intents::tunnel_id).load::<i32>(conn)?;
+        for tunnel in ids { if crate::refresh::load(conn, tunnel)?.mode == cat4igp_shared::control::RefreshMode::Proxy { return Ok(Err("userspace UDP proxy cannot refresh FakeTCP transport".into())); } }
+    }
+    if let Action::AddMembership { mesh_id, node_id } = &command.action {
+        let faketcp = mesh_groups::table.find(mesh_id).select(mesh_groups::auto_wireguard_faketcp).first::<bool>(conn)?;
+        if faketcp {
+            let members = crate::db::get_mesh_members(conn, *mesh_id)?;
+            for tunnel in crate::db::get_wireguard_answers(conn, *node_id)? {
+                let peer = if tunnel.node_id_peer1 == *node_id { tunnel.node_id_peer2 } else { tunnel.node_id_peer1 };
+                if members.iter().any(|m| m.id == peer) && crate::refresh::load(conn, tunnel.id)?.mode == cat4igp_shared::control::RefreshMode::Proxy {
+                    return Ok(Err("userspace UDP proxy cannot refresh FakeTCP transport".into()));
+                }
+            }
+        }
+    }
     if let Action::SetMeshMtu { id, mtu } = &command.action {
         if !(1280..=9000).contains(mtu) {
             return Ok(Err("MTU must be between 1280 and 9000".into()));
@@ -359,6 +397,9 @@ fn topology_mutation(
         })
         .collect::<Result<Vec<_>, Error>>()?;
     match &command.action {
+        Action::SetTunnelRefreshMode { tunnel_id, mode } => {
+            if let Err(error) = crate::refresh::set_mode(conn, *tunnel_id, *mode)? { return Ok(Err(error)); }
+        }
         Action::CreateL2tpV2Tunnel { node_id_peer1, node_id_peer2, endpoint_peer1, endpoint_peer2, udp_port_peer1, udp_port_peer2, address_peer1, address_peer2, secret, mtu, wireguard_tunnel_id } => {
             let id = crate::db::next_management_id(conn, "tunnel")?;
             diesel::sql_query("INSERT INTO l2tpv2_tunnels VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
@@ -592,10 +633,12 @@ pub(crate) fn read(
                 wireguard_tunnels::endpoint_peer1, wireguard_tunnels::endpoint_peer2,
                 wireguard_tunnels::endpoint_ipv6, wireguard_tunnels::mtu))
                 .load::<(i32, i32, i32, Option<String>, Option<String>, bool, i32)>(conn)?.into_iter()
-                .map(|(id, node_id_peer1, node_id_peer2, endpoint_peer1, endpoint_peer2, ipv6, mtu)|
-                    serde_json::json!({"id":id,"node_id_peer1":node_id_peer1,"node_id_peer2":node_id_peer2,
+                .map(|(id, node_id_peer1, node_id_peer2, endpoint_peer1, endpoint_peer2, ipv6, mtu)| {
+                    let refresh_mode = crate::refresh::load(conn, id)?.mode;
+                    Ok(serde_json::json!({"id":id,"node_id_peer1":node_id_peer1,"node_id_peer2":node_id_peer2,
                         "endpoint_peer1":endpoint_peer1,"endpoint_peer2":endpoint_peer2,"ipv6":ipv6,"mtu":mtu,
-                        "intents":intents.remove(&id).unwrap_or_default()})).collect::<Vec<_>>();
+                        "refresh_mode":refresh_mode,"intents":intents.remove(&id).unwrap_or_default()}))
+                }).collect::<Result<Vec<_>, Error>>()?;
             Ok(serde_json::json!({"server_features":cat4igp_shared::control::FeatureSupport::server(),"nodes":nodes,"meshes":meshes,"memberships":memberships,"invites":invites,"tunnels":tunnels,"l2tp_tunnels":crate::db::l2tp_rows(conn)?,"l2tp_v2_tunnels":crate::db::l2tp_v2_rows(conn)?}))
         }
         Operation::Status => {
@@ -854,7 +897,63 @@ struct Web {
     jobs: crate::DatabaseSender,
     keys: Arc<Keys>,
     hashing: Arc<tokio::sync::Semaphore>,
-    attempts: Arc<std::sync::Mutex<(i64, u32)>>,
+    trusted_proxy: Option<IpAddr>,
+    attempts: Arc<std::sync::Mutex<LoginAttempts>>,
+}
+
+// A trusted proxy must replace (not append to) X-Real-IP with the actual client IP.
+fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted_proxy: Option<IpAddr>) -> Option<IpAddr> {
+    let ip = if Some(peer) == trusted_proxy {
+        let mut values = headers.get_all("x-real-ip").iter();
+        let value = values.next()?.to_str().ok()?;
+        if values.next().is_some() { return None; }
+        value.parse::<IpAddr>().ok()?
+    } else {
+        peer
+    };
+    Some(match ip {
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => IpAddr::V4(ip),
+            None => {
+                let mut octets = ip.octets();
+                octets[8..].fill(0);
+                IpAddr::V6(octets.into())
+            }
+        },
+        ip => ip,
+    })
+}
+
+#[derive(Default)]
+struct LoginAttempts {
+    clients: BTreeMap<IpAddr, (Instant, u32)>,
+    // A conservative earliest start; resetting an existing bucket can make this stale.
+    earliest: Option<Instant>,
+}
+
+fn allow_login(attempts: &mut LoginAttempts, ip: IpAddr, now: Instant) -> bool {
+    const WINDOW: Duration = Duration::from_secs(60);
+    const MAX_CLIENTS: usize = 16_384;
+    if !attempts.clients.contains_key(&ip) {
+        if attempts.clients.len() >= MAX_CLIENTS {
+            // Avoid scanning the entire table for every rejected new address.
+            if attempts.earliest.is_some_and(|start| now.saturating_duration_since(start) >= WINDOW) {
+                attempts.clients.retain(|_, (start, _)| now.saturating_duration_since(*start) < WINDOW);
+                attempts.earliest = attempts.clients.values().map(|(start, _)| *start).min();
+            }
+            // Active buckets must not be evicted: an address churn attack can fill the
+            // table and deny new clients until a window expires, but cannot reset limits.
+            if attempts.clients.len() >= MAX_CLIENTS { return false; }
+        }
+        attempts.earliest = Some(attempts.earliest.map_or(now, |start| start.min(now)));
+    }
+    let entry = attempts.clients.entry(ip).or_insert((now, 0));
+    if now.saturating_duration_since(entry.0) >= WINDOW {
+        *entry = (now, 0);
+    }
+    if entry.1 >= 10 { return false; }
+    entry.1 += 1;
+    true
 }
 
 fn cookie(headers: &HeaderMap) -> Option<&str> {
@@ -965,7 +1064,7 @@ struct Login {
     password: String,
 }
 
-async fn login(State(web): State<Web>, Json(login): Json<Login>) -> Response {
+async fn login(State(web): State<Web>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Json(login): Json<Login>) -> Response {
     if login.username.is_empty()
         || login.username.len() > 256
         || login.password.is_empty()
@@ -973,16 +1072,11 @@ async fn login(State(web): State<Web>, Json(login): Json<Login>) -> Response {
     {
         return failure(StatusCode::UNAUTHORIZED, "invalid credentials");
     }
-    {
-        let mut attempts = web.attempts.lock().unwrap();
-        let minute = chrono::Utc::now().timestamp() / 60;
-        if attempts.0 != minute {
-            *attempts = (minute, 0);
-        }
-        if attempts.1 >= 10 {
-            return failure(StatusCode::TOO_MANY_REQUESTS, "login rate limited");
-        }
-        attempts.1 += 1;
+    let Some(ip) = client_ip(peer.ip(), &headers, web.trusted_proxy) else {
+        return failure(StatusCode::BAD_REQUEST, "client address unavailable");
+    };
+    if !allow_login(&mut web.attempts.lock().unwrap(), ip, Instant::now()) {
+        return failure(StatusCode::TOO_MANY_REQUESTS, "login rate limited");
     }
     let Ok(permit) = web.hashing.clone().try_acquire_owned() else {
         return failure(StatusCode::TOO_MANY_REQUESTS, "login busy");
@@ -1151,6 +1245,11 @@ fn validate_keys(keys: &Keys) -> Result<(), Error> {
 
 pub(crate) async fn router(jobs: crate::DatabaseSender) -> Result<Router, Error> {
     let Some(keys) = load_keys()? else { return Ok(Router::new()); };
+    let trusted_proxy = match std::env::var("ADMIN_TRUSTED_PROXY_IP") {
+        Ok(value) => Some(value.parse::<IpAddr>().map_err(|_| "invalid ADMIN_TRUSTED_PROXY_IP")?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err("invalid ADMIN_TRUSTED_PROXY_IP".into()),
+    };
     if let Ok(path) = std::env::var("ADMIN_BOOTSTRAP_FILE") {
         let login: Login = serde_json::from_slice(&protected_file(&path)?)?;
         if login.username.trim().is_empty()
@@ -1187,15 +1286,16 @@ pub(crate) async fn router(jobs: crate::DatabaseSender) -> Result<Router, Error>
         )
         .await?;
     }
-    Ok(web_router(jobs, keys))
+    Ok(web_router(jobs, keys, trusted_proxy))
 }
 
-fn web_router(jobs: crate::DatabaseSender, keys: impl Into<Arc<Keys>>) -> Router {
+fn web_router(jobs: crate::DatabaseSender, keys: impl Into<Arc<Keys>>, trusted_proxy: Option<IpAddr>) -> Router {
     let web = Web {
         jobs,
         keys: keys.into(),
         hashing: Arc::new(tokio::sync::Semaphore::new(2)),
-        attempts: Arc::new(std::sync::Mutex::new((0, 0))),
+        trusted_proxy,
+        attempts: Arc::new(std::sync::Mutex::new(LoginAttempts::default())),
     };
     Router::new()
         .route("/login", post(login))
@@ -1228,6 +1328,7 @@ pub(crate) async fn test_gateway(
                 active: "test".into(),
                 keys: BTreeMap::from([("test".into(), "a".repeat(32))]),
             },
+            None,
         ),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1235,7 +1336,7 @@ pub(crate) async fn test_gateway(
     (
         address,
         tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
         }),
     )
 }
@@ -1272,6 +1373,57 @@ pub(crate) async fn test_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_client_identity_and_rate_limit() {
+        let proxy: IpAddr = "192.0.2.1".parse().unwrap();
+        let other: IpAddr = "192.0.2.2".parse().unwrap();
+        let client: IpAddr = "198.51.100.1".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "198.51.100.1".parse().unwrap());
+        assert_eq!(client_ip(other, &headers, Some(proxy)), Some(other));
+        assert_eq!(client_ip(proxy, &headers, Some(proxy)), Some(client));
+        headers.append("x-real-ip", "198.51.100.2".parse().unwrap());
+        assert_eq!(client_ip(proxy, &headers, Some(proxy)), None);
+        headers.clear();
+        assert_eq!(client_ip(proxy, &headers, Some(proxy)), None);
+        headers.insert("x-real-ip", "198.51.100.1, 198.51.100.2".parse().unwrap());
+        assert_eq!(client_ip(proxy, &headers, Some(proxy)), None);
+        let v6: IpAddr = "2001:db8:1234:5678:abcd::1".parse().unwrap();
+        assert_eq!(client_ip(v6, &headers, None), Some("2001:db8:1234:5678::".parse().unwrap()));
+        let mapped: IpAddr = "::ffff:198.51.100.1".parse().unwrap();
+        assert_eq!(client_ip(mapped, &headers, None), Some(client));
+        let mut attempts = LoginAttempts::default();
+        let now = Instant::now();
+        for _ in 0..10 { assert!(allow_login(&mut attempts, client, now)); }
+        assert!(!allow_login(&mut attempts, client, now));
+        assert!(allow_login(&mut attempts, other, now));
+        assert!(allow_login(&mut attempts, client, now + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn login_capacity_preserves_active_limits_and_reclaims_expired_buckets() {
+        let mut attempts = LoginAttempts::default();
+        let now = Instant::now();
+        let client = |n: u32| IpAddr::V4(n.into());
+        for _ in 0..10 { assert!(allow_login(&mut attempts, client(0), now)); }
+        for n in 1..16_384 { assert!(allow_login(&mut attempts, client(n), now + Duration::from_secs(1))); }
+        assert!(!allow_login(&mut attempts, client(16_384), now + Duration::from_secs(1)));
+        assert!(!allow_login(&mut attempts, client(0), now + Duration::from_secs(1)));
+        assert!(allow_login(&mut attempts, client(1), now + Duration::from_secs(1)));
+        assert_eq!(attempts.clients.len(), 16_384);
+
+        // Refresh the oldest bucket, making the cached earliest timestamp stale.
+        let later = now + Duration::from_secs(60);
+        assert!(allow_login(&mut attempts, client(0), later));
+        assert!(!allow_login(&mut attempts, client(16_384), later));
+        assert_eq!(attempts.clients.len(), 16_384);
+        assert_eq!(attempts.earliest, Some(now + Duration::from_secs(1)));
+
+        assert!(allow_login(&mut attempts, client(16_384), later + Duration::from_secs(1)));
+        assert_eq!(attempts.clients.len(), 2);
+        assert_eq!(attempts.clients[&client(0)].1, 1);
+    }
 
     #[test]
     fn inventory_contract_and_node_revocation() {
@@ -1335,9 +1487,9 @@ mod tests {
         assert_eq!(
             inventory["tunnels"],
             serde_json::json!([
-                {"id":1,"node_id_peer1":1,"node_id_peer2":2,"endpoint_peer1":null,"endpoint_peer2":"[2001:db8::2]:1234","ipv6":true,"mtu":1420,
+                {"id":1,"node_id_peer1":1,"node_id_peer2":2,"endpoint_peer1":null,"endpoint_peer2":"[2001:db8::2]:1234","ipv6":true,"mtu":1420,"refresh_mode":"current",
                     "intents":[{"kind":"legacy","mesh_id":null},{"kind":"manual","mesh_id":null},{"kind":"mesh","mesh_id":1}]},
-                {"id":2,"node_id_peer1":2,"node_id_peer2":2,"endpoint_peer1":"192.0.2.1:42","endpoint_peer2":null,"ipv6":false,"mtu":1280,"intents":[]}
+                {"id":2,"node_id_peer1":2,"node_id_peer2":2,"endpoint_peer1":"192.0.2.1:42","endpoint_peer2":null,"ipv6":false,"mtu":1280,"refresh_mode":"current","intents":[]}
             ])
         );
         let command = Mutation {
@@ -1416,7 +1568,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
+                axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
             });
             (address, server)
         }

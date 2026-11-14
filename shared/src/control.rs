@@ -19,18 +19,23 @@ pub struct FeatureSupport {
     pub l2tp_v3: bool,
     pub faketcp: bool,
     pub fec: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub refresh_proxy: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub refresh_dual_link: bool,
 }
 
 impl FeatureSupport {
     /// Features understood by the controller, independently of client backends.
     pub fn server() -> Self {
-        Self { wireguard: true, l2tp_v2: true, l2tp_v3: true, faketcp: true, fec: true }
+        Self { wireguard: true, l2tp_v2: true, l2tp_v3: true, faketcp: true, fec: true, refresh_proxy: true, refresh_dual_link: true }
     }
 
     pub fn supports(&self, required: Self) -> bool {
         (!required.wireguard || self.wireguard) && (!required.l2tp_v2 || self.l2tp_v2)
             && (!required.l2tp_v3 || self.l2tp_v3) && (!required.faketcp || self.faketcp)
-            && (!required.fec || self.fec)
+            && (!required.fec || self.fec) && (!required.refresh_proxy || self.refresh_proxy)
+            && (!required.refresh_dual_link || self.refresh_dual_link)
     }
 }
 
@@ -203,12 +208,28 @@ pub fn verify_topology_relay(
     Ok(envelope)
 }
 
-fn key(shared_secret: [u8; 32], purpose: &[u8]) -> Result<[u8; 32], &'static str> {
+fn key(shared_secret: x25519_dalek::SharedSecret, purpose: &[u8]) -> Result<[u8; 32], &'static str> {
+    if !shared_secret.was_contributory() {
+        return Err("invalid X25519 public key");
+    }
     let mut output = [0; 32];
-    Hkdf::<Sha256>::new(Some(b"cat4igp/control/v1"), &shared_secret)
+    Hkdf::<Sha256>::new(Some(b"cat4igp/control/v1"), shared_secret.as_bytes())
         .expand(purpose, &mut output)
         .map_err(|_| "failed to derive envelope key")?;
     Ok(output)
+}
+
+/// Reject malformed and low-order X25519 public keys before trusting them.
+pub fn validate_encryption_public_key(public_key: &str) -> Result<(), &'static str> {
+    let public: [u8; 32] = hex_decode(public_key, 32)?
+        .try_into()
+        .map_err(|_| "invalid envelope encoding")?;
+    let shared = x25519_dalek::StaticSecret::from([0x42; 32])
+        .diffie_hellman(&x25519_dalek::PublicKey::from(public));
+    if !shared.was_contributory() {
+        return Err("invalid X25519 public key");
+    }
+    Ok(())
 }
 
 pub fn seal_topology_snapshot(
@@ -234,9 +255,7 @@ pub fn seal_topology_snapshot(
     let aad = envelope_bytes(&envelope)?;
     let cipher = ChaCha20Poly1305::new(
         (&key(
-            ephemeral
-                .diffie_hellman(&x25519_dalek::PublicKey::from(recipient))
-                .to_bytes(),
+            ephemeral.diffie_hellman(&x25519_dalek::PublicKey::from(recipient)),
             b"topology",
         )?)
             .into(),
@@ -301,8 +320,7 @@ pub fn open_topology_snapshot(
     let cipher = ChaCha20Poly1305::new(
         (&key(
             x25519_dalek::StaticSecret::from(private)
-                .diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral))
-                .to_bytes(),
+                .diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral)),
             b"topology",
         )?)
             .into(),
@@ -351,6 +369,52 @@ pub struct EnrollmentResponse {
     pub controller_encryption_key: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshMode { #[default] Current, Proxy, DualLink }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RefreshState {
+    pub active_generation: u64,
+    pub active_slot: u8,
+    pub next_generation: u64,
+    pub pending: Option<RefreshPending>,
+}
+impl Default for RefreshState {
+    fn default() -> Self { Self { active_generation: 0, active_slot: 0, next_generation: 1, pending: None } }
+}
+fn is_default_refresh(value: &RefreshState) -> bool { *value == RefreshState::default() }
+fn is_current_mode(value: &RefreshMode) -> bool { *value == RefreshMode::Current }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RefreshPending {
+    pub generation: u64,
+    pub slot: u8,
+    pub local_offer: Option<RefreshOffer>,
+    pub remote_offer: Option<RefreshOffer>,
+    pub local_ready: bool,
+    pub remote_ready: bool,
+    pub committed: bool,
+    pub local_switched: bool,
+    pub remote_switched: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rolling_back: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_rolled_back: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote_rolled_back: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RefreshOffer { pub endpoint: String, pub public_key: String }
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshStage { Offer, Ready, Switched, Abort, RolledBack }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RefreshAnswer { pub generation: u64, pub stage: RefreshStage, pub offer: Option<RefreshOffer> }
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WireguardTunnelInfo {
     pub tunnel_id: i32,
@@ -366,6 +430,10 @@ pub struct WireguardTunnelInfo {
     pub faketcp: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "is_current_mode")]
+    pub refresh_mode: RefreshMode,
+    #[serde(default, skip_serializing_if = "is_default_refresh")]
+    pub refresh: RefreshState,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -436,6 +504,8 @@ pub struct TunnelAnswer {
     pub tunnel_id: i32,
     pub decline_type: Option<i16>,
     pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<RefreshAnswer>,
 }
 
 pub fn seal_tunnel_answer(
@@ -461,9 +531,7 @@ pub fn seal_tunnel_answer(
     let aad = envelope_bytes(&envelope)?;
     let cipher = ChaCha20Poly1305::new(
         (&key(
-            ephemeral
-                .diffie_hellman(&x25519_dalek::PublicKey::from(recipient))
-                .to_bytes(),
+            ephemeral.diffie_hellman(&x25519_dalek::PublicKey::from(recipient)),
             b"tunnel-answer",
         )?)
             .into(),
@@ -531,8 +599,7 @@ pub fn open_tunnel_answer(
     let cipher = ChaCha20Poly1305::new(
         (&key(
             x25519_dalek::StaticSecret::from(private)
-                .diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral))
-                .to_bytes(),
+                .diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral)),
             b"tunnel-answer",
         )?)
             .into(),

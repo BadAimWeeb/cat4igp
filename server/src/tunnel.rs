@@ -13,6 +13,7 @@ pub(crate) fn remove_orphaned(conn: &mut SqliteConnection) -> QueryResult<()> {
     diesel::sql_query("DELETE FROM application_kv WHERE key IN (SELECT 'l2tp_active/' || id FROM deleted_tunnel_descendants)").execute(conn)?;
     diesel::sql_query("DELETE FROM l2tpv2_tunnels WHERE id IN (SELECT id FROM deleted_tunnel_descendants)").execute(conn)?;
     diesel::sql_query("DELETE FROM l2tpv3_tunnels WHERE id IN (SELECT id FROM deleted_tunnel_descendants)").execute(conn)?;
+    diesel::sql_query("DELETE FROM application_kv WHERE key LIKE 'wireguard_refresh/%' AND NOT EXISTS (SELECT 1 FROM wireguard_tunnels WHERE application_kv.key='wireguard_refresh/' || wireguard_tunnels.id)").execute(conn)?;
     diesel::sql_query("DELETE FROM tunnel_dependencies WHERE NOT EXISTS (SELECT 1 FROM tunnel_id_registry t WHERE t.id=child_id)").execute(conn)?;
     Ok(())
 }
