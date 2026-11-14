@@ -71,7 +71,7 @@ package installation contract; configuration files accepted by the daemon are TO
 
 The cat4igp client has been enhanced with:
 
-1. **Configuration Management**: Load/save configuration from TOML or JSON files
+1. **Configuration Management**: Load/save TOML configuration files
 2. **CLI Interface**: Command-line options for managing the daemon
 3. **Public IP Detection**: STUN-based detection of public IPv4 and IPv6 addresses
 4. **WireGuard Response Handler**: Smart IP address selection for connection responses
@@ -85,15 +85,17 @@ policy routing and security limitations.
 
 ## Configuration File Format
 
-Configuration can be stored in TOML or JSON format. The configuration file should include:
-
-### TOML Format (Recommended)
+The daemon loads TOML configuration files:
 
 ```toml
 daemon_socket = "/tmp/cat4igp-client.sock"
 data_dir = "/var/lib/cat4igp-client"
 # Required only for direct, unencrypted L2TP.
 allow_insecure_l2tp = false
+
+# Optional reachable addresses, placed at the top level.
+public_hostname_ipv4 = "example.com"
+public_hostname_ipv6 = "vpn6.example.com"
 
 # Port range for tunnel endpoints
 [port_range]
@@ -104,43 +106,10 @@ max = 52000
 [tunnel_protocols]
 wireguard = true
 l2tp = false
-
-# Optional reachable addresses. The matching family is advertised with the
-# allocated tunnel UDP port; IPv6 uses the IPv6 value.
-public_hostname_ipv4 = "example.com"
-public_hostname_ipv6 = "vpn6.example.com"
-
-# The standalone server multiaddress. It must include its pinned peer ID.
-control_bootstrap_addresses = [
-  "/dns4/controller.example.com/tcp/9000/p2p/12D3KooW..."
-]
-
-# Required libp2p private-network key file, issued out of band with the invite.
-control_private_network_key = """/key/swarm/psk/1.0.0/
-/base16/
-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"""
 ```
 
-### JSON Format
-
-```json
-{
-  "daemon_socket": "/tmp/cat4igp-client.sock",
-  "data_dir": "/var/lib/cat4igp-client",
-  "port_range": {
-    "min": 51820,
-    "max": 52000
-  },
-  "tunnel_protocols": {
-    "wireguard": true
-  },
-  "public_hostname_ipv4": "example.com",
-  "public_hostname_ipv6": "vpn6.example.com",
-  "control_bootstrap_addresses": [
-    "/dns4/controller.example.com/tcp/9000/p2p/12D3KooW..."
-  ]
-}
-```
+Controller addresses and the private-network key are normally supplied in the
+trusted enrollment bundle. Protect any manually configured keys as secrets.
 
 ## CLI Commands
 
@@ -148,49 +117,49 @@ control_private_network_key = """/key/swarm/psk/1.0.0/
 
 ```bash
 # Start with default configuration
-./target/debug/client start
+cat4igp-client daemon
 
 # Start with custom configuration file
-./target/debug/client start --config /path/to/config.toml
+cat4igp-client daemon --config /path/to/config.toml
 
 # Or using the --config global option
-./target/debug/client --config /path/to/config.toml start
+cat4igp-client --config /path/to/config.toml daemon
 ```
 
 ### Generate Configuration File
 
 ```bash
 # Generate TOML configuration
-./target/debug/client gen-config --output config.toml
+cat4igp-client gen-config --output config.toml
 
-# Generate JSON configuration
-./target/debug/client gen-config --output config.json --json
+# JSON output is for inspection, not a loadable daemon configuration.
+cat4igp-client gen-config --output config.json --json
 ```
 
 ### Show Current Configuration
 
 ```bash
 # Display configuration as TOML (default)
-./target/debug/client show-config
+cat4igp-client show-config
 
 # Display configuration as JSON
-./target/debug/client show-config --json
+cat4igp-client show-config --json
 
 # Display specific config file
-./target/debug/client show-config --config /path/to/config.toml
+cat4igp-client show-config --config /path/to/config.toml
 ```
 
 ### Detect Public IP Address
 
 ```bash
 # Detect both IPv4 and IPv6
-./target/debug/client public-ip
+cat4igp-client public-ip
 
 # Detect only IPv4
-./target/debug/client public-ip ipv4
+cat4igp-client public-ip ipv4
 
 # Detect only IPv6
-./target/debug/client public-ip ipv6
+cat4igp-client public-ip ipv6
 ```
 
 ## Configuration Features
@@ -222,7 +191,11 @@ For each controller-requested link, a node advertises an endpoint in this order:
 2. If the relevant hostname is unset, issue STUN from that requested UDP port and advertise STUN's mapped address and **actual mapped port**.
 3. If neither yields a valid endpoint for the requested family, reject that link with `RejectedNoIpStack`.
 
-Nodes exchange endpoints through the controller, send a short UDP punch burst, then use WireGuard persistent keepalive. They re-advertise a changed endpoint after control polling or Linux link/address events.
+Nodes exchange endpoints through the controller, send a short UDP punch burst, then use WireGuard persistent keepalive. FEC tunnels refresh STUN through their active socket. The kernel WireGuard socket cannot be probed by the daemon after activation: without a configured hostname, refresh reports an error and retains the last advertised endpoint. Configure a stable hostname and port forwarding for automatic address refresh on kernel WireGuard. STUN cannot guarantee the same mapping toward different destinations behind endpoint-dependent NAT.
+For an existing WireGuard peer, reconciliation preserves a kernel-learned
+endpoint while its handshake is recent. A changed controller endpoint is
+applied after the handshake becomes stale, allowing reconnection without
+repeatedly overwriting authenticated roaming.
 
 This is best effort. Permit and, when necessary, forward the configured UDP range at the host and edge firewall. Do not use a private, unspecified, multicast, split-horizon, or controller-only hostname. Symmetric NAT and restrictive endpoint-dependent firewalls can still prevent direct connectivity; CAT4IGP does not relay traffic.
 
@@ -271,23 +244,16 @@ let from_json = ClientConfig::from_json(&json)?;
 
 ## Default Configuration
 
-If no configuration file is specified, the client uses defaults:
+The daemon tries `/etc/cat4igp/client.toml` unless `--config` is supplied; if
+the selected file does not exist, it uses defaults including:
 
 ```toml
 daemon_socket = "/tmp/cat4igp-client.sock"
 data_dir = "/var/lib/cat4igp-client"
 port_range = { min = 51820, max = 52000 }
-tunnel_protocols = { wireguard = true }
-control_bootstrap_addresses = ["/dns4/controller.example.com/tcp/9000/p2p/12D3KooW..."]
+tunnel_protocols = { wireguard = true, l2tp = false }
 ```
 
-## Module Structure
-
-- **`config.rs`**: Configuration parsing, serialization, and defaults
-- **`public_ip.rs`**: STUN-based public IP detection
-- **`wireguard_response.rs`**: Handler for WireGuard connection responses
-- **`tls_verifier.rs`**: TLS configuration and verification
-- **`main.rs`**: CLI interface and daemon startup
 
 ## Error Handling
 
@@ -303,8 +269,8 @@ All operations return proper error types:
 Run tests for configuration management:
 
 ```bash
-cargo test --package client config::tests
-cargo test --package client public_ip::tests
+cargo test -p cat4igp-client config::tests
+cargo test -p cat4igp-client public_ip::tests
 ```
 
 ## Future Enhancements

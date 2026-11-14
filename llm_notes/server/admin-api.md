@@ -10,6 +10,10 @@ Set `ADMIN_JWT_CONFIG_FILE` to an owner-only JSON file containing the exact publ
 
 Use a same-origin HTTPS reverse proxy. Every JSON POST requires the configured Origin and `Content-Type: application/json`; bodies are limited to 4096 bytes. Do not expose the server HTTP listener directly to an untrusted network and do not enable credentialed CORS.
 
+For per-client login throttling behind the proxy, set `ADMIN_TRUSTED_PROXY_IP` to the proxy's exact IP address as seen by the server. Configure that proxy to **overwrite** `X-Real-IP` with the verified connecting client's IP, not append to or pass through an incoming header; restrict access to the proxy and server listener accordingly. Requests from that peer without exactly one valid IP in `X-Real-IP` are rejected. Headers from other peers are ignored. Without this setting, the TCP peer is the client, so all users behind a proxy share its limit. Invalid configuration fails startup.
+
+Login allows 10 attempts per client per 60 seconds; IPv6 clients share a /64 bucket. State is in memory and resets on restart. At most 16,384 client buckets are retained; when full, the oldest is evicted, so distributed attackers can weaken this limit. Argon2 verification remains capped at two concurrent jobs. Deploy additional network-level abuse controls as appropriate.
+
 ## Browser contract
 
 | Endpoint | Request | Successful response |

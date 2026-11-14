@@ -57,5 +57,10 @@ stateful firewalls or DPI; it is not guaranteed censorship circumvention.
 The inner WireGuard protocol supplies confidentiality. Each active tunnel owns
 an nftables table; normal teardown removes it, but a crash or SIGKILL can leave
 tables named `cat4igp_ft_*` for an administrator to inspect and remove.
+FakeTCP protocol version 2 is incompatible with earlier clients: upgrade both
+peers before enabling it. The initial WireGuard MTU is limited by the route MTU;
+if the path MTU falls later, oversized datagrams are dropped and logged until the
+tunnel is reconfigured. TCP forwarding and stateful firewall support remain
+necessary even when the NAT translates ports.
 
 Protocol that is not designed to circumvent censorship and are UDP-based (QUIC-based are exempt) should add a flag to allow for FEC and FakeTCP implementation & indication.

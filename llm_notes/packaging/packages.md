@@ -13,8 +13,9 @@ starting them**. Linux kernel WireGuard support is required; OpenWrt declares
 | OpenWrt 25.12.5 | x86/64, armsr/armv8 | procd |
 | Static musl binary | x86_64, aarch64 | Administrator-managed |
 
-Build images, actions, OpenWrt SDK checksums and the packages feed are pinned
-in `packaging/build.sh` and the workflow (paths are repository-root relative). Package repositories
+Build images, OpenWrt SDK checksums and the packages feed are specified
+in `packaging/build.sh` and the workflow (paths are repository-root relative).
+GitHub Actions references use version tags rather than immutable commit SHAs. Package repositories
 inside the images remain live: these are ABI-appropriate builds, not
 bit-for-bit reproducible builds.
 
@@ -81,6 +82,10 @@ does not make this a Windows/macOS binary or remove kernel requirements.
 Install the matching package with the native package manager. As root, edit
 `/etc/cat4igp/client.toml`, including private-control-network settings if needed.
 The port range upper bound is exclusive. Keep configuration mode `0600`.
+Debian upgrades can prompt when both the shipped and locally modified conffile
+change. For an unattended upgrade that preserves local configuration, use
+`apt-get -o Dpkg::Options::="--force-confold" install cat4igp-client`, then
+review any `.dpkg-dist` file and merge required changes deliberately.
 
 Start the service explicitly with `systemctl start cat4igp-client`,
 `rc-service cat4igp-client start`, or `/etc/init.d/cat4igp-client start`.
@@ -103,5 +108,7 @@ unless intentionally discarding the enrolled identity.
 `bash packaging/build.sh --check` validates version inputs. Existing Rust tests
 also parse both packaged TOML samples. Native recipes execute `--help` and
 check staged permissions; OpenWrt checks its init script and installer suppression.
-Real service activation, upgrade preservation, sysupgrade and WireGuard
-enrollment/reboot still require disposable systems or supported devices.
+Disposable x86_64 VMs exercised installation, upgrade configuration preservation,
+enabled-service reboot and crash recovery on Debian 13, Alpine 3.24, Arch Linux,
+and OpenWrt 25.12.5. This does not verify other architectures, enrolled tunnel
+recovery or OpenWrt sysupgrade; validate those on representative systems.
