@@ -38,6 +38,10 @@ if [[ ${1:-} == --check ]]; then
     if [[ ${GITHUB_REF:-} == refs/tags/* ]]; then
         pkgversion debian "$GITHUB_REF" 20261001000000 "$sha" >/dev/null || die 'Tag does not match client/Cargo.toml'
     fi
+    grep -Eq '^Depends:.*[ ,]nftables([ ,]|$)' "$root/packaging/debian/control"
+    grep -Eq '^depends=".* nftables([ ]|"$)' "$root/packaging/alpine/APKBUILD"
+    grep -Eq "^depends=\(.*'nftables'" "$root/packaging/arch/PKGBUILD"
+    grep -Eq '^[[:space:]]*DEPENDS:=.*\+nftables([[:space:]]|$)' "$root/packaging/openwrt/Makefile"
     if pkgversion bogus main invalid invalid; then die 'Accepted invalid input'; fi
     echo 'Version/input checks passed'
     exit
@@ -94,7 +98,7 @@ case $distro in
             bzip2 flex bison libssl-dev libelf-dev time
         useradd -m builder ;;
     arch)
-        pacman -S --needed --noconfirm base-devel cmake curl
+        pacman -S --needed --noconfirm base-devel cmake curl nftables
         useradd -m builder ;;
 esac
 work=$(mktemp -d /tmp/cat4igp.XXXXXX)

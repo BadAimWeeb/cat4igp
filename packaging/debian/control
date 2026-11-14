@@ -9,6 +9,6 @@ Homepage: https://github.com/BadAimWeeb/cat4igp
 
 Package: cat4igp-client
 Architecture: amd64 arm64 riscv64
-Depends: ${shlibs:Depends}, ${misc:Depends}, ca-certificates
+Depends: ${shlibs:Depends}, ${misc:Depends}, ca-certificates, nftables
 Description: WireGuard mesh network client
  Client daemon and command-line interface for cat4igp mesh networks.

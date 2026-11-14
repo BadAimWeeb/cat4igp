@@ -24,7 +24,7 @@ define Package/cat4igp-client
   CATEGORY:=Network
   TITLE:=WireGuard mesh network client
   URL:=https://github.com/BadAimWeeb/cat4igp
-  DEPENDS:=$(RUST_ARCH_DEPENDS) +ca-bundle +kmod-wireguard +libgcc
+  DEPENDS:=$(RUST_ARCH_DEPENDS) +ca-bundle +kmod-wireguard +libgcc +nftables
 endef
 
 define Package/cat4igp-client/conffiles

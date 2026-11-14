@@ -4,6 +4,7 @@ on:
   push: {}
   pull_request: {}
   workflow_dispatch: {}
+  workflow_call: {}
 
 permissions:
   contents: read
@@ -17,4 +18,46 @@ jobs:
         with:
           persist-credentials: false
       # Cargo uses the repository's pinned rust-toolchain.toml.
-      - run: cargo test --locked -p cat4igp-client -p cat4igp-server -p cat4igp-shared
+      - run: cargo test --locked -p cat4igp-client -p cat4igp-server -p cat4igp-shared -p cat4igp-libfec
+      - name: Run privileged tunnel tests in isolated network namespaces
+        run: |
+          set -euo pipefail
+          sudo modprobe wireguard
+          sudo modprobe l2tp_netlink
+          sudo apt-get update
+          sudo apt-get install -y nftables conntrack
+          sudo modprobe l2tp_eth
+          cargo test --locked -p cat4igp-client --no-run --message-format=json > /tmp/client-tests.json
+          binary=$(python3 -c 'import json; print(next(m["executable"] for line in open("/tmp/client-tests.json") if (m := json.loads(line)).get("reason") == "compiler-artifact" and m.get("profile", {}).get("test") and m.get("executable") and m["target"]["name"] == "cat4igp-client"))')
+          for test in \
+            daemon::daemon_memory::l2tp::integration_test::reconcile_wireguard_resources_are_shared_and_cleaned \
+            daemon::daemon_memory::l2tp::integration_test::unmanaged_address_is_not_removed \
+            daemon::daemon_memory::l2tp_v2_policy::tests::policy_routes_to_wireguard_and_drops_when_it_disappears \
+            daemon::daemon_memory::l2tp::integration_test::l2tp_direct_and_wireguard_exchange_jumbo_packets \
+            daemon::daemon_memory::wireguard::matching_mtu_still_brings_wireguard_up \
+            tunnel::wireguard::tests::reconciliation_preserves_kernel_roaming \
+            daemon::daemon_memory::refresh_integration_test::kernel_dual_link_refresh \
+            network::faketcp::tests::routed_conntrack_nat_outage_and_recovery; do
+            # libtest succeeds even if an exact filter matches no tests.
+            sudo unshare --net "$binary" --list --ignored | grep -Fx "$test: test"
+            sudo unshare --net "$binary" --exact "$test" --ignored --nocapture
+          done
+
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build

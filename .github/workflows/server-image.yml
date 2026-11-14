@@ -8,6 +8,9 @@ permissions:
   contents: read
 
 jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+
   metadata:
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -39,7 +42,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: metadata
+    needs: [metadata, tests]
     permissions:
       contents: read
       packages: write
