@@ -267,6 +267,158 @@ fn revocation_migration_round_trip_preserves_identity() {
 }
 
 #[test]
+fn offline_node_deletion_revokes_identity_and_updates_only_surviving_peers() {
+    use crate::admin::{Action, Mutation};
+    use cat4igp_shared::control::{ControlResponse, EnrollmentRequest, EnrollmentResponse};
+
+    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    migrate(&mut conn, true).unwrap();
+    conn.batch_execute("INSERT INTO invites(code,max_uses) VALUES('invite',10);
+        INSERT INTO nodes(id,name,auth_key) VALUES(1,'survivor-a','a');
+        INSERT INTO node_control_identities(node_id,peer_id,signing_key,encryption_key) VALUES(1,'peer-a','a','a');
+        INSERT INTO application_kv SELECT 'wireguard_key/' || id,json_object('public_key','CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=','created_at','2026-01-01') FROM nodes;").unwrap();
+    let at = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+    let mut enrollment = EnrollmentCommand {
+        allocation: prepare_enrollment_allocation(&mut conn, "invite").unwrap(),
+        request: EnrollmentRequest {
+            request_id: "enroll-isolated".into(), node_name: "isolated".into(), invitation_code: "invite".into(),
+            client_peer_id: "isolated-peer".into(), client_signing_key: "signing".into(),
+            client_encryption_key: "encryption".into(), wireguard_public_key: "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+        },
+        node_id: 2, auth_key: "isolated-auth".into(), applied_at: at,
+        response: EnrollmentResponse {
+            node_id: 2, topology_revision: 0, network_id: "network".into(),
+            controller_signing_key: "controller".into(), controller_encryption_key: "controller-encryption".into(),
+        },
+    };
+    assert!(matches!(apply_enrollment(&mut conn, &enrollment).unwrap().0, ControlResponse::Enrolled(_)));
+    conn.batch_execute("INSERT INTO nodes(id,name,auth_key) VALUES(3,'survivor-b','b');
+        INSERT INTO node_control_identities(node_id,peer_id,signing_key,encryption_key) VALUES(3,'peer-b','b','b');
+        INSERT INTO application_kv VALUES('wireguard_key/3',json_object('public_key','CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=','created_at','2026-01-01'));
+        INSERT INTO wireguard_tunnels(id,node_id_peer1,node_id_peer2,endpoint_ipv6,created_at,updated_at) VALUES
+        (1,1,2,0,'2026-11-01 00:00:00','2026-11-01 00:00:00'),
+        (2,1,3,0,'2026-11-01 00:00:00','2026-11-01 00:00:00'),
+        (3,2,3,0,'2026-11-01 00:00:00','2026-11-01 00:00:00');
+        INSERT INTO tunnel_intents(tunnel_id,kind,mesh_id) SELECT id,'manual',0 FROM wireguard_tunnels;").unwrap();
+    let cached = topology_snapshot(&mut conn, 2, 0).unwrap();
+    assert_eq!(cached.tunnels.len(), 2);
+    let survivors = [1, 3].map(|id| {
+        let revision = control_identity_for_node(&mut conn, id).unwrap().topology_revision;
+        topology_snapshot(&mut conn, id, revision).unwrap()
+    });
+    let deletion = Mutation {
+        request_id: "delete-isolated".into(), action: Action::DeleteNode { id: 2 },
+        applied_at: at + chrono::Duration::hours(1),
+    };
+
+    // A failed durable tombstone must not partially delete authorization or topology.
+    conn.batch_execute("CREATE TRIGGER fail_revocation BEFORE INSERT ON application_kv WHEN NEW.key='node_revocation/isolated-peer' BEGIN SELECT RAISE(ABORT,'disk failure'); END;").unwrap();
+    assert!(crate::admin::apply(&mut conn, &deletion).is_err());
+    assert!(!identity_revoked(&mut conn, "isolated-peer").unwrap());
+    assert!(control_identity_for_peer(&mut conn, "isolated-peer").is_ok());
+    assert_eq!(serde_json::to_value(topology_snapshot(&mut conn, 2, 0).unwrap()).unwrap(), serde_json::to_value(&cached).unwrap());
+    conn.batch_execute("DROP TRIGGER fail_revocation;").unwrap();
+
+    // No request or acknowledgement from the offline node participates in deletion.
+    let result = crate::admin::apply(&mut conn, &deletion).unwrap().unwrap().unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(receipt["affected_nodes"], serde_json::json!([1, 3]));
+    assert_eq!(receipt["convergence"], "polling");
+    assert_eq!(crate::admin::apply(&mut conn, &deletion).unwrap().unwrap(), Some(result));
+    assert!(identity_revoked(&mut conn, "isolated-peer").unwrap());
+    assert!(!identity_revoked(&mut conn, "peer-a").unwrap());
+    assert!(matches!(control_identity_for_peer(&mut conn, "isolated-peer"), Err(diesel::result::Error::NotFound)));
+    assert!(matches!(authenticate(&mut conn, "isolated-auth"), Err(diesel::result::Error::NotFound)));
+    for previous in survivors {
+        let revision = control_identity_for_node(&mut conn, previous.node_id).unwrap().topology_revision;
+        let current = topology_snapshot(&mut conn, previous.node_id, revision).unwrap();
+        assert_eq!(current.revision, previous.revision + 1);
+        assert_eq!(current.tunnels.len(), 1);
+        assert_eq!(current.tunnels[0].tunnel_id, 2);
+        assert_ne!(current.tunnels[0].peer_node_id, 2);
+    }
+    // The old successful enrollment receipt cannot resurrect a deleted identity.
+    for request_id in ["enroll-isolated", "new-request"] {
+        enrollment.request.request_id = request_id.into();
+        let (response, pushes) = apply_enrollment(&mut conn, &enrollment).unwrap();
+        assert!(matches!(response, ControlResponse::Rejected(reason) if reason == "identity permanently revoked"));
+        assert!(pushes.is_empty());
+    }
+    assert_eq!(get_invites(&mut conn).unwrap()[0].used_count, 1);
+    assert_eq!(get_node_list(&mut conn).unwrap().len(), 2);
+}
+
+#[test]
+fn enrolled_client_current_backup_restore_retains_enrollment_and_revocation() {
+    use cat4igp_shared::control::{ControlResponse, EnrollmentRequest, EnrollmentResponse};
+    use crate::admin::{Action, Mutation};
+
+    let directory = tempfile::tempdir().unwrap();
+    let live = directory.path().join("live.sqlite");
+    let backup = directory.path().join("current.sqlite");
+    let restored = directory.path().join("restored.sqlite");
+    let mut conn = SqliteConnection::establish(live.to_str().unwrap()).unwrap();
+    migrate(&mut conn, true).unwrap();
+    conn.batch_execute("PRAGMA journal_mode=WAL; INSERT INTO invites(code,max_uses) VALUES('drill',2);").unwrap();
+    let at = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+    let mut commands = Vec::new();
+    let mut replies = Vec::new();
+    for id in [1, 2] {
+        let command = EnrollmentCommand {
+            allocation: prepare_enrollment_allocation(&mut conn, "drill").unwrap(),
+            request: EnrollmentRequest {
+                request_id: format!("enroll-{id}"), node_name: format!("client-{id}"),
+                invitation_code: "drill".into(), client_peer_id: format!("peer-{id}"),
+                client_signing_key: format!("signing-{id}"), client_encryption_key: format!("encryption-{id}"),
+                wireguard_public_key: "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            },
+            node_id: id, auth_key: format!("auth-{id}"), applied_at: at,
+            response: EnrollmentResponse {
+                node_id: id, topology_revision: 0, network_id: "network".into(),
+                controller_signing_key: "controller".into(), controller_encryption_key: "controller-encryption".into(),
+            },
+        };
+        let reply = apply_enrollment(&mut conn, &command).unwrap().0;
+        assert!(matches!(&reply, ControlResponse::Enrolled(response) if response.node_id == id));
+        commands.push(command);
+        replies.push(serde_json::to_value(reply).unwrap());
+    }
+    let deletion = Mutation {
+        request_id: "revoke-client-2".into(), action: Action::DeleteNode { id: 2 },
+        applied_at: at + chrono::Duration::hours(1),
+    };
+    assert!(crate::admin::apply(&mut conn, &deletion).unwrap().is_ok());
+    let revision = control_identity_for_node(&mut conn, 1).unwrap().topology_revision;
+    let topology = serde_json::to_value(topology_snapshot(&mut conn, 1, revision).unwrap()).unwrap();
+    // VACUUM INTO includes committed WAL state; copying only the live main file does not.
+    diesel::sql_query("VACUUM INTO ?")
+        .bind::<diesel::sql_types::Text, _>(backup.to_str().unwrap())
+        .execute(&mut conn).unwrap();
+    drop(conn); // Fence the only writer before installing the matched current backup.
+    std::fs::copy(&backup, &restored).unwrap();
+    let mut conn = SqliteConnection::establish(restored.to_str().unwrap()).unwrap();
+    migrate(&mut conn, false).unwrap();
+    assert_eq!(get_node_list(&mut conn).unwrap().len(), 1);
+    assert_eq!(get_invites(&mut conn).unwrap()[0].used_count, 2);
+    assert_eq!(control_identity_for_peer(&mut conn, "peer-1").unwrap().node_id, 1);
+    assert!(authenticate(&mut conn, "auth-1").is_ok());
+    assert_eq!(serde_json::to_value(topology_snapshot(&mut conn, 1, revision).unwrap()).unwrap(), topology);
+    let (reply, pushes) = apply_enrollment(&mut conn, &commands[0]).unwrap();
+    assert_eq!(serde_json::to_value(reply).unwrap(), replies[0]);
+    assert!(pushes.is_empty());
+    assert!(identity_revoked(&mut conn, "peer-2").unwrap());
+    assert!(matches!(authenticate(&mut conn, "auth-2"), Err(diesel::result::Error::NotFound)));
+    assert!(matches!(control_identity_for_peer(&mut conn, "peer-2"), Err(diesel::result::Error::NotFound)));
+    for request_id in ["enroll-2", "new-enrollment"] {
+        commands[1].request.request_id = request_id.into();
+        let (reply, pushes) = apply_enrollment(&mut conn, &commands[1]).unwrap();
+        assert!(matches!(reply, ControlResponse::Rejected(reason) if reason == "identity permanently revoked"));
+        assert!(pushes.is_empty());
+    }
+    assert_eq!(get_invites(&mut conn).unwrap()[0].used_count, 2);
+}
+
+#[test]
 fn administrator_bootstrap_is_atomic_and_idempotent() {
     use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
     use crate::admin::{Action, Mutation, Operation};
