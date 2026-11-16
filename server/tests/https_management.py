@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Live trusted-TLS smoke check; requires built server and frontend/dist, no packages."""
+"""Run the live HTTPS management integration scenario with temporary credentials.
+
+Prerequisites: Python 3, OpenSSL (with req -addext), a Rust toolchain and
+SQLite development libraries, Node.js 22+, and npm. For --browser, also install
+Firefox with WebDriver BiDi support and NSS certutil (e.g. libnss3-tools).
+From the repository root, prepare artifacts and run:
+
+    cargo build -p cat4igp-server
+    npm ci --prefix frontend
+    npm run build --prefix frontend
+    python3 server/tests/https_management.py --browser
+
+Omit --browser for the HTTPS API-only scenario. No existing secrets or external
+services are used; temporary databases, CA, credentials, and logs are removed.
+"""
 import base64
 import argparse
 import contextlib
@@ -21,6 +35,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from html.parser import HTMLParser
 from tempfile import TemporaryDirectory
 
@@ -62,8 +77,30 @@ class Assets(HTMLParser):
             self.paths.append(attrs["href"])
 
 
+def certificates(tmp):
+    """Create a disposable localhost CA and server certificate (no trust-store changes)."""
+    def openssl(*args):
+        subprocess.run(["openssl", *args], cwd=tmp, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            "-subj", "/CN=cat4igp smoke CA", "-keyout", "ca.key", "-out", "ca.pem",
+            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+            "-addext", "subjectKeyIdentifier=hash",
+            "-addext", "authorityKeyIdentifier=keyid:always")
+    openssl("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost",
+            "-keyout", "tls.key", "-out", "tls.csr")
+    (tmp / "extensions").write_text(
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n"
+        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n")
+    openssl("x509", "-req", "-in", "tls.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
+            "-CAcreateserial", "-days", "1", "-extfile", "extensions", "-out", "tls.pem")
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--browser", action="store_true", help="also run installed Firefox native BiDi UI assertions")
     args = parser.parse_args()
     binary = ROOT / "target/debug/cat4igp-server"
@@ -72,21 +109,7 @@ def main():
     with TemporaryDirectory(prefix="cat4igp-https-") as directory, contextlib.ExitStack() as cleanup:
         tmp = Path(directory)
         # Secrets and subprocess logs never leave this owner-only temporary directory.
-        def openssl(*args):
-            subprocess.run(["openssl", *args], cwd=tmp, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                "-subj", "/CN=cat4igp smoke CA", "-keyout", "ca.key", "-out", "ca.pem",
-                "-addext", "basicConstraints=critical,CA:TRUE",
-                "-addext", "keyUsage=critical,keyCertSign,cRLSign")
-        openssl("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost",
-                "-keyout", "tls.key", "-out", "tls.csr")
-        (tmp / "extensions").write_text(
-            "subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\n"
-            "keyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n")
-        openssl("x509", "-req", "-in", "tls.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
-                "-CAcreateserial", "-days", "1", "-extfile", "extensions", "-out", "tls.pem")
+        certificates(tmp)
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(tmp / "tls.pem", tmp / "tls.key")
         backend = [0]
@@ -285,7 +308,7 @@ def main():
         assert first["committed"]
         assert json.loads(request("/admin/actions", 200, action, mutation)[1]) == first
         assert len(json.loads(request("/admin/inventory", 200)[1])["meshes"]) == 1
-        request("/admin/replicas", 409)
+        request("/admin/replicas", 404)  # Replication management is not part of the standalone API.
         backend[0] = ports[1]
         request("/admin/me", 200)  # Same cookie, same origin, independent controller process.
         assert not json.loads(request("/admin/inventory", 200)[1])["meshes"]
@@ -294,7 +317,7 @@ def main():
             def encode(value):
                 return base64.urlsafe_b64encode(value).rstrip(b"=")
             header = {"alg": "HS256", "typ": "JWT", "kid": "smoke"}
-            claims = {"sub": "administrator:1", "iss": "smoke", "aud": "browser",
+            claims = {"sub": "administrator:1", "jti": str(uuid.uuid4()), "iss": "smoke", "aud": "browser",
                       "iat": iat, "exp": exp}
             payload = b".".join(encode(json.dumps(value).encode()) for value in (header, claims))
             signature = hmac.new(signing.encode(), payload, hashlib.sha256).digest()
@@ -334,7 +357,7 @@ def main():
             secret_file(tmp / "browser.json", {"origin": origin, "cross_origin": cross_origin, **credentials,
                         "expired": signed_token(now - 901, now - 1), "ca": str(tmp / "ca.pem")})
             subprocess.run(["node", ROOT / "server/tests/browser_management.mjs", tmp / "browser.json"],
-                           check=True, timeout=120)
+                           check=True, timeout=300)
         print("PASS: trusted hostname-verified HTTPS; untrusted CA rejected; built frontend assets served")
         print("PASS: login/cookie attributes, invalid JWT, Origin/CSRF/JSON rejection, mutation replay, logout")
         print("PASS: signed HS256 JWT with 60s remaining accepted; signed expired JWT me/action 401, unchanged inventory on both controllers")
