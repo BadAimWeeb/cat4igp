@@ -338,10 +338,10 @@ impl WireguardTunnelC {
             let ifcreated = self.os_tun.is_ift_created();
             self.os_tun.destroy().await?;
             if let Some(fec) = self.fec.take() {
-                Arc::try_unwrap(fec)
-                    .map_err(|_| "FEC engine still in use")?
-                    .shutdown()
-                    .await;
+                match Arc::try_unwrap(fec) {
+                    Ok(fec) => fec.shutdown().await,
+                    Err(fec) => { self.fec = Some(fec); return Err("FEC engine still in use".into()); }
+                }
             }
 
             let port = daemon_memory
@@ -421,7 +421,10 @@ impl WireguardTunnelC {
         #[cfg(target_os = "linux")]
         { self.faketcp = None; }
         if let Some(fec) = self.fec.take() {
-            Arc::try_unwrap(fec).map_err(|_| "FEC engine still in use")?.shutdown().await;
+            match Arc::try_unwrap(fec) {
+                Ok(fec) => fec.shutdown().await,
+                Err(fec) => { self.fec = Some(fec); return Err("FEC engine still in use".into()); }
+            }
         }
         Ok(())
     }
@@ -497,6 +500,15 @@ impl DaemonMemory {
         snapshot: &TopologySnapshot,
         local_private_key: &str,
     ) -> Result<(), String> {
+        self.reconcile_wireguard_tunnels_excluding(snapshot, local_private_key, &HashSet::new()).await.0
+    }
+
+    pub async fn reconcile_wireguard_tunnels_excluding(
+        &self,
+        snapshot: &TopologySnapshot,
+        local_private_key: &str,
+        blocked: &HashSet<i32>,
+    ) -> (Result<(), String>, HashSet<i32>) {
         let mut switched = self.refresh_switched.lock().await;
         let mut preserved = self.refresh_preserved.lock().await;
         let mut active = self.wireguard.lock().await;
@@ -516,19 +528,25 @@ impl DaemonMemory {
         let stale_ids: Vec<i32> = active
             .keys()
             .copied()
-            .filter(|id| !desired_ids.contains(id))
+            .filter(|id| !desired_ids.contains(id) && !blocked.contains(id))
             .collect();
-        let mut removal_error = None;
+        let mut errors = Vec::new();
+        let mut failed = HashSet::new();
         for id in stale_ids {
             let mut candidates = self.refresh_wireguard.lock().await;
             if let Some(candidate) = candidates.get_mut(&id) {
                 if let Err(error) = candidate.teardown().await {
-                    removal_error = Some(format!("failed to teardown refresh tunnel {id}: {error}"));
+                    errors.push(format!("failed to teardown refresh tunnel {id}: {error}"));
+                    failed.insert(id);
                     continue;
                 }
             }
             candidates.remove(&id);
-            if let Some(port) = self.refresh_ports.lock().await.remove(&id) { self.port_mgmt.release(port); }
+            let protected = self.rejected_refresh_ports.lock().await;
+            if !protected.contains(&id) {
+                if let Some(port) = self.refresh_ports.lock().await.remove(&id) { self.port_mgmt.release(port); }
+            }
+            drop(protected);
             switched.remove(&id);
             preserved.remove(&id);
             drop(candidates);
@@ -541,7 +559,8 @@ impl DaemonMemory {
                         self.advertised_endpoints.lock().await.remove(&id);
                     }
                     Err(error) => {
-                        removal_error = Some(format!("failed to teardown tunnel {id}: {error}"))
+                        errors.push(format!("failed to teardown tunnel {id}: {error}"));
+                        failed.insert(id);
                     }
                 }
             }
@@ -553,7 +572,7 @@ impl DaemonMemory {
             .await
             .keys()
             .copied()
-            .filter(|id| !snapshot_ids.contains(id) && !active.contains_key(id))
+            .filter(|id| !snapshot_ids.contains(id) && !active.contains_key(id) && !blocked.contains(id))
             .collect();
         for id in unused {
             self.release_tunnel_port(id).await;
@@ -564,7 +583,7 @@ impl DaemonMemory {
             let is_ready = self.wireguard_enabled && (!tunnel.faketcp || cfg!(target_os = "linux"))
                 && matches!(tunnel.local_answered, WireguardAnswered::Answered)
                 && matches!(tunnel.remote_response, WireguardAnswered::Answered);
-            if !is_ready {
+            if !is_ready || blocked.contains(&tunnel.tunnel_id) {
                 continue;
             }
 
@@ -573,13 +592,15 @@ impl DaemonMemory {
                 if switched.contains(&tunnel.tunnel_id) || preserved.contains(&tunnel.tunnel_id) {
                     continue;
                 }
-                existing
-                    .update_from_rest(tunnel_arc, memory_arc.clone())
-                    .await
-                    .map_err(|e| format!("failed to update tunnel {}: {}", tunnel.tunnel_id, e))?;
-                existing.activate().await.map_err(|e| {
-                    format!("failed to activate tunnel {}: {}", tunnel.tunnel_id, e)
-                })?;
+                if let Err(error) = existing.update_from_rest(tunnel_arc, memory_arc.clone()).await {
+                    errors.push(format!("failed to update tunnel {}: {error}", tunnel.tunnel_id));
+                    failed.insert(tunnel.tunnel_id);
+                    continue;
+                }
+                if let Err(error) = existing.activate().await {
+                    errors.push(format!("failed to activate tunnel {}: {error}", tunnel.tunnel_id));
+                    failed.insert(tunnel.tunnel_id);
+                }
                 continue;
             }
 
@@ -595,10 +616,9 @@ impl DaemonMemory {
                 Ok(tunnel) => tunnel,
                 Err(error) => {
                     self.release_tunnel_port(tunnel.tunnel_id).await;
-                    return Err(format!(
-                        "failed to create tunnel {}: {error}",
-                        tunnel.tunnel_id
-                    ));
+                    errors.push(format!("failed to create tunnel {}: {error}", tunnel.tunnel_id));
+                    failed.insert(tunnel.tunnel_id);
+                    continue;
                 }
             };
 
@@ -617,15 +637,14 @@ impl DaemonMemory {
                         .await
                         .remove(&tunnel.tunnel_id);
                 }
-                return Err(format!(
-                    "failed to setup tunnel {}: {error}",
-                    tunnel.tunnel_id
-                ));
+                errors.push(format!("failed to setup tunnel {}: {error}", tunnel.tunnel_id));
+                failed.insert(tunnel.tunnel_id);
+                continue;
             }
             active.insert(tunnel.tunnel_id, new_tunnel);
         }
 
-        removal_error.map_or(Ok(()), Err)
+        (if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }, failed)
     }
 }
 
@@ -783,4 +802,101 @@ async fn active_kernel_mapping_refresh_does_not_rebind_or_disturb_socket() {
     let mut buf = [0; 32];
     let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(1), socket.recv_from(&mut buf)).await.unwrap().unwrap();
     assert_eq!(&buf[..n], b"still alive");
+}
+
+#[cfg(test)]
+fn isolation_info(id: i32) -> WireguardTunnelInfo {
+    WireguardTunnelInfo {
+        tunnel_id: id, peer_node_id: id + 100, public_key: String::new(), preferred_port: 0,
+        remote_endpoint: None, local_answered: WireguardAnswered::Answered,
+        remote_response: WireguardAnswered::Answered, mtu: 1420, endpoint_ipv6: false,
+        fec: false, faketcp: false, created_at: 0, updated_at: 0,
+        refresh_mode: Default::default(), refresh: Default::default(),
+    }
+}
+
+#[cfg(test)]
+fn isolation_snapshot(tunnels: Vec<WireguardTunnelInfo>) -> TopologySnapshot {
+    TopologySnapshot { node_id: 1, revision: 1, tunnels, l2tp_tunnels: vec![], l2tp_v2_tunnels: vec![], l2tp_availability: None }
+}
+
+#[tokio::test]
+async fn reconciliation_reports_all_failures_and_skips_blocked_tunnels() {
+    let mut config = crate::config::ClientConfig::default();
+    config.tunnel_protocols.wireguard = true;
+    let memory = DaemonMemory::new(config);
+    let mut first = isolation_info(1);
+    first.remote_endpoint = Some("invalid".into());
+    let mut second = isolation_info(2);
+    second.remote_endpoint = Some("invalid".into());
+    let mut blocked = isolation_info(3);
+    blocked.remote_endpoint = Some("invalid".into());
+    memory.reserve_tunnel_port(3).await.unwrap();
+    let (result, failed) = memory.reconcile_wireguard_tunnels_excluding(
+        &isolation_snapshot(vec![first, second, blocked]), "", &HashSet::from([3]),
+    ).await;
+    let error = result.unwrap_err();
+    assert!(error.contains("tunnel 1") && error.contains("tunnel 2"));
+    assert_eq!(failed, HashSet::from([1, 2]));
+    assert!(memory.reserved_ports.lock().await.contains_key(&3));
+    let (result, _) = memory.reconcile_wireguard_tunnels_excluding(
+        &isolation_snapshot(vec![]), "", &HashSet::from([3]),
+    ).await;
+    assert!(result.is_ok());
+    assert!(memory.reserved_ports.lock().await.contains_key(&3));
+    memory.release_tunnel_port(3).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn stale_failure_preserves_candidate_and_cleans_independent_tunnel() {
+    let memory = Arc::new(DaemonMemory::new(crate::config::ClientConfig::default()));
+    let private = wireguard_control::Key::generate_private();
+    let peer = wireguard_control::Key::generate_private();
+    let mut info = isolation_info(11);
+    info.fec = true;
+    info.public_key = peer.get_public().to_base64();
+    let (candidate, _) = WireguardTunnelC::new_with_port(Arc::new(info.clone()), private.to_base64(), 0, false).await.unwrap();
+    let held = candidate.fec.as_ref().unwrap().clone();
+    info.fec = false;
+    let (active, _) = WireguardTunnelC::new_from_rest(Arc::new(info), private.to_base64(), memory.clone()).await.unwrap();
+    let (other, _) = WireguardTunnelC::new_from_rest(Arc::new(isolation_info(12)), private.to_base64(), memory.clone()).await.unwrap();
+    memory.wireguard.lock().await.extend([(11, active), (12, other)]);
+    memory.refresh_wireguard.lock().await.insert(11, candidate);
+    let (result, failed) = memory.reconcile_wireguard_tunnels_excluding(&isolation_snapshot(vec![]), "", &HashSet::new()).await;
+    assert!(result.is_err());
+    assert_eq!(failed, HashSet::from([11]));
+    assert!(memory.wireguard.lock().await.contains_key(&11));
+    assert!(!memory.wireguard.lock().await.contains_key(&12));
+    assert!(memory.refresh_wireguard.lock().await.get(&11).unwrap().fec.is_some());
+    assert!(memory.reserved_ports.lock().await.contains_key(&11));
+    assert!(!memory.reserved_ports.lock().await.contains_key(&12));
+    drop(held);
+    assert!(memory.reconcile_wireguard_tunnels(&isolation_snapshot(vec![]), "").await.is_ok());
+    assert!(memory.wireguard.lock().await.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn update_failure_does_not_skip_an_independent_update() {
+    let mut config = crate::config::ClientConfig::default();
+    config.tunnel_protocols.wireguard = true;
+    let memory = Arc::new(DaemonMemory::new(config));
+    let private = wireguard_control::Key::generate_private();
+    let first = isolation_info(21);
+    let second = isolation_info(22);
+    for info in [&first, &second] {
+        let (tunnel, _) = WireguardTunnelC::new_from_rest(Arc::new(info.clone()), private.to_base64(), memory.clone()).await.unwrap();
+        memory.wireguard.lock().await.insert(info.tunnel_id, tunnel);
+    }
+    let mut invalid = first;
+    invalid.peer_node_id += 1;
+    let mut changed = second;
+    changed.remote_endpoint = Some("127.0.0.1:54321".into());
+    let (result, failed) = memory.reconcile_wireguard_tunnels_excluding(
+        &isolation_snapshot(vec![invalid, changed]), &private.to_base64(), &HashSet::new(),
+    ).await;
+    assert!(result.unwrap_err().contains("failed to update tunnel 21"));
+    assert!(failed.contains(&21));
+    assert_eq!(memory.wireguard.lock().await.get(&22).unwrap().get_os_tun().get_peer_endpoint(), Some("127.0.0.1:54321".parse().unwrap()));
 }

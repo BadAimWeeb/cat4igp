@@ -30,17 +30,6 @@ enum Commands {
         config: Option<PathBuf>,
     },
 
-    /// Register with server
-    Register {
-        /// Controller multiaddress including `/p2p/<peer-id>`
-        #[arg(long)]
-        server: String,
-
-        /// Invite code from the controller
-        #[arg(long)]
-        invite: String,
-    },
-
     /// Register using a sensitive JSON bundle received over a trusted channel
     RegisterBundle {
         #[arg(long, value_name = "FILE")]
@@ -108,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             start_daemon(client_config, config_path).await?;
         }
 
-        Some(command @ (Commands::Register { .. } | Commands::RegisterBundle { .. })) => {
+        Some(Commands::RegisterBundle { bundle }) => {
             let client_config = if config_path.exists() {
                 config::ClientConfig::from_file(&config_path)?
             } else {
@@ -117,22 +106,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let client = DaemonClient::new(&client_config.daemon_socket, &client_config.data_dir)?;
 
-            let request = match command {
-                Commands::Register { server, invite } => DaemonRequest::Register {
-                    address: server,
-                    invite_code: invite,
-                },
-                Commands::RegisterBundle { bundle } => {
-                    use std::io::Read;
-                    let mut contents = String::new();
-                    std::fs::File::open(bundle)?
-                        .take(16 * 1024 + 1)
-                        .read_to_string(&mut contents)?;
-                    config::ServerConfig::from_bundle(&contents)?;
-                    DaemonRequest::RegisterBundle { bundle: contents }
-                }
-                _ => unreachable!(),
-            };
+            use std::io::Read;
+            let mut contents = String::new();
+            std::fs::File::open(bundle)?
+                .take(16 * 1024 + 1)
+                .read_to_string(&mut contents)?;
+            config::ServerConfig::from_bundle(&contents)?;
+            let request = DaemonRequest::RegisterBundle { bundle: contents };
 
             match client.send_request(request).await? {
                 daemon::protocol::DaemonResponse::Ok(msg) => {
@@ -171,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     running,
                     server_configured,
                     node_key_present,
+                    controller_snapshot_age_seconds,
                     message,
                 } => {
                     println!("Daemon Status:");
@@ -183,6 +164,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "  Node Key Present: {}",
                         if node_key_present { "Yes" } else { "No" }
                     );
+                    match controller_snapshot_age_seconds {
+                        Some(age) => println!("  Controller Snapshot Age Seconds: {age}"),
+                        None => println!("  Controller Snapshot Age Seconds: Unknown"),
+                    }
                     if let Some(msg) = message {
                         println!("  Message: {}", msg);
                     }
@@ -346,11 +331,12 @@ async fn start_daemon(
 
     // Run the daemon's Unix socket server
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        result = daemon.run() => result?,
-        result = tokio::signal::ctrl_c() => result?,
-        _ = terminate.recv() => {},
-    }
+    daemon.run_until_shutdown(async {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }).await?;
 
     Ok(())
 }

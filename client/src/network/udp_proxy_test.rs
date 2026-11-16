@@ -40,6 +40,83 @@ async fn forwards_only_pinned_peer_and_stun_uses_transport_socket() {
     assert!(!proxy.is_running());
 }
 
+#[tokio::test]
+async fn stun_ignores_spoofed_replies_without_interrupting_peer_traffic() {
+    let wg = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let reserve = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = reserve.local_addr().unwrap().port();
+    drop(reserve);
+    let public = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut proxy = UdpProxy::start(port, false, Some(peer.local_addr().unwrap()), wg.local_addr().unwrap()).await.unwrap();
+    {
+    let lookup = proxy.mapped_addr(server.local_addr().unwrap(), Duration::from_secs(2));
+    tokio::pin!(lookup);
+    let mut request = [0u8; 128];
+    let (n, source) = tokio::select! {
+        result = &mut lookup => panic!("lookup completed before request: {result:?}"),
+        result = server.recv_from(&mut request) => result.unwrap(),
+    };
+    assert_eq!((n, source), (20, public));
+    let mut response = Vec::from(&request[..20]);
+    response[..2].copy_from_slice(&[1, 1]);
+    response[2..4].copy_from_slice(&12u16.to_be_bytes());
+    response.extend_from_slice(&[0, 1, 0, 8, 0, 1, 0x12, 0x34, 192, 0, 2, 1]);
+
+    attacker.send_to(&response, public).await.unwrap();
+    let mut wrong_transaction = response.clone();
+    wrong_transaction[8] ^= 1;
+    server.send_to(&wrong_transaction, public).await.unwrap();
+    assert!(timeout(Duration::from_millis(100), &mut lookup).await.is_err());
+    peer.send_to(b"during lookup", public).await.unwrap();
+    let mut buf = [0u8; 64];
+    let (len, _) = timeout(Duration::from_secs(1), wg.recv_from(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(&buf[..len], b"during lookup");
+
+    server.send_to(&response, public).await.unwrap();
+    assert_eq!(lookup.await.unwrap(), "192.0.2.1:4660".parse().unwrap());
+    }
+    proxy.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn roaming_requires_trusted_update_and_rejects_old_peer() {
+    let wg = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let old = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let new = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let reserve = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = reserve.local_addr().unwrap().port();
+    drop(reserve);
+    let public = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut proxy = UdpProxy::start(port, false, Some(old.local_addr().unwrap()), wg.local_addr().unwrap()).await.unwrap();
+    let mut buf = [0; 64];
+
+    new.send_to(b"untrusted", public).await.unwrap();
+    assert!(timeout(Duration::from_millis(100), wg.recv_from(&mut buf)).await.is_err());
+    wg.send_to(b"before", proxy.local_addr()).await.unwrap();
+    let (len, _) = timeout(Duration::from_secs(1), old.recv_from(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(&buf[..len], b"before");
+
+    proxy.set_peer(Some(new.local_addr().unwrap())).await.unwrap();
+    // FIFO command processing: the STUN request is sent only after the peer update.
+    let (reply, _receiver) = oneshot::channel();
+    proxy.commands.send(Command::Stun(server.local_addr().unwrap(), [0; 20], reply)).await.unwrap();
+    timeout(Duration::from_secs(1), server.recv_from(&mut buf)).await.unwrap().unwrap();
+    old.send_to(b"stale", public).await.unwrap();
+    assert!(timeout(Duration::from_millis(100), wg.recv_from(&mut buf)).await.is_err());
+    new.send_to(b"accepted", public).await.unwrap();
+    let (len, _) = timeout(Duration::from_secs(1), wg.recv_from(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(&buf[..len], b"accepted");
+    wg.send_to(b"after", proxy.local_addr()).await.unwrap();
+    let (len, _) = timeout(Duration::from_secs(1), new.recv_from(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(&buf[..len], b"after");
+    assert!(timeout(Duration::from_millis(100), old.recv_from(&mut buf)).await.is_err());
+    proxy.stop().await.unwrap();
+}
+
 #[test]
 fn parses_ipv6_xor_mapping_and_rejects_malformed() {
     let mut packet = vec![1, 1, 0, 24, 0x21, 0x12, 0xa4, 0x42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];

@@ -43,6 +43,8 @@ struct Record {
     active: Option<Link>,
     previous: Option<Link>,
     candidate: Option<Link>,
+    #[serde(default)]
+    rejected_candidate: bool,
     next_attempt: u64,
     last_attempt: u64,
 }
@@ -134,6 +136,7 @@ impl Store {
         if let Some(existing) = self.node_id {
             if existing != node || self.network_id != config.control_network_id || self.controller_peer_id != peer || self.controller_signing_key != signing || self.controller_encryption_key != encryption { return Err("refresh state enrollment mismatch".into()); }
         } else {
+            if !self.records.is_empty() { return Err("unbound refresh state contains records".into()); }
             self.node_id = Some(node);
             self.network_id = config.control_network_id.clone();
             self.controller_peer_id = peer.to_owned();
@@ -163,6 +166,17 @@ impl Store {
 }
 
 impl Daemon {
+    pub(super) async fn restore_rejected_candidate_ports(&self) -> Result<(), String> {
+        let store = self.refresh_state.lock().await;
+        for (&id, record) in &store.records {
+            if record.rejected_candidate {
+                let candidate = record.candidate.as_ref().ok_or("rejected refresh candidate missing")?;
+                self.memory.protect_rejected_refresh_port(id, candidate.port).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn trigger_network_refresh(&self) -> Result<(), String> {
         let mut store = self.refresh_state.lock().await;
         let now = now()?;
@@ -185,6 +199,17 @@ impl Daemon {
         }
     }
 
+    pub(super) fn persisted_refresh_port_matches(&self, config: &ServerConfig, tunnel: &WireguardTunnelInfo, port: u16) -> Result<bool, String> {
+        // Changing refresh mode does not retire an already-promoted key or port.
+        if tunnel.refresh.active_generation == 0 { return Ok(false); }
+        let mut store = Store::load(&self.config.data_dir).map_err(|error| error.to_string())?;
+        if store.node_id.is_none() { return Ok(false); }
+        // An already-bound store is checked without changing its enrollment.
+        store.bind(config)?;
+        Ok(store.records.get(&tunnel.tunnel_id).and_then(|record| record.active.as_ref()).is_some_and(|link|
+            link.generation == tunnel.refresh.active_generation && link.slot == tunnel.refresh.active_slot && link.port == port))
+    }
+
 
     pub(super) async fn restore_refresh_active(&self, snapshot: &TopologySnapshot) -> Result<(), String> {
         let mut store = self.refresh_state.lock().await;
@@ -197,6 +222,9 @@ impl Daemon {
                 continue;
             }
             let record = store.records.get_mut(&tunnel.tunnel_id).unwrap();
+            if record.rejected_candidate && record.candidate.as_ref().is_some_and(|candidate| candidate.generation == tunnel.refresh.active_generation) {
+                return Err(format!("rejected refresh candidate for tunnel {} is active on controller", tunnel.tunnel_id));
+            }
             if record.active.as_ref().is_some_and(|active| active.generation != tunnel.refresh.active_generation)
                 && !record.candidate.as_ref().is_some_and(|candidate| tunnel.refresh.pending.is_none() && candidate.generation == tunnel.refresh.active_generation) {
                 if let Some(previous) = record.previous.as_ref().filter(|previous| previous.generation == tunnel.refresh.active_generation && previous.slot == tunnel.refresh.active_slot) {
@@ -209,6 +237,7 @@ impl Daemon {
             }
             if let Some(candidate) = &record.candidate {
                 if tunnel.refresh.pending.is_none() && tunnel.refresh.active_generation == candidate.generation {
+                    if candidate.slot != tunnel.refresh.active_slot { return Err(format!("refresh active generation mismatch for tunnel {}", tunnel.tunnel_id)); }
                     record.previous = record.active.take();
                     record.active = record.candidate.take();
                     record.next_attempt = now()?.saturating_add(REFRESH_INTERVAL);
@@ -275,6 +304,38 @@ impl Daemon {
         tokio::time::timeout(std::time::Duration::from_secs(15), self.memory.refresh_mapped_addr(tunnel.tunnel_id, &detector, tunnel.endpoint_ipv6)).await.map_err(|_| "refresh mapping discovery timed out".to_string())?
     }
 
+    async fn cleanup_candidate(&self, tunnel: &WireguardTunnelInfo, candidate: &Link) -> Result<(), String> {
+        let id = tunnel.tunnel_id;
+        self.memory.reserve_refresh_port(id, Some(candidate.port)).await?;
+        let flags = candidate.flags.ok_or("candidate WireGuard naming flags missing; refusing unverified cleanup")?;
+        self.memory.teardown_refresh(id).await?;
+        self.memory.cleanup_inactive_slot(&flags.apply(tunnel), candidate.slot == 1, &candidate.offer.public_key).await
+    }
+
+    async fn discard_rejected_candidate(&self, store: &mut Store, tunnel: &WireguardTunnelInfo, candidate: &Link) -> Result<(), String> {
+        store.records.get_mut(&tunnel.tunnel_id).unwrap().rejected_candidate = true;
+        let protection = self.memory.protect_rejected_refresh_port(tunnel.tunnel_id, candidate.port).await;
+        store.save(&self.config.data_dir)?;
+        protection?;
+        self.cleanup_candidate(tunnel, candidate).await?;
+        self.publish_rejected_candidate(store, tunnel.tunnel_id).await
+    }
+
+    async fn publish_rejected_candidate(&self, store: &mut Store, id: i32) -> Result<(), String> {
+        let next_attempt = now()?.saturating_add(300);
+        let record = store.records.get_mut(&id).unwrap();
+        let previous = record.clone();
+        record.candidate = None;
+        record.rejected_candidate = false;
+        record.next_attempt = next_attempt;
+        if let Err(error) = store.save(&self.config.data_dir) {
+            *store.records.get_mut(&id).unwrap() = previous;
+            return Err(error);
+        }
+        self.memory.release_refresh_port(id).await;
+        Ok(())
+    }
+
     pub(super) async fn reconcile_refresh(&self, config: &mut ServerConfig, snapshot: &TopologySnapshot) -> Result<(), String> {
         let required = FeatureSupport { wireguard: true, refresh_dual_link: true, ..Default::default() };
         if !self.feature_support().supports(required) || !self.server_features.read().unwrap().is_some_and(|f| f.supports(required)) { return Ok(()); }
@@ -287,6 +348,15 @@ impl Daemon {
             let pending = tunnel.refresh.pending.as_ref();
             if store.records.get(&id).and_then(|record| record.active.as_ref()).is_some_and(|active| active.generation != tunnel.refresh.active_generation) { continue; }
             let record = store.records.entry(id).or_default();
+            if record.rejected_candidate {
+                let candidate = record.candidate.clone().ok_or("rejected refresh candidate missing")?;
+                if pending.is_some() || tunnel.refresh.active_generation == candidate.generation {
+                    return Err(format!("rejected refresh candidate for tunnel {id} is still referenced by controller"));
+                }
+                self.discard_rejected_candidate(&mut store, tunnel, &candidate).await?;
+                in_flight = in_flight.saturating_sub(1);
+                continue;
+            }
             if let Some(pending) = pending.filter(|p| p.rolling_back) {
                 self.memory.rollback_refresh(id, snapshot).await?;
                 if !pending.local_rolled_back { self.send_refresh(config, id, pending.generation, RefreshStage::RolledBack, None).await?; }
@@ -294,13 +364,17 @@ impl Daemon {
             }
             if record.candidate.as_ref().is_some_and(|candidate| stale_candidate(candidate.generation, pending.map(|p| p.generation), tunnel.refresh.next_generation)) {
                 let stale = record.candidate.as_ref().unwrap().clone();
-                self.memory.abort_refresh(id).await?;
-                let flags = stale.flags.ok_or("candidate WireGuard naming flags missing; refusing unverified cleanup")?;
-                self.memory.cleanup_inactive_slot(&flags.apply(tunnel), stale.slot == 1, &stale.offer.public_key).await?;
+                self.cleanup_candidate(tunnel, &stale).await?;
+                let next_attempt = now()?.saturating_add(REFRESH_INTERVAL);
+                let previous = record.clone();
                 record.candidate = None;
-                record.next_attempt = now()?.saturating_add(REFRESH_INTERVAL);
+                record.next_attempt = next_attempt;
+                if let Err(error) = store.save(&self.config.data_dir) {
+                    *store.records.get_mut(&id).unwrap() = previous;
+                    return Err(error);
+                }
+                self.memory.release_refresh_port(id).await;
                 in_flight = in_flight.saturating_sub(1);
-                store.save(&self.config.data_dir)?;
             }
             let record = store.records.get_mut(&id).unwrap();
             if pending.is_none() && record.next_attempt == 0 {
@@ -357,11 +431,7 @@ impl Daemon {
             if pending.and_then(|p| p.local_offer.as_ref()).is_none() {
                 if let Err(error) = self.send_refresh(config, id, generation, RefreshStage::Offer, Some(candidate.offer.clone())).await {
                     if discard_rejected_offer(&error, pending.is_some()) {
-                        self.memory.abort_refresh(id).await?;
-                        let record = store.records.get_mut(&id).unwrap();
-                        record.candidate = None;
-                        record.next_attempt = now()?.saturating_add(300);
-                        store.save(&self.config.data_dir)?;
+                        self.discard_rejected_candidate(&mut store, tunnel, &candidate).await?;
                     }
                     return Err(error.into());
                 }
@@ -443,6 +513,184 @@ mod tests {
         assert_eq!(restored.records[&1].previous.as_ref().unwrap().private_key, old.to_base64());
         assert_eq!(restored.records[&1].active.as_ref().unwrap().private_key, new.to_base64());
     }
+    #[tokio::test]
+    async fn unbound_refresh_records_are_not_adopted_during_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = Key::generate_private();
+        let mut store = Store::default();
+        store.records.insert(1, Record { active: Some(Link {
+            generation: 1, slot: 1, private_key: key.to_base64(), port: 12345, created_at: 1,
+            previous_flags: None, flags: None, previous_public_key: Key::generate_private().get_public().to_base64(),
+            offer: RefreshOffer { endpoint: "127.0.0.1:12345".into(), public_key: key.get_public().to_base64() },
+        }), ..Default::default() });
+        store.save(dir.path()).unwrap();
+        let original = fs::read(dir.path().join(FILE)).unwrap();
+        let daemon = Daemon::new(crate::config::ClientConfig {
+            data_dir: dir.path().to_owned(), daemon_socket: dir.path().join("daemon.sock"), ..Default::default()
+        }).await.unwrap();
+        let mut config = ServerConfig::new(String::new(), String::new());
+        config.control_node_id = Some(7);
+        config.controller_peer_id = Some("controller".into());
+        config.controller_signing_key = Some("signing".into());
+        config.controller_encryption_key = Some("encryption".into());
+        *daemon.server_config.lock().await = Some(config);
+        let snapshot = TopologySnapshot { node_id: 7, revision: 1, tunnels: vec![], l2tp_tunnels: vec![], l2tp_v2_tunnels: vec![], l2tp_availability: None };
+        assert!(daemon.restore_refresh_active(&snapshot).await.is_err());
+        assert!(daemon.refresh_state.lock().await.node_id.is_none());
+        assert_eq!(fs::read(dir.path().join(FILE)).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn mismatched_promoted_slot_does_not_destroy_candidate() {
+        use cat4igp_shared::custom_type::WireguardAnswered;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(crate::config::ClientConfig {
+            data_dir: dir.path().to_owned(), daemon_socket: dir.path().join("daemon.sock"), ..Default::default()
+        }).await.unwrap();
+        let mut config = ServerConfig::new(String::new(), String::new());
+        config.control_node_id = Some(7);
+        config.controller_peer_id = Some("controller".into());
+        config.controller_signing_key = Some("signing".into());
+        config.controller_encryption_key = Some("encryption".into());
+        *daemon.server_config.lock().await = Some(config.clone());
+        let link = |generation, slot, port| {
+            let key = Key::generate_private();
+            Link { generation, slot, port, private_key: key.to_base64(), created_at: 1,
+                previous_flags: None, flags: None, previous_public_key: Key::generate_private().get_public().to_base64(),
+                offer: RefreshOffer { endpoint: format!("127.0.0.1:{port}"), public_key: key.get_public().to_base64() } }
+        };
+        {
+            let mut store = daemon.refresh_state.lock().await;
+            store.bind(&config).unwrap();
+            store.records.insert(1, Record { active: Some(link(1, 1, 10001)), candidate: Some(link(2, 0, 10002)), ..Default::default() });
+            store.save(dir.path()).unwrap();
+        }
+        let snapshot = TopologySnapshot {
+            node_id: 7, revision: 1,
+            tunnels: vec![WireguardTunnelInfo {
+                tunnel_id: 1, peer_node_id: 2, public_key: String::new(), preferred_port: 0, remote_endpoint: None,
+                local_answered: WireguardAnswered::Answered, remote_response: WireguardAnswered::Answered,
+                mtu: 1420, endpoint_ipv6: false, fec: false, faketcp: false, created_at: 0, updated_at: 0,
+                refresh_mode: Default::default(), refresh: cat4igp_shared::control::RefreshState {
+                    active_generation: 2, active_slot: 1, ..Default::default()
+                },
+            }],
+            l2tp_tunnels: vec![], l2tp_v2_tunnels: vec![], l2tp_availability: None,
+        };
+        assert!(daemon.restore_refresh_active(&snapshot).await.is_err());
+        let store = Store::load(dir.path()).unwrap();
+        let record = &store.records[&1];
+        assert_eq!(record.active.as_ref().unwrap().generation, 1);
+        assert_eq!(record.candidate.as_ref().unwrap().generation, 2);
+        assert!(record.previous.is_none());
+    }
+    #[tokio::test]
+    async fn rejected_candidate_after_restart_requires_verified_cleanup() {
+        use cat4igp_shared::custom_type::WireguardAnswered;
+        let dir = tempfile::tempdir().unwrap();
+        let client = crate::config::ClientConfig {
+            data_dir: dir.path().to_owned(), daemon_socket: dir.path().join("daemon.sock"), ..Default::default()
+        };
+        let daemon = Daemon::new(client.clone()).await.unwrap();
+        let port = daemon.memory.reserve_refresh_port(1, None).await.unwrap();
+        let key = Key::generate_private();
+        let candidate = Link { generation: 1, slot: 1, private_key: key.to_base64(), port, created_at: 1,
+            previous_flags: None, flags: None, previous_public_key: key.get_public().to_base64(),
+            offer: RefreshOffer { endpoint: format!("127.0.0.1:{port}"), public_key: key.get_public().to_base64() } };
+        {
+            let mut store = daemon.refresh_state.lock().await;
+            store.records.insert(1, Record { candidate: Some(candidate.clone()), ..Default::default() });
+            store.save(dir.path()).unwrap();
+        }
+        drop(daemon);
+        let daemon = Daemon::new(client.clone()).await.unwrap();
+        let tunnel = WireguardTunnelInfo {
+            tunnel_id: 1, peer_node_id: 2, public_key: String::new(), preferred_port: 0, remote_endpoint: None,
+            local_answered: WireguardAnswered::Answered, remote_response: WireguardAnswered::Answered,
+            mtu: 1420, endpoint_ipv6: false, fec: false, faketcp: false, created_at: 0, updated_at: 0,
+            refresh_mode: Default::default(), refresh: Default::default(),
+        };
+        let mut store = daemon.refresh_state.lock().await;
+        for _ in 0..2 {
+            assert!(daemon.discard_rejected_candidate(&mut store, &tunnel, &candidate).await.unwrap_err().contains("naming flags missing"));
+            assert!(store.records[&1].candidate.is_some());
+            assert!(store.records[&1].rejected_candidate);
+            assert!(Store::load(dir.path()).unwrap().records[&1].candidate.is_some());
+            assert!(Store::load(dir.path()).unwrap().records[&1].rejected_candidate);
+            assert!(daemon.memory.reserve_refresh_port(2, Some(port)).await.is_err());
+        }
+        drop(store);
+        drop(daemon);
+        let restarted = Daemon::new(client).await.unwrap();
+        assert!(restarted.memory.reserve_refresh_port(2, Some(port)).await.is_err());
+        assert_ne!(restarted.memory.reserve_tunnel_port(2).await.unwrap(), port);
+    }
+    #[tokio::test]
+    async fn rejected_candidate_port_is_reserved_before_marking_can_fail() {
+        use cat4igp_shared::custom_type::WireguardAnswered;
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let client = crate::config::ClientConfig {
+            data_dir: state_dir.clone(), daemon_socket: dir.path().join("daemon.sock"), ..Default::default()
+        };
+        let port = client.port_range.min;
+        let key = Key::generate_private();
+        let candidate = Link { generation: 1, slot: 1, private_key: key.to_base64(), port, created_at: 1,
+            previous_flags: None, flags: None, previous_public_key: key.get_public().to_base64(),
+            offer: RefreshOffer { endpoint: format!("127.0.0.1:{port}"), public_key: key.get_public().to_base64() } };
+        let mut store = Store::default();
+        store.records.insert(1, Record { candidate: Some(candidate.clone()), ..Default::default() });
+        store.save(&state_dir).unwrap();
+        let daemon = Daemon::new(client).await.unwrap();
+        let tunnel = WireguardTunnelInfo {
+            tunnel_id: 1, peer_node_id: 2, public_key: String::new(), preferred_port: 0, remote_endpoint: None,
+            local_answered: WireguardAnswered::Answered, remote_response: WireguardAnswered::Answered,
+            mtu: 1420, endpoint_ipv6: false, fec: false, faketcp: false, created_at: 0, updated_at: 0,
+            refresh_mode: Default::default(), refresh: Default::default(),
+        };
+        fs::rename(&state_dir, dir.path().join("moved")).unwrap();
+        fs::write(&state_dir, b"not a directory").unwrap();
+        let mut store = daemon.refresh_state.lock().await;
+        assert!(daemon.discard_rejected_candidate(&mut store, &tunnel, &candidate).await.is_err());
+        assert!(store.records[&1].rejected_candidate);
+        assert!(daemon.memory.reserve_refresh_port(2, Some(port)).await.is_err());
+        assert_ne!(daemon.memory.reserve_tunnel_port(2).await.unwrap(), port);
+    }
+
+
+    #[tokio::test]
+    async fn rejected_candidate_remains_reserved_until_cleanup_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let daemon = Daemon::new(crate::config::ClientConfig {
+            data_dir: state_dir.clone(), daemon_socket: dir.path().join("daemon.sock"), ..Default::default()
+        }).await.unwrap();
+        let port = daemon.memory.reserve_refresh_port(1, None).await.unwrap();
+        let key = Key::generate_private();
+        let candidate = Link { generation: 1, slot: 1, private_key: key.to_base64(), port, created_at: 1,
+            previous_flags: None, flags: None, previous_public_key: key.get_public().to_base64(),
+            offer: RefreshOffer { endpoint: format!("127.0.0.1:{port}"), public_key: key.get_public().to_base64() } };
+        let mut store = daemon.refresh_state.lock().await;
+        store.records.insert(1, Record { candidate: Some(candidate), ..Default::default() });
+        store.save(&state_dir).unwrap();
+
+        let moved = dir.path().join("moved");
+        fs::rename(&state_dir, &moved).unwrap();
+        fs::write(&state_dir, b"not a directory").unwrap();
+        assert!(daemon.publish_rejected_candidate(&mut store, 1).await.is_err());
+        assert!(store.records[&1].candidate.is_some());
+        assert!(Store::load(&moved).unwrap().records[&1].candidate.is_some());
+        assert!(daemon.memory.reserve_refresh_port(2, Some(port)).await.is_err());
+
+        fs::remove_file(&state_dir).unwrap();
+        fs::rename(&moved, &state_dir).unwrap();
+        daemon.publish_rejected_candidate(&mut store, 1).await.unwrap();
+        assert!(Store::load(&state_dir).unwrap().records[&1].candidate.is_none());
+        assert_eq!(daemon.memory.reserve_refresh_port(2, Some(port)).await.unwrap(), port);
+    }
+
     #[test]
     fn stale_and_rejected_offers_do_not_block_future_generations() {
         assert!(stale_candidate(4, None, 5));

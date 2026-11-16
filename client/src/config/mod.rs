@@ -7,7 +7,7 @@ pub mod server;
 pub use server::ServerConfig;
 
 /// Configuration for the client daemon
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ClientConfig {
     /// Path to the daemon socket file to listen on
     pub daemon_socket: PathBuf,
@@ -37,13 +37,6 @@ pub struct ClientConfig {
     #[serde(default, deserialize_with = "optional_hostname")]
     pub public_hostname_ipv6: Option<String>,
 
-    /// Additional controller multiaddresses used if the enrollment address is unavailable.
-    #[serde(default)]
-    pub control_bootstrap_addresses: Vec<String>,
-
-    /// libp2p PSK key-file content for the private control network.
-    pub control_private_network_key: Option<String>,
-
     /// Private control network identifier shared with the controller.
     #[serde(default = "default_control_network_id")]
     pub control_network_id: String,
@@ -51,6 +44,54 @@ pub struct ClientConfig {
     /// Optional fixed-destination control traffic relay.
     #[serde(default)]
     pub control_relay: Option<ControlRelay>,
+}
+
+#[derive(Deserialize)]
+struct ClientConfigInput {
+    daemon_socket: PathBuf,
+    data_dir: PathBuf,
+    port_range: PortRange,
+    tunnel_protocols: TunnelProtocols,
+    #[serde(default)]
+    allow_insecure_l2tp: bool,
+    #[serde(default)]
+    l2tp_v2_userspace: bool,
+    #[serde(default, deserialize_with = "optional_hostname")]
+    public_hostname_ipv4: Option<String>,
+    #[serde(default, deserialize_with = "optional_hostname")]
+    public_hostname_ipv6: Option<String>,
+    #[serde(default = "default_control_network_id")]
+    control_network_id: String,
+    #[serde(default)]
+    control_relay: Option<ControlRelay>,
+    #[serde(default, rename = "control_bootstrap_addresses", deserialize_with = "reject_legacy_control_config")]
+    _control_bootstrap_addresses: (),
+    #[serde(default, rename = "control_private_network_key", deserialize_with = "reject_legacy_control_config")]
+    _control_private_network_key: (),
+}
+
+fn reject_legacy_control_config<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom(
+        "legacy control bootstrap addresses or private network key found in client config; preserve server.json and verify its enrollment state before removing these fields, or enroll with a trusted bundle",
+    ))
+}
+
+impl<'de> Deserialize<'de> for ClientConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let input = ClientConfigInput::deserialize(deserializer)?;
+        Ok(Self {
+            daemon_socket: input.daemon_socket,
+            data_dir: input.data_dir,
+            port_range: input.port_range,
+            tunnel_protocols: input.tunnel_protocols,
+            allow_insecure_l2tp: input.allow_insecure_l2tp,
+            l2tp_v2_userspace: input.l2tp_v2_userspace,
+            public_hostname_ipv4: input.public_hostname_ipv4,
+            public_hostname_ipv6: input.public_hostname_ipv6,
+            control_network_id: input.control_network_id,
+            control_relay: input.control_relay,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,7 +135,7 @@ pub struct TunnelProtocols {
 impl Default for ClientConfig {
     fn default() -> Self {
         ClientConfig {
-            daemon_socket: PathBuf::from("/tmp/cat4igp-client.sock"),
+            daemon_socket: PathBuf::from("/run/cat4igp-client.sock"),
             data_dir: PathBuf::from("/var/lib/cat4igp-client"),
             port_range: PortRange {
                 min: 51820,
@@ -108,8 +149,6 @@ impl Default for ClientConfig {
             l2tp_v2_userspace: false,
             public_hostname_ipv4: None,
             public_hostname_ipv6: None,
-            control_bootstrap_addresses: Vec::new(),
-            control_private_network_key: None,
             control_relay: None,
             control_network_id: default_control_network_id(),
         }
@@ -131,7 +170,11 @@ impl ClientConfig {
     /// Load configuration from a TOML file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let content = fs::read_to_string(path)?;
-        let config: ClientConfig = toml::from_str(&content)?;
+        let value: toml::Value = toml::from_str(&content).map_err(|_| "invalid client configuration TOML")?;
+        if value.get("control_bootstrap_addresses").is_some() || value.get("control_private_network_key").is_some() {
+            return Err("legacy control bootstrap addresses or private network key found in client config; preserve server.json and verify its enrollment state before removing these fields, or enroll with a trusted bundle".into());
+        }
+        let config: ClientConfig = toml::from_str(&content).map_err(|_| "invalid client configuration TOML or unrecognized identity/registration field; preserve server.json and migrate manually")?;
         Ok(config)
     }
 

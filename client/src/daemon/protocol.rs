@@ -5,20 +5,10 @@ use std::io;
 use std::path::Path;
 
 /// Request sent from CLI to daemon
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum DaemonRequest {
     /// Get daemon status
     Status,
-    /// Set server configuration
-    SetServer {
-        address: String,
-        invite_code: String,
-    },
-    /// Register with server and store node key
-    Register {
-        address: String,
-        invite_code: String,
-    },
     /// Trusted operator bundle; never include contents in diagnostics.
     RegisterBundle { bundle: String },
     /// Restart the daemon
@@ -46,6 +36,9 @@ pub enum DaemonResponse {
         running: bool,
         server_configured: bool,
         node_key_present: bool,
+        /// Seconds since the last verified, non-rollback controller snapshot pull.
+        #[serde(default)]
+        controller_snapshot_age_seconds: Option<u64>,
         message: Option<String>,
     },
     /// Server configuration details

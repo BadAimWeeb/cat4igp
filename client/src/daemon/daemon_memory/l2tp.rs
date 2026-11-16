@@ -105,6 +105,12 @@ pub(super) struct ActiveL2tp {
     cleanup_pending: bool,
 }
 
+impl ActiveL2tp {
+    pub(super) fn invalidate_underlay(&mut self, wireguard_id: i32) {
+        if self.info.wireguard_tunnel_id == Some(wireguard_id) { self.cleanup_pending = true; }
+    }
+}
+
 fn cookie(value: &str) -> Result<[u8; 8], String> {
     if value.len() != 16 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         return Err("invalid L2TP cookie".into());
@@ -117,11 +123,16 @@ fn cookie(value: &str) -> Result<[u8; 8], String> {
 }
 
 impl DaemonMemory {
+    #[cfg(test)]
     pub(super) async fn invalidate_l2tp_underlay(&self, wireguard_id: i32) {
         for tunnel in self.l2tp.lock().await.values_mut() {
-            if tunnel.info.wireguard_tunnel_id == Some(wireguard_id) { tunnel.cleanup_pending = true; }
+            tunnel.invalidate_underlay(wireguard_id);
         }
     }
+    pub(super) async fn l2tp_cleanup_pending_underlays(&self) -> HashSet<i32> {
+        self.l2tp.lock().await.values().filter(|t| t.cleanup_pending).filter_map(|t| t.info.wireguard_tunnel_id).collect()
+    }
+
 
     pub(super) async fn remove_stale_l2tp(&self, snapshot: &TopologySnapshot) -> Result<(), String> {
         let mut active = self.l2tp.lock().await;
@@ -137,7 +148,10 @@ impl DaemonMemory {
             let outer_conflict = existing.underlay.is_some() && existing.info.remote_endpoint.parse::<IpAddr>().ok().is_some_and(|ip| snapshot.tunnels.iter().filter_map(|t| t.remote_endpoint.as_deref()).filter_map(|s| s.parse::<SocketAddr>().ok()).any(|endpoint| endpoint.ip() == ip));
             (!desired.contains(id) || new != Some(&existing.info) || dependency_changed || outer_conflict || existing.cleanup_pending).then_some(*id)
         }).collect();
+        let mut errors = Vec::new();
         for id in stale {
+            active.get_mut(&id).unwrap().cleanup_pending = true;
+            let result: Result<(), String> = async {
             active.get_mut(&id).unwrap().tunnel.destroy().await.map_err(|e| format!("failed to destroy L2TP {id}: {e}"))?;
             let existing = active.get(&id).unwrap();
             if let Some(interface) = existing.underlay.clone() {
@@ -159,13 +173,23 @@ impl DaemonMemory {
                 }
             }
             active.remove(&id);
+            Ok(())
+            }.await;
+            if let Err(error) = result { errors.push(format!("L2TP {id}: {error}")); }
         }
-        Ok(())
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
     }
 
     pub(super) async fn reconcile_l2tp(&self, snapshot: &TopologySnapshot) -> Result<(), String> {
+        self.reconcile_l2tp_excluding(snapshot, &HashSet::new()).await
+    }
+
+    pub(super) async fn reconcile_l2tp_excluding(&self, snapshot: &TopologySnapshot, excluded: &HashSet<i32>) -> Result<(), String> {
         let mut active = self.l2tp.lock().await;
+        let mut errors = Vec::new();
         for info in &snapshot.l2tp_tunnels {
+            if info.wireguard_tunnel_id.is_some_and(|id| excluded.contains(&id)) { continue; }
+            let result: Result<(), String> = async {
             if !self.l2tp_enabled { return Err("L2TP disabled in client configuration".into()); }
             if info.security_mode == "pure" && !self.allow_insecure_l2tp { return Err("unencrypted L2TP requires allow_insecure_l2tp = true".into()); }
             if (self.l2tp_excluded_ports.0..self.l2tp_excluded_ports.1).contains(&info.local_port) {
@@ -193,9 +217,10 @@ impl DaemonMemory {
                 _ => return Err("invalid L2TP security mode or dependency".into()),
             };
             if let Some(existing) = active.get_mut(&info.tunnel_id) {
+                if existing.cleanup_pending { return Err("L2TP cleanup pending".into()); }
                 if existing.underlay != underlay { return Err("L2TP underlay changed before cleanup".into()); }
                 if !existing.tunnel.is_ift_created() { existing.tunnel.setup().await.map_err(|e| e.to_string())?; }
-                continue;
+                return Ok(());
             }
             let bind_ip = if underlay.is_some() { local_ip } else if local_ip.is_ipv4() { IpAddr::V4(Ipv4Addr::UNSPECIFIED) } else { IpAddr::V6(Ipv6Addr::UNSPECIFIED) };
             let mut tunnel = L2tpTunnel::new(
@@ -211,8 +236,14 @@ impl DaemonMemory {
                 if !addresses.iter().any(|a| a.addr() == local_ip) {
                     add_host_address(interface, local_ip).await?;
                     owned_address = true;
+                } else if !active.values().any(|t| t.owned_address && t.underlay.as_ref() == Some(interface) && t.info.local_endpoint.parse::<IpAddr>().ok() == Some(local_ip)) {
+                    return Err(format!("L2TP local address {local_ip} already exists without in-memory ownership"));
                 }
-                match add_host_route(interface, remote_ip).await {
+                match add_host_route(interface, remote_ip).await.and_then(|owned| {
+                    if !owned && !active.values().any(|t| t.owned_route && t.underlay.as_ref() == Some(interface) && t.info.remote_endpoint.parse::<IpAddr>().ok() == Some(remote_ip)) {
+                        Err(format!("L2TP route to {remote_ip} already exists without in-memory ownership"))
+                    } else { Ok(owned) }
+                }) {
                     Ok(owned) => owned_route = owned,
                     Err(e) => {
                         if owned_address {
@@ -240,8 +271,11 @@ impl DaemonMemory {
             }
             let wg_flags = info.wireguard_tunnel_id.and_then(|id| snapshot.tunnels.iter().find(|t| t.tunnel_id == id)).map(|t| (t.endpoint_ipv6, t.fec));
             active.insert(info.tunnel_id, ActiveL2tp { info: info.clone(), tunnel, underlay, wg_flags, owned_route, owned_address, cleanup_pending: false });
+            Ok(())
+            }.await;
+            if let Err(error) = result { errors.push(format!("L2TP {}: {error}", info.tunnel_id)); }
         }
-        Ok(())
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
     }
 }
 

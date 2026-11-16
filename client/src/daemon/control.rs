@@ -169,7 +169,7 @@ pub fn start(
                         continue;
                     };
                     let bootstraps = config.control_bootstrap_addresses.clone();
-                    // ponytail: serial bounded one-shot RPCs; reuse connected streams when polling load warrants it.
+                    // ponytail: one bounded RPC at a time; reuse connected streams when polling load warrants it.
                     let result = request_to_bootstraps(&mut config, &bootstraps, request).await;
                     let _ = reply.send(result);
                 }
@@ -257,6 +257,9 @@ pub async fn enroll(
     });
     let response = request_to_bootstraps(config, bootstraps, request).await?;
     if let ControlResponse::Enrolled(enrollment) = &response {
+        if enrollment.node_id <= 0 || enrollment.topology_revision < 0 || enrollment.network_id.is_empty() {
+            return Err("invalid controller enrollment identity".into());
+        }
         if config.controller_signing_key.as_ref().is_some_and(|pin| {
             hex_decode(pin).ok() != hex_decode(&enrollment.controller_signing_key).ok()
         }) || (config.controller_signing_key.is_some()
@@ -322,52 +325,32 @@ async fn request_to_bootstraps(
     bootstraps: &[String],
     request: ControlRequest,
 ) -> Result<ControlResponse, String> {
-    let mut errors = Vec::new();
-    // ponytail: at most 16 pinned addresses, ten seconds each; no automatic retry of application rejections.
     if bootstraps.is_empty() || bootstraps.len() > 16 {
         return Err("expected 1..16 private control bootstraps".into());
     }
+    let mut addresses = Vec::with_capacity(bootstraps.len());
+    let mut controller = None;
     for bootstrap in bootstraps {
         let peer = bootstrap_peer_id(bootstrap)?;
-        if config.controller_signing_key.is_some()
-            && !config.control_peer_authorized(peer)
-        {
+        if config.controller_signing_key.is_some() && !config.control_peer_authorized(peer) {
             return Err("private bootstrap does not match pinned controller".into());
         }
-    }
-    for bootstrap in bootstraps {
-        let controller = bootstrap_peer_id(bootstrap)?;
-        if config.controller_signing_key.is_some()
-            && !config.control_peer_authorized(controller)
-        {
-            return Err("private bootstrap does not match pinned controller".into());
+        if controller.is_some_and(|expected| expected != peer) {
+            return Err("all controller bootstrap addresses must use the same peer id".into());
         }
-        let Ok(address) = bootstrap.parse() else {
-            errors.push(format!("{bootstrap}: invalid multiaddress"));
-            continue;
-        };
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            request_to(config, controller, address, request.clone()),
-        )
-        .await
-        {
-            Ok(Ok(response)) => return Ok(response),
-            Ok(Err(error)) if error.starts_with("retryable:") => errors.push(error),
-            Ok(Err(error)) => return Err(error),
-            Err(_) => errors.push(format!("{bootstrap}: timed out")),
-        }
+        controller = Some(peer);
+        addresses.push(bootstrap.parse().map_err(|_| "invalid controller bootstrap address")?);
     }
-    Err(format!(
-        "all controller bootstrap addresses failed: {}",
-        errors.join("; ")
-    ))
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        request_to(config, controller.unwrap(), addresses, request),
+    ).await.map_err(|_| "controller request timed out".to_string())?
 }
 
 async fn request_to(
     config: &mut crate::config::ServerConfig,
     controller: libp2p::PeerId,
-    address: libp2p::Multiaddr,
+    addresses: Vec<libp2p::Multiaddr>,
     request: ControlRequest,
 ) -> Result<ControlResponse, String> {
     let keypair = config
@@ -400,7 +383,10 @@ async fn request_to(
         keypair.public().to_peer_id(),
         SwarmConfig::with_tokio_executor(),
     );
-    swarm.dial(address).map_err(|error| error.to_string())?;
+    swarm.dial(libp2p::swarm::dial_opts::DialOpts::peer_id(controller)
+        .override_dial_concurrency_factor(std::num::NonZeroU8::new(16).unwrap())
+        .addresses(addresses)
+        .build()).map_err(|error| error.to_string())?;
     let mut pending = None;
     loop {
         match swarm.select_next_some().await {
@@ -446,15 +432,7 @@ async fn request_to(
                 error,
                 ..
             } if peer == controller => {
-                // Authentication/protocol failures are terminal; only refused TCP dials may advance.
-                let text = error.to_string();
-                return Err(
-                    if text.contains("Connection refused") || text.contains("ConnectionRefused") {
-                        format!("retryable: {text}")
-                    } else {
-                        format!("controller connection failed: {text}")
-                    },
-                );
+                return Err(format!("controller connection failed: {error}"));
             }
             _ => {}
         }

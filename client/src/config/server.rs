@@ -79,6 +79,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub topology_revision: i64,
 
+    /// A revision journal was installed before this enrollment was committed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub revision_journal: bool,
+
     /// Controller-assigned recipient identifier for topology PubSub.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_node_id: Option<i32>,
@@ -173,6 +177,7 @@ impl ServerConfig {
             controller_encryption_key: None,
             control_bootstrap_addresses: Vec::new(),
             control_private_network_key: None,
+            revision_journal: false,
             topology_revision: 0,
             control_node_id: None,
             control_network_id: default_control_network_id(),

@@ -19,6 +19,28 @@ async fn direct_policy_and_port_collision_fail_closed() {
     snapshot.l2tp_tunnels[0].local_port = 0;
     assert!(memory.reconcile_l2tp(&snapshot).await.is_err());
 }
+#[tokio::test]
+async fn reconciliation_reports_each_independent_failure() {
+    let mut config = crate::config::ClientConfig::default();
+    config.tunnel_protocols.l2tp = true;
+    config.allow_insecure_l2tp = true;
+    let info = cat4igp_shared::control::L2tpTunnelInfo {
+        tunnel_id: 1, peer_node_id: 2, local_endpoint: "bad".into(), remote_endpoint: "192.0.2.2".into(), local_port: 1701, remote_port: 1701,
+        local_session_id: 1, remote_session_id: 2, local_cookie: "0101010101010101".into(), remote_cookie: "0202020202020202".into(), security_mode: "pure".into(), wireguard_tunnel_id: None, mtu: 1500,
+    };
+    let mut second = info.clone();
+    second.tunnel_id = 2;
+    let snapshot = TopologySnapshot { node_id: 1, revision: 1, tunnels: vec![], l2tp_v2_tunnels: vec![], l2tp_availability: None, l2tp_tunnels: vec![info, second] };
+    let error = DaemonMemory::new(config).reconcile_l2tp(&snapshot).await.unwrap_err();
+    assert!(error.contains("L2TP 1:") && error.contains("L2TP 2:"));
+    let mut excluded_snapshot = snapshot;
+    excluded_snapshot.l2tp_tunnels[0].wireguard_tunnel_id = Some(10);
+    let error = DaemonMemory::new({ let mut c = crate::config::ClientConfig::default(); c.tunnel_protocols.l2tp = true; c.allow_insecure_l2tp = true; c })
+        .reconcile_l2tp_excluding(&excluded_snapshot, &HashSet::from([10])).await.unwrap_err();
+    assert!(!error.contains("L2TP 1:") && error.contains("L2TP 2:"));
+}
+
+
 
 #[tokio::test]
 #[ignore = "requires an isolated user/network namespace with CAP_NET_ADMIN"]
@@ -32,7 +54,7 @@ async fn reconcile_wireguard_resources_are_shared_and_cleaned() {
     DeviceUpdate::new().set_private_key(private).add_peer(PeerConfigBuilder::new(&peer_key).add_allowed_ip("0.0.0.0".parse().unwrap(), 0).add_allowed_ip("::".parse().unwrap(), 0).set_endpoint("127.0.0.1:41000".parse().unwrap())).apply(&"wgtest".parse::<InterfaceName>().unwrap(), Backend::Kernel).unwrap();
     let mut config = crate::config::ClientConfig::default();
     config.tunnel_protocols.l2tp = true;
-    let memory = DaemonMemory::new(config);
+    let memory = DaemonMemory::new(config.clone());
     let os = crate::tunnel::wireguard::WireGuardTunnel::new("wgtest".into(), String::new(), String::new(), None, None);
     let wg = super::super::wireguard::WireguardTunnelC::new(10, 2, false, 1420, os, None);
     memory.wireguard.lock().await.insert(10, wg);
@@ -52,6 +74,40 @@ async fn reconcile_wireguard_resources_are_shared_and_cleaned() {
     let peer: std::net::IpAddr = remote.parse().unwrap();
     assert!(crate::interface::get_addr("wgtest".into()).await.unwrap().iter().any(|a| a.addr() == ip));
     assert!(!add_host_route("wgtest", peer).await.unwrap());
+    // A fresh daemon cannot infer ownership from a matching address or route.
+    let restarted = DaemonMemory::new(config.clone());
+    let os = crate::tunnel::wireguard::WireGuardTunnel::new("wgtest".into(), String::new(), String::new(), None, None);
+    restarted.wireguard.lock().await.insert(10, super::super::wireguard::WireguardTunnelC::new(10, 2, false, 1420, os, None));
+    let mut stale = snapshot.clone();
+    stale.l2tp_tunnels.truncate(1);
+    assert!(restarted.reconcile_l2tp(&stale).await.unwrap_err().contains("without in-memory ownership"));
+    stale.l2tp_tunnels[0].local_endpoint = if ip.is_ipv4() { "10.253.2.3" } else { "fd00:253:2::3" }.into();
+    let new_ip: std::net::IpAddr = stale.l2tp_tunnels[0].local_endpoint.parse().unwrap();
+    assert!(restarted.reconcile_l2tp(&stale).await.unwrap_err().contains("without in-memory ownership"));
+    assert!(!crate::interface::get_addr("wgtest".into()).await.unwrap().iter().any(|a| a.addr() == new_ip));
+    assert!(crate::interface::get_addr("wgtest".into()).await.unwrap().iter().any(|a| a.addr() == ip));
+    assert!(!add_host_route("wgtest", peer).await.unwrap());
+    let recovery_started = std::time::Instant::now();
+    memory.invalidate_l2tp_underlay(10).await;
+    assert_eq!(memory.l2tp_cleanup_pending_underlays().await, HashSet::from([10]));
+    memory.remove_stale_l2tp(&snapshot).await.unwrap();
+    assert!(memory.l2tp.lock().await.is_empty());
+    assert!(memory.l2tp_cleanup_pending_underlays().await.is_empty());
+    // Observe dependent teardown before any underlay deletion: the kernel
+    // WireGuard device must still exist after both dependent TAPs are gone.
+    for name in ["catl14", "catl15"] {
+        let name = std::ffi::CString::new(name).unwrap();
+        assert_eq!(unsafe { libc::if_nametoindex(name.as_ptr()) }, 0);
+    }
+    let underlay = std::ffi::CString::new("wgtest").unwrap();
+    assert_ne!(unsafe { libc::if_nametoindex(underlay.as_ptr()) }, 0);
+    assert!(!crate::interface::get_addr("wgtest".into()).await.unwrap().iter().any(|a| a.addr() == ip));
+    memory.reconcile_l2tp(&snapshot).await.unwrap();
+    assert!(memory.l2tp.lock().await.get(&20).unwrap().tunnel.is_ift_created());
+    assert!(memory.l2tp.lock().await.get(&21).unwrap().tunnel.is_ift_created());
+    assert!(crate::interface::get_addr("wgtest".into()).await.unwrap().iter().any(|a| a.addr() == ip));
+    assert!(recovery_started.elapsed() < Duration::from_secs(5), "reference dependent teardown/recreation exceeded five seconds");
+    println!("L2TP dependent teardown/recreation elapsed_ms={}", recovery_started.elapsed().as_millis());
     snapshot.l2tp_tunnels.remove(0);
     memory.remove_stale_l2tp(&snapshot).await.unwrap();
     assert!(crate::interface::get_addr("wgtest".into()).await.unwrap().iter().any(|a| a.addr() == ip));

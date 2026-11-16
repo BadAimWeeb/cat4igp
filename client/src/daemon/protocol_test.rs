@@ -18,20 +18,28 @@ fn test_verify_secret() {
 
 #[test]
 fn test_daemon_request_serialization() {
-    let req = DaemonRequest::SetServer {
-        address: "https://example.com".to_string(),
-        invite_code: "abc123".to_string(),
-    };
+    let req = DaemonRequest::RegisterBundle { bundle: "sensitive-bundle".into() };
     let json = serde_json::to_string(&req).unwrap();
     let deserialized: DaemonRequest = serde_json::from_str(&json).unwrap();
     match deserialized {
-        DaemonRequest::SetServer {
-            address,
-            invite_code,
-        } => {
-            assert_eq!(address, "https://example.com");
-            assert_eq!(invite_code, "abc123");
-        }
+        DaemonRequest::RegisterBundle { bundle } => assert_eq!(bundle, "sensitive-bundle"),
         _ => panic!("Wrong request type"),
     }
+    assert!(serde_json::from_str::<DaemonRequest>(r#"{"SetServer":{"address":"a","invite_code":"i"}}"#).is_err());
+    assert!(serde_json::from_str::<DaemonRequest>(r#"{"Register":{"address":"a","invite_code":"i"}}"#).is_err());
+}
+
+#[test]
+fn status_age_round_trips_and_old_daemons_are_unknown() {
+    let response = DaemonResponse::Status {
+        running: true,
+        server_configured: true,
+        node_key_present: true,
+        controller_snapshot_age_seconds: Some(42),
+        message: None,
+    };
+    let encoded = serde_json::to_string(&response).unwrap();
+    assert!(matches!(serde_json::from_str::<DaemonResponse>(&encoded).unwrap(), DaemonResponse::Status { controller_snapshot_age_seconds: Some(42), .. }));
+    let old = r#"{"Status":{"running":true,"server_configured":true,"node_key_present":true,"message":null}}"#;
+    assert!(matches!(serde_json::from_str::<DaemonResponse>(old).unwrap(), DaemonResponse::Status { controller_snapshot_age_seconds: None, .. }));
 }

@@ -38,6 +38,7 @@ pub struct Daemon {
     control_sync: Arc<Mutex<()>>,
     control_plane: Arc<std::sync::Mutex<Option<control::ControlPlane>>>,
     refresh_state: Arc<Mutex<refresh::Store>>,
+    last_controller_snapshot: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     server_features: Arc<std::sync::RwLock<Option<cat4igp_shared::control::FeatureSupport>>>,
     tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
     stopping: Arc<tokio::sync::Notify>,
@@ -146,7 +147,7 @@ impl Daemon {
         let refresh_state = refresh::Store::load(&config.data_dir)?;
         let cfg_clone = config.clone();
 
-        Ok(Daemon {
+        let daemon = Daemon {
             hostnames: Arc::new(Mutex::new((
                 config.public_hostname_ipv4.clone(),
                 config.public_hostname_ipv6.clone(),
@@ -158,12 +159,15 @@ impl Daemon {
             memory: Arc::new(daemon_memory::DaemonMemory::new(cfg_clone)),
             control_sync: Arc::new(Mutex::new(())),
             control_plane: Arc::new(std::sync::Mutex::new(None)),
+            last_controller_snapshot: Arc::new(std::sync::Mutex::new(None)),
             refresh_state: Arc::new(Mutex::new(refresh_state)),
             server_features: Arc::new(std::sync::RwLock::new(None)),
             tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             stopping: Arc::new(tokio::sync::Notify::new()),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        })
+        };
+        daemon.restore_rejected_candidate_ports().await.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(daemon)
     }
 
     /// Handle a request from the CLI
@@ -175,14 +179,6 @@ impl Daemon {
 
         match req {
             DaemonRequest::Status => self.handle_status().await,
-            DaemonRequest::SetServer {
-                address,
-                invite_code,
-            } => self.handle_set_server(address, invite_code).await,
-            DaemonRequest::Register {
-                address,
-                invite_code,
-            } => self.handle_register(address, invite_code).await,
             DaemonRequest::RegisterBundle { bundle } => match ServerConfig::from_bundle(&bundle) {
                 Ok(config) => self.register_config(config).await,
                 Err(error) => DaemonResponse::Error(error),
@@ -215,84 +211,11 @@ impl Daemon {
             running: true,
             server_configured,
             node_key_present,
+            controller_snapshot_age_seconds: self.last_controller_snapshot.lock().unwrap().map(|at| at.elapsed().as_secs()),
             message: poll_error,
         }
     }
 
-    async fn handle_set_server(&self, address: String, invite_code: String) -> DaemonResponse {
-        let _registration = self.control_sync.lock().await;
-        let mut server_config = self.server_config.lock().await;
-        if server_config.is_some() {
-            return DaemonResponse::Error(
-                "Server already configured; refusing to overwrite enrollment".into(),
-            );
-        }
-        let mut config = ServerConfig {
-            address: address.clone(),
-            invite_code,
-            enrollment_bootstrap_addresses: Vec::new(),
-            enrollment_node_name: None,
-            wg_private_key: None,
-            wg_public_key: None,
-            control_private_key: None,
-            control_encryption_private_key: None,
-            controller_peer_id: None,
-            controller_signing_key: None,
-            controller_encryption_key: None,
-            control_bootstrap_addresses: Vec::new(),
-            control_private_network_key: self.config.control_private_network_key.clone(),
-            topology_revision: 0,
-            control_node_id: None,
-            control_network_id: self.config.control_network_id.clone(),
-        };
-
-        if let Err(e) = config.ensure_wireguard_keypair() {
-            return DaemonResponse::Error(format!("Failed to generate WireGuard keypair: {}", e));
-        }
-        if let Err(e) = config.ensure_control_keypair() {
-            return DaemonResponse::Error(format!("Failed to generate control identity: {}", e));
-        }
-        if let Err(e) = config.ensure_control_encryption_key() {
-            return DaemonResponse::Error(format!(
-                "Failed to generate control encryption identity: {}",
-                e
-            ));
-        }
-
-        if let Err(e) = config.save(&self.config.data_dir) {
-            return DaemonResponse::Error(format!("Failed to save server config: {}", e));
-        }
-
-        *server_config = Some(config);
-        DaemonResponse::Ok(Some("Server configuration set".to_string()))
-    }
-
-    async fn handle_register(&self, address: String, invite_code: String) -> DaemonResponse {
-        let mut config = ServerConfig {
-            address: address.clone(),
-            invite_code,
-            enrollment_bootstrap_addresses: Vec::new(),
-            enrollment_node_name: None,
-            wg_private_key: None,
-            wg_public_key: None,
-            control_private_key: None,
-            control_encryption_private_key: None,
-            controller_peer_id: None,
-            controller_signing_key: None,
-            controller_encryption_key: None,
-            control_bootstrap_addresses: Vec::new(),
-            control_private_network_key: self.config.control_private_network_key.clone(),
-            topology_revision: 0,
-            control_node_id: None,
-            control_network_id: self.config.control_network_id.clone(),
-        };
-
-        config.control_bootstrap_addresses = self.config.control_bootstrap_addresses.clone();
-        if !config.control_bootstrap_addresses.contains(&address) {
-            config.control_bootstrap_addresses.insert(0, address);
-        }
-        self.register_config(config).await
-    }
 
     async fn register_config(&self, mut config: ServerConfig) -> DaemonResponse {
         let _registration = self.control_sync.lock().await;
@@ -313,15 +236,27 @@ impl Daemon {
             } else {
                 &pending.enrollment_bootstrap_addresses
             };
+            let seeds_match = if original_seeds.is_empty() {
+                config.control_bootstrap_addresses.contains(&pending.address)
+            } else {
+                original_seeds == &config.control_bootstrap_addresses
+            };
             if (pending.invite_code == config.invite_code || pending.invite_code.is_empty())
-                && original_seeds == &config.control_bootstrap_addresses
-                && pending.controller_signing_key == config.controller_signing_key
+                && seeds_match
+                && pending.controller_signing_key.as_ref().is_none_or(|key| Some(key) == config.controller_signing_key.as_ref())
+                && pending.controller_peer_id.as_ref().is_none_or(|peer| Some(peer) == config.controller_peer_id.as_ref())
                 && pending.control_network_id == config.control_network_id
-                && pending.control_private_network_key == config.control_private_network_key
+                && pending.control_private_network_key.as_ref().is_none_or(|key| Some(key) == config.control_private_network_key.as_ref())
             {
-                let invite_code = config.invite_code;
-                config = pending.clone();
-                config.invite_code = invite_code;
+                let mut merged = pending.clone();
+                merged.invite_code = config.invite_code;
+                merged.controller_peer_id = config.controller_peer_id;
+                merged.controller_signing_key = config.controller_signing_key;
+                merged.control_private_network_key = config.control_private_network_key;
+                if merged.control_bootstrap_addresses.is_empty() {
+                    merged.control_bootstrap_addresses = config.control_bootstrap_addresses;
+                }
+                config = merged;
             } else {
                 return DaemonResponse::Error(
                     "Pending registration differs; refusing to overwrite identity".into(),
@@ -378,6 +313,10 @@ impl Daemon {
             _ => return DaemonResponse::Error("Unexpected enrollment response; pending registration retained".into()),
         }
 
+        if let Err(error) = topology_cache::initialize_journal(&self.config.data_dir, &config) {
+            return DaemonResponse::Error(format!("Failed to initialize revision journal: {error}"));
+        }
+        config.revision_journal = true;
         config.invite_code.clear();
         if let Err(e) = config.save(&self.config.data_dir) {
             return DaemonResponse::Error(format!("Failed to save server config: {}", e));
@@ -480,7 +419,7 @@ impl Daemon {
             original.read_to_string(&mut content)?;
             // Validate the complete file before changing any source spans.
             let disk_config: ClientConfig = toml::from_str(&content)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid client configuration; legacy control fields require manual migration"))?;
             if disk_config.public_hostname_ipv4 != hostnames.0
                 || disk_config.public_hostname_ipv6 != hostnames.1
             {
@@ -587,10 +526,70 @@ impl Daemon {
         self.server_config.lock().await.is_some()
     }
 
+    pub async fn run_until_shutdown(
+        &self,
+        shutdown: impl Future<Output = io::Result<()>>,
+    ) -> io::Result<()> {
+        let running = self.run();
+        tokio::pin!(running);
+        tokio::select! {
+            result = &mut running => result,
+            signal = shutdown => {
+                // notify_one retains a permit if startup has not reached the accept loop.
+                self.stopping.notify_one();
+                running.await?;
+                signal
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn assert_immediate_shutdown_drains_tasks(signal_error: bool) {
+        let directory = tempfile::TempDir::new().unwrap();
+        let config = ClientConfig {
+            daemon_socket: directory.path().join("daemon.sock"),
+            data_dir: directory.path().to_path_buf(),
+            ..Default::default()
+        };
+        let daemon = Self::new(config).await.unwrap();
+        let (dropped, drained) = tokio::sync::oneshot::channel();
+        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) { let _ = self.0.take().unwrap().send(()); }
+        }
+        let guard = OnDrop(Some(dropped));
+        daemon.tasks.lock().unwrap().spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let result = daemon.run_until_shutdown(async {
+            if signal_error { Err(io::Error::other("signal failed")) } else { Ok(()) }
+        }).await;
+        assert_eq!(result.as_ref().err().map(ToString::to_string), signal_error.then(|| "signal failed".to_string()));
+        drained.await.unwrap();
+        assert!(daemon.tasks.lock().unwrap().is_empty());
+        assert!(!daemon.get_socket_path().exists());
+    }
+
+    #[cfg(test)]
+    async fn assert_shutdown_preserves_run_error() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        std::fs::write(&socket, b"unmanaged").unwrap();
+        let daemon = Self::new(ClientConfig {
+            daemon_socket: socket.clone(),
+            data_dir: directory.path().to_path_buf(),
+            ..Default::default()
+        }).await.unwrap();
+        let error = daemon.run_until_shutdown(async { Ok(()) }).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(socket).unwrap(), b"unmanaged");
+    }
+
     /// Start the daemon's Unix socket server
     pub async fn run(&self) -> io::Result<()> {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
         // Create parent directory if it doesn't exist
         if let Some(parent) = self.config.daemon_socket.parent() {
             std::fs::create_dir_all(parent)?;
@@ -637,6 +636,7 @@ impl Daemon {
         let listener = UnixListener::bind(&self.config.daemon_socket)?;
         let metadata = std::fs::symlink_metadata(&self.config.daemon_socket)?;
         guard.socket = Some((metadata.dev(), metadata.ino()));
+        std::fs::set_permissions(&self.config.daemon_socket, std::fs::Permissions::from_mode(0o600))?;
         self.stopped
             .store(false, std::sync::atomic::Ordering::SeqCst);
         println!("✓ Listening on socket: {:?}", self.config.daemon_socket);
@@ -731,6 +731,7 @@ impl Daemon {
             memory: Arc::clone(&self.memory),
             control_sync: Arc::clone(&self.control_sync),
             control_plane: Arc::clone(&self.control_plane),
+            last_controller_snapshot: Arc::clone(&self.last_controller_snapshot),
             server_features: Arc::clone(&self.server_features),
             refresh_state: Arc::clone(&self.refresh_state),
             tasks: Arc::clone(&self.tasks),
@@ -847,7 +848,7 @@ impl Daemon {
         let (snapshot, mut ports) = match topology_cache::load(&self.config.data_dir, &config) {
             Ok(cache) => cache,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(format!("topology cache cannot be restored: {error}; preserve the cache and recover using a trusted revision high-water mark")),
         };
         if snapshot.revision > config.topology_revision {
             config.topology_revision = snapshot.revision;
@@ -864,6 +865,28 @@ impl Daemon {
 
     async fn cache_topology(&self, config: &mut ServerConfig, snapshot: &TopologySnapshot) -> Result<(), String> {
         let mut ports = self.memory.cached_ports().await;
+        // Preserve durable reservations before restoration, but a completed refresh
+        // may replace them once the previous cache is journal-verified.
+        let (cached, committed) = match topology_cache::load(&self.config.data_dir, config) {
+            Ok((_, ports)) => (ports, config.revision_journal),
+            Err(_) => (topology_cache::load_reservations(&self.config.data_dir, config, snapshot)
+                .map_err(|error| error.to_string())?, false),
+        };
+        for (id, port) in cached {
+            if let Some(tunnel) = snapshot.tunnels.iter().find(|tunnel| tunnel.tunnel_id == id) {
+                if let Some(&current) = ports.get(&id).filter(|current| **current != port) {
+                    if !committed
+                        || !self.persisted_refresh_port_matches(config, tunnel, current)?
+                        || topology_cache::load_reservations(&self.config.data_dir, config, snapshot)
+                            .map_err(|error| error.to_string())?.get(&id) != Some(&port)
+                    {
+                        return Err(format!("conflicting cached port for tunnel {id}"));
+                    }
+                }
+                ports.entry(id).or_insert(port);
+            }
+        }
+        self.memory.restore_ports(&ports).await?;
         ports.retain(|id, _| snapshot.tunnels.iter().any(|tunnel| tunnel.tunnel_id == *id));
         topology_cache::save(&self.config.data_dir, config, snapshot, &ports).map_err(|e| e.to_string())?;
         config.topology_revision = snapshot.revision;
@@ -892,8 +915,8 @@ impl Daemon {
             .filter(|key| !key.is_empty())
             .ok_or_else(|| "wireguard private key missing from server configuration".to_string())?
             .to_owned();
-        self.restore_refresh_active(&snapshot).await?;
         self.cache_topology(&mut config, &snapshot).await?;
+        self.restore_refresh_active(&snapshot).await?;
         if let Err(error) = self.answer_pending_tunnels(&mut config, &snapshot).await {
             eprintln!("[daemon] topology answer failed: {error}");
         }
@@ -982,8 +1005,9 @@ impl Daemon {
                         "wireguard private key missing from server configuration".to_string()
                     })?
                     .to_owned();
-                self.restore_refresh_active(&snapshot).await?;
                 self.cache_topology(&mut config, &snapshot).await?;
+                self.restore_refresh_active(&snapshot).await?;
+                *self.last_controller_snapshot.lock().unwrap() = Some(std::time::Instant::now());
                 if let Err(error) = self.answer_pending_tunnels(&mut config, &snapshot).await {
                     eprintln!("[daemon] topology answer failed: {error}");
                 }
@@ -1270,3 +1294,11 @@ async fn handle_client(mut stream: UnixStream, daemon: Arc<Daemon>) -> io::Resul
 #[cfg(test)]
 #[path = "daemon_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[tokio::test]
+async fn signal_shutdown_waits_for_cleanup_and_preserves_errors() {
+    Daemon::assert_immediate_shutdown_drains_tasks(false).await;
+    Daemon::assert_immediate_shutdown_drains_tasks(true).await;
+    Daemon::assert_shutdown_preserves_run_error().await;
+}

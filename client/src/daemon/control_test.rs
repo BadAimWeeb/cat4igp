@@ -40,6 +40,61 @@ async fn wire_server(
     }
 }
 
+#[tokio::test]
+async fn unreachable_bootstrap_does_not_block_reachable_address() {
+    let authority = libp2p::identity::Keypair::generate_ed25519();
+    let psk = format!("/key/swarm/psk/1.0.0/\n/base16/\n{}", "12".repeat(32));
+    let (mut swarm, address) = wire_server(&authority, psk.parse().unwrap()).await;
+    let server = tokio::spawn(async move {
+        loop {
+            if let libp2p::swarm::SwarmEvent::Behaviour(ControlBehaviourEvent::RequestResponse(
+                request_response::Event::Message { message: request_response::Message::Request { channel, .. }, .. }
+            )) = swarm.select_next_some().await {
+                swarm.behaviour_mut().request_response.send_response(channel, ControlResponse::Rejected("received".into())).unwrap();
+            }
+        }
+    });
+    let mut config = crate::config::ServerConfig::new(String::new(), String::new());
+    config.control_private_network_key = Some(psk);
+    let unreachable = format!("/ip4/192.0.2.1/tcp/65000/p2p/{}", authority.public().to_peer_id());
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), request_to_bootstraps(
+        &mut config, &[unreachable, address.to_string()], ControlRequest::Snapshot,
+    )).await.unwrap().unwrap();
+    assert!(matches!(response, ControlResponse::Rejected(message) if message == "received"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn invalid_enrollment_fields_do_not_commit_identity() {
+    for (node_id, topology_revision, network_id) in [(0, 3, "default"), (7, -1, "default"), (7, 3, "")] {
+        let authority = libp2p::identity::Keypair::generate_ed25519();
+        let signing: String = authority.public().encode_protobuf().iter().map(|byte| format!("{byte:02x}")).collect();
+        let psk = format!("/key/swarm/psk/1.0.0/\n/base16/\n{}", "12".repeat(32));
+        let (mut swarm, address) = wire_server(&authority, psk.parse().unwrap()).await;
+        let response = EnrollmentResponse {
+            node_id, topology_revision, network_id: network_id.into(),
+            controller_signing_key: signing, controller_encryption_key: "23".repeat(32),
+        };
+        let server = tokio::spawn(async move {
+            loop {
+                if let libp2p::swarm::SwarmEvent::Behaviour(ControlBehaviourEvent::RequestResponse(
+                    request_response::Event::Message { message: request_response::Message::Request { channel, .. }, .. }
+                )) = swarm.select_next_some().await {
+                    swarm.behaviour_mut().request_response.send_response(channel, ControlResponse::Enrolled(response.clone())).unwrap();
+                }
+            }
+        });
+        let mut config = crate::config::ServerConfig::new(String::new(), String::new());
+        config.control_private_network_key = Some(psk);
+        config.ensure_wireguard_keypair().unwrap();
+        let result = enroll(&mut config, &[address.to_string()], "test".into()).await;
+        assert_eq!(result.unwrap_err(), "invalid controller enrollment identity");
+        assert!(config.control_node_id.is_none());
+        assert!(config.controller_encryption_key.is_none());
+        server.abort();
+    }
+}
+
 pub(crate) async fn ipc_process_kill_retries_durable_wire_result<
     F: std::future::Future<Output = Result<(), String>> + Send,
 >(
@@ -237,6 +292,7 @@ pub(crate) async fn ipc_process_kill_retries_durable_wire_result<
         let mut expected = serde_json::to_value(&before).unwrap();
         expected["control_node_id"] = serde_json::json!(42);
         expected["topology_revision"] = serde_json::json!(7);
+        expected["revision_journal"] = serde_json::json!(true);
         expected["controller_encryption_key"] = serde_json::json!("23".repeat(32));
         expected["invite_code"] = serde_json::json!("");
         assert_eq!(serde_json::to_value(after).unwrap(), expected);

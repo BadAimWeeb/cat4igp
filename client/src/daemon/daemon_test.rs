@@ -1,6 +1,92 @@
 use super::*;
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn control_cache_preserves_ports_before_topology_restore() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = TempDir::new().unwrap();
+    let daemon = Daemon::new(ClientConfig {
+        data_dir: directory.path().to_owned(),
+        daemon_socket: directory.path().join("daemon.sock"),
+        ..Default::default()
+    }).await.unwrap();
+    let mut config = ServerConfig::new(String::new(), String::new());
+    config.ensure_control_keypair().unwrap();
+    config.ensure_control_encryption_key().unwrap();
+    config.ensure_wireguard_keypair().unwrap();
+    config.control_node_id = Some(7);
+    config.controller_peer_id = Some("controller".into());
+    config.controller_signing_key = Some("signing".into());
+    config.controller_encryption_key = Some("encryption".into());
+    topology_cache::initialize_journal(directory.path(), &config).unwrap();
+    config.revision_journal = true;
+    let snapshot = TopologySnapshot {
+        node_id: 7, revision: 1,
+        tunnels: vec![cat4igp_shared::control::WireguardTunnelInfo {
+            tunnel_id: 1, peer_node_id: 2, public_key: String::new(),
+            preferred_port: 0, remote_endpoint: None,
+            local_answered: WireguardAnswered::Answered,
+            remote_response: WireguardAnswered::Answered,
+            mtu: 1420, endpoint_ipv6: false, fec: false, faketcp: false,
+            created_at: 0, updated_at: 0,
+            refresh_mode: Default::default(), refresh: Default::default(),
+        }],
+        l2tp_tunnels: vec![], l2tp_v2_tunnels: vec![], l2tp_availability: None,
+    };
+    // Reserve a non-first port: lowest-free allocation must not silently replace it.
+    let first = daemon.memory.reserve_tunnel_port(99).await.unwrap();
+    let port = daemon.memory.reserve_tunnel_port(1).await.unwrap();
+    daemon.memory.release_tunnel_port(99).await;
+    daemon.memory.release_tunnel_port(1).await;
+    assert_ne!(first, port);
+    topology_cache::save(directory.path(), &config, &snapshot, &[(1, port)].into_iter().collect()).unwrap();
+    daemon.cache_topology(&mut config, &snapshot).await.unwrap();
+    assert_eq!(daemon.memory.reserve_tunnel_port(1).await.unwrap(), port);
+    assert_eq!(topology_cache::load(directory.path(), &config).unwrap().1[&1], port);
+    daemon.memory.release_tunnel_port(1).await;
+    std::fs::write(directory.path().join("topology-cache.json"), b"damaged").unwrap();
+    daemon.cache_topology(&mut config, &snapshot).await.unwrap();
+    assert_eq!(daemon.memory.reserve_tunnel_port(1).await.unwrap(), port);
+    assert_eq!(topology_cache::load(directory.path(), &config).unwrap().1[&1], port);
+    let cache_path = directory.path().join("topology-cache.json");
+    let journal_path = directory.path().join("topology-revision.json");
+    let cache = std::fs::read(&cache_path).unwrap();
+    let journal = std::fs::read(&journal_path).unwrap();
+    daemon.memory.release_tunnel_port(1).await;
+    let conflicting = daemon.memory.reserve_tunnel_port(1).await.unwrap();
+    assert_ne!(conflicting, port);
+    let mut incoming = snapshot.clone();
+    incoming.revision += 1;
+    for case in ["intact", "damaged", "missing", "stale", "legacy"] {
+        std::fs::write(&cache_path, &cache).unwrap();
+        std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&journal_path, &journal).unwrap();
+        config.revision_journal = true;
+        match case {
+            "intact" => {},
+            "damaged" => std::fs::write(&cache_path, b"damaged").unwrap(),
+            "missing" => std::fs::remove_file(&cache_path).unwrap(),
+            "stale" => {
+                let mut stale: serde_json::Value = serde_json::from_slice(&cache).unwrap();
+                stale["snapshot"]["revision"] = 0.into();
+                std::fs::write(&cache_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+            }
+            "legacy" => {
+                config.revision_journal = false;
+                std::fs::remove_file(&journal_path).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let previous_cache = std::fs::read(&cache_path).ok();
+        let previous_journal = std::fs::read(&journal_path).ok();
+        assert!(daemon.cache_topology(&mut config, &incoming).await.unwrap_err().contains("conflicting cached port"), "{case}");
+        assert_eq!(std::fs::read(&cache_path).ok(), previous_cache, "{case}");
+        assert_eq!(std::fs::read(&journal_path).ok(), previous_journal, "{case}");
+        assert_eq!(daemon.memory.reserve_tunnel_port(1).await.unwrap(), conflicting, "{case}");
+        assert_eq!(config.topology_revision, snapshot.revision, "{case}");
+    }
+}
+
 #[test]
 fn executable_discovery_requires_executable_regular_file() {
     use std::os::unix::fs::PermissionsExt;
@@ -254,18 +340,12 @@ async fn run_stop_cancel_restart_preserves_socket_and_config() {
         };
         let daemon = Arc::new(Daemon::new(config.clone()).await.unwrap());
         let ipc = client::DaemonClient::new(&config.daemon_socket, &config.data_dir).unwrap();
-        assert!(matches!(
-            daemon
-                .handle_request(
-                    DaemonRequest::SetServer {
-                        address: "pending-controller".into(),
-                        invite_code: "pending-invite".into(),
-                    },
-                    daemon.get_secret()
-                )
-                .await,
-            DaemonResponse::Ok(_)
-        ));
+        let mut pending_config = ServerConfig::new("pending-controller".into(), "pending-invite".into());
+        pending_config.ensure_wireguard_keypair().unwrap();
+        pending_config.ensure_control_keypair().unwrap();
+        pending_config.ensure_control_encryption_key().unwrap();
+        pending_config.save(directory.path()).unwrap();
+        *daemon.server_config.lock().await = Some(pending_config);
         let pending = serde_json::to_value(ServerConfig::load(directory.path()).unwrap()).unwrap();
         let secret = std::fs::read(directory.path().join(".daemon_secret")).unwrap();
         for cancel in [false, true, false] {
@@ -281,6 +361,8 @@ async fn run_stop_cancel_restart_preserves_socket_and_config() {
                     break;
                 }
             }
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&config.daemon_socket).unwrap().permissions().mode() & 0o777, 0o600);
             let competing = Daemon::new(config.clone()).await.unwrap();
             assert!(competing.run().await.is_err());
             // A stalled unauthenticated connection must not keep a handler alive.
@@ -442,6 +524,7 @@ async fn ipc_process_child() {
             // Executes real signed snapshot pull, endpoint answering and actuator reconciliation.
             // Empty topology requires neither external STUN nor privileged tunnel setup.
             daemon.sync_control_snapshot().await.unwrap();
+            assert!(matches!(daemon.handle_status().await, DaemonResponse::Status { controller_snapshot_age_seconds: Some(_), .. }));
             assert_eq!(daemon.memory.wireguard_len().await, 0);
             assert!(daemon.memory.get_last_poll_error().await.is_none());
             println!("IPC_SYNCED");
@@ -546,11 +629,32 @@ async fn ipc_pending_bundle_retry_preserves_identity_and_fingerprint() {
         changed.bootstrap_addresses = vec![format!("/ip4/127.0.0.1/tcp/1/p2p/{peer}")];
         assert!(matches!(register(restarted.clone(), serde_json::to_string(&changed).unwrap()).await,
             DaemonResponse::Error(error) if error.contains("Pending registration differs")));
-        let response = register(restarted.clone(), bundle).await;
+        let response = register(restarted.clone(), bundle.clone()).await;
         assert!(matches!(response, DaemonResponse::Error(_)));
         drop(restarted);
         let mut after = ServerConfig::load(directory.path()).unwrap();
         assert_eq!(serde_json::to_value(&after).unwrap(), before);
+        after.enrollment_bootstrap_addresses.clear();
+        after.control_bootstrap_addresses.clear();
+        after.controller_peer_id = None;
+        after.controller_signing_key = None;
+        after.control_private_network_key = None;
+        after.save(directory.path()).unwrap();
+        let legacy = Arc::new(Daemon::new(local.clone()).await.unwrap());
+        assert!(matches!(register(legacy.clone(), bundle.clone()).await, DaemonResponse::Error(_)));
+        drop(legacy);
+        after = ServerConfig::load(directory.path()).unwrap();
+        assert_eq!(after.ensure_control_keypair().unwrap().public().to_peer_id(), identity);
+        assert_eq!(after.controller_peer_id.as_deref(), Some(peer.to_string().as_str()));
+        assert!(after.control_private_network_key.is_some());
+        after.control_node_id = Some(42);
+        after.save(directory.path()).unwrap();
+        let completed = Arc::new(Daemon::new(local.clone()).await.unwrap());
+        let saved = std::fs::read(directory.path().join("server.json")).unwrap();
+        let completed_bundle = serde_json::to_string(&changed).unwrap();
+        assert!(matches!(register(completed, completed_bundle).await,
+            DaemonResponse::Error(error) if error.contains("refusing to overwrite enrollment")));
+        assert_eq!(std::fs::read(directory.path().join("server.json")).unwrap(), saved);
         assert_eq!(after.ensure_control_keypair().unwrap().public().to_peer_id(), identity);
         assert_eq!(std::fs::metadata(directory.path().join("server.json")).unwrap().permissions().mode() & 0o777, 0o600);
         assert!(!std::fs::read_dir(directory.path()).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
@@ -573,92 +677,31 @@ async fn test_daemon_creation() {
 }
 
 #[tokio::test]
-async fn test_set_server_config() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = ClientConfig {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let daemon = Daemon::new(config).await.unwrap();
-    let secret = daemon.get_secret().to_string();
-
-    let req = DaemonRequest::SetServer {
-        address: "/ip4/127.0.0.1/tcp/9000/p2p/12D3KooWExample".to_string(),
-        invite_code: "test-invite".to_string(),
-    };
-
-    let response = daemon.handle_request(req, &secret).await;
-    match response {
-        DaemonResponse::Ok(_) => {
-            assert!(daemon.is_server_configured().await);
-        }
-        _ => panic!("Unexpected response"),
-    }
+async fn controller_snapshot_age_is_process_local_and_monotonic() {
+    let directory = TempDir::new().unwrap();
+    let config = ClientConfig { data_dir: directory.path().to_path_buf(), ..Default::default() };
+    let daemon = Daemon::new(config.clone()).await.unwrap();
+    assert!(matches!(daemon.handle_status().await, DaemonResponse::Status { controller_snapshot_age_seconds: None, .. }));
+    *daemon.last_controller_snapshot.lock().unwrap() = Some(std::time::Instant::now() - Duration::from_secs(65));
+    assert!(matches!(daemon.clone_for_handler().handle_status().await, DaemonResponse::Status { controller_snapshot_age_seconds: Some(age), .. } if age >= 65));
+    let restarted = Daemon::new(config).await.unwrap();
+    assert!(matches!(restarted.handle_status().await, DaemonResponse::Status { controller_snapshot_age_seconds: None, .. }));
 }
 
 #[tokio::test]
-async fn set_server_preserves_pending_and_completed_enrollment() {
+async fn ignored_stale_push_does_not_prove_controller_contact() {
     let directory = TempDir::new().unwrap();
-    let config = ClientConfig {
-        data_dir: directory.path().to_owned(),
-        ..Default::default()
-    };
-    let daemon = Daemon::new(config).await.unwrap();
-    let request = || DaemonRequest::SetServer {
-        address: "original-controller".into(),
-        invite_code: "original-invite".into(),
-    };
-    assert!(matches!(
-        daemon.handle_request(request(), daemon.get_secret()).await,
-        DaemonResponse::Ok(_)
-    ));
-    let authority = libp2p::identity::Keypair::generate_ed25519();
-    for stage in 0..3 {
-        let mut saved = ServerConfig::load(directory.path()).unwrap();
-        if stage >= 1 {
-            saved.controller_peer_id = Some(authority.public().to_peer_id().to_string());
-            saved.controller_signing_key = Some(
-                authority
-                    .public()
-                    .encode_protobuf()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect(),
-            );
-            saved.enrollment_node_name = Some("original-node".into());
-        }
-        if stage == 2 {
-            saved.control_node_id = Some(42);
-            saved.topology_revision = 7;
-            saved.invite_code.clear();
-        }
-        saved.save(directory.path()).unwrap();
-        *daemon.server_config.lock().await = Some(saved);
-        let before = std::fs::read(directory.path().join("server.json")).unwrap();
-        let memory_before = serde_json::to_value(&*daemon.server_config.lock().await).unwrap();
-        for attempt in [
-            request(),
-            DaemonRequest::SetServer {
-                address: "replacement-controller".into(),
-                invite_code: "replacement-invite".into(),
-            },
-        ] {
-            assert!(matches!(
-                daemon.handle_request(attempt, daemon.get_secret()).await,
-                DaemonResponse::Error(error) if error.contains("refusing to overwrite enrollment")
-            ));
-            assert_eq!(
-                std::fs::read(directory.path().join("server.json")).unwrap(),
-                before
-            );
-            assert_eq!(
-                serde_json::to_value(&*daemon.server_config.lock().await).unwrap(),
-                memory_before
-            );
-        }
-    }
+    let daemon = Daemon::new(ClientConfig { data_dir: directory.path().to_path_buf(), ..Default::default() }).await.unwrap();
+    let mut server = ServerConfig::new("seed".into(), "invite".into());
+    server.control_node_id = Some(1);
+    server.topology_revision = 10;
+    *daemon.server_config.lock().await = Some(server);
+    daemon.apply_pushed_snapshot(TopologySnapshot {
+        node_id: 1, revision: 9, tunnels: vec![], l2tp_tunnels: vec![], l2tp_v2_tunnels: vec![], l2tp_availability: None,
+    }).await.unwrap();
+    assert!(matches!(daemon.handle_status().await, DaemonResponse::Status { controller_snapshot_age_seconds: None, .. }));
 }
+
 
 #[tokio::test]
 async fn test_auth_failure() {

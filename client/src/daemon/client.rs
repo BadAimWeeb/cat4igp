@@ -11,6 +11,9 @@ struct IpcMessage {
     secret: String,
     request: DaemonRequest,
 }
+fn trusted_peer(uid: u32, caller_uid: u32) -> bool {
+    uid == 0 || uid == caller_uid
+}
 
 /// Client for communicating with the daemon via Unix socket
 pub struct DaemonClient {
@@ -40,6 +43,13 @@ impl DaemonClient {
                 ),
             )
         })?;
+        let peer = stream.peer_cred()?;
+        if !trusted_peer(peer.uid(), unsafe { libc::geteuid() }) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "daemon socket peer is not owned by root or the current user",
+            ));
+        }
 
         // Prepare the message
         let message = IpcMessage {

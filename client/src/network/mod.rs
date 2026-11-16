@@ -7,3 +7,6 @@ pub mod faketcp;
 
 pub use public_ip::PublicIpDetector;
 pub use tls::TlsVerifier;
+
+#[cfg(all(test, target_os = "linux"))]
+mod privilege_test;
