@@ -74,3 +74,29 @@ in plaintext in its database and mutation receipts; protect their storage and
 backups. The secret is omitted from
 administrator inventory. Each client creates private temporary PPP files and
 isolates them with a mount namespace; they are removed on normal shutdown.
+Explicit teardown and unexpected xl2tpd exit wait up to five seconds for owned
+process-group members to exit before reaping xl2tpd. The supervisor observes leader
+exit without reaping it, retaining PID ownership while signaling the group. Cleanup
+failures remain errors and prevent restarting that tunnel object; teardown does not
+delete interfaces by name. This does not contain helpers that escape the group or
+provide recovery after the client is killed.
+
+The packaged systemd unit creates `/run/cat4igp-client` with mode 0700 and removes
+it after its service cgroup stops. L2TPv2 uses that exact `RUNTIME_DIRECTORY` only
+after validating its type, owner and permissions; invalid values fail closed.
+Without that environment, native/OpenRC/procd execution still uses private random
+directories directly under `/run`, which can survive an abrupt client exit.
+`sudo python3 packaging/check-service-containment.py --confirm-disposable` checks
+the actual unit's descendant termination and runtime-directory removal in a
+disposable systemd VM. It does not establish ownership-safe unmanaged scavenging.
+
+Generate a different random CHAP secret for each tunnel and exchange it through a
+trusted channel; do not put it in tickets, logs or unprotected configuration. The
+operator must control who can administer tunnels, access the controller database,
+mutation receipts, client state and backups. Encrypt backups and protect their keys
+separately. If a secret or backup is exposed, contain affected endpoints independently,
+delete the affected tunnel and create a replacement with a new secret. An offline
+peer can keep using cached configuration until it reconnects. Verify both endpoints
+have converged and traffic uses the new tunnel before lifting containment. CHAP alone
+is not a confidentiality layer; use WireGuard
+mode for untrusted networks.

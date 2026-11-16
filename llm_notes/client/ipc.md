@@ -18,7 +18,7 @@ The cat4igp client uses Unix domain sockets for secure inter-process communicati
 
 ## Socket Location
 
-- **Path**: Configured in `daemon_socket` field (default: `/tmp/cat4igp-client.sock`)
+- **Path**: Configured in `daemon_socket` field (default: `/run/cat4igp-client.sock`); custom parent directories must be trusted.
 - **Type**: Unix domain socket (SOCK_STREAM)
 - **Protocol**: Length-prefixed JSON messages
 
@@ -30,6 +30,7 @@ The cat4igp client uses Unix domain sockets for secure inter-process communicati
 - Permissions: `0600` (owner read/write only)
 - Length: 32 random alphanumeric characters
 - Sent with every request for authentication
+- Before sending any request, the CLI checks the connected peer's kernel credentials and accepts only root or its own effective UID. Processes running as that same UID are trusted.
 
 ## Message Protocol
 
@@ -67,31 +68,17 @@ The cat4igp client uses Unix domain sockets for secure inter-process communicati
 ```rust
 DaemonRequest::Status
 ```
-Returns daemon running status, server configuration state, and node key presence.
+Returns daemon running status, server configuration state, node key presence, the age of the last verified, non-rollback controller snapshot pull, and any reconciliation error. The age uses a monotonic clock and is unknown until the first successful verified pull after each daemon start. Cached topology and unsolicited pushes do not reset it; a fresh pull does not imply successful tunnel reconciliation.
 
-### SetServer
+### RegisterBundle
 ```rust
-DaemonRequest::SetServer {
-    address: "/dns4/controller.example.com/tcp/9000/p2p/12D3KooW...",
-    invite_code: "invite-code-here",
-}
+DaemonRequest::RegisterBundle { bundle: bundle_json }
 ```
-Configures server settings and saves to `<data_dir>/server.json` only when no
-server configuration exists. Further calls reject without changing pending or
-completed enrollment, even when the address and invite match. Use `Register`
-or `RegisterBundle` to resume the original enrollment without replacing keys.
-
-### GetServer
-```rust
-DaemonRequest::GetServer
-```
-Retrieves current server configuration.
-
-### Register
-```rust
-DaemonRequest::Register
-```
-Registers with the configured server and stores node key.
+Imports the trusted enrollment JSON and registers with its pinned controller.
+The bundle contains secrets: never log it. The daemon saves pending and completed
+enrollment in private `<data_dir>/server.json`; retry the same bundle to resume a
+pending enrollment. Completed enrollment cannot be replaced by registration.
+Address/invite-only registration is not supported.
 
 ### GetConfig
 ```rust
@@ -133,13 +120,9 @@ DaemonResponse::Status {
     running: true,
     server_configured: true,
     node_key_present: false,
+    controller_snapshot_age_seconds: None,
     message: None,
 }
-```
-
-### ServerConfig
-```rust
-DaemonResponse::Config(serde_json::Value)
 ```
 
 ### Config
@@ -153,54 +136,35 @@ DaemonResponse::Config(serde_json::Value)
 
 ```bash
 # Terminal 1: Start daemon
-./target/debug/client daemon --config config.toml
-
-# Output:
-# Starting cat4igp client daemon...
-# Configuration:
-#   Daemon socket: "/tmp/cat4igp-client.sock"
-#   Data directory: "/var/lib/cat4igp-client"
-#   Port range: 51820-52000
-# ✓ Daemon initialized
-#   Daemon secret: AbCdEfGh1234...
-# ⚠ Server not configured - waiting for CLI commands
-# Daemon is running...
-# ✓ Listening on socket: "/tmp/cat4igp-client.sock"
+cat4igp-client daemon --config config.toml
 ```
 
 ### Check Status
 
 ```bash
 # Terminal 2: Check daemon status
-./target/debug/client status
+cat4igp-client --config config.toml status
 
 # Output:
 # Daemon Status:
 #   Running: Yes
 #   Server Configured: No
 #   Node Key Present: No
-```
-
-### Configure Server
-
-```bash
-# Set server configuration
-./target/debug/client register --server /dns4/controller.example.com/tcp/9000/p2p/12D3KooW... --invite my-invite-code
-
-# Output:
-# ✓ Server configuration set
-
-# The daemon stores enrollment state in <data_dir>/server.json with mode 0600.
+#   Controller Snapshot Age Seconds: Unknown
 ```
 
 ### Register with Server
 
-```bash
-./target/debug/client register --server /dns4/controller.example.com/tcp/9000/p2p/12D3KooW... --invite my-invite-code
+Obtain the bundle from a trusted operator channel and protect it like a password.
+With the daemon running, use the same configuration file to locate its socket:
 
-# Output:
-# ✓ Registration successful
+```bash
+cat4igp-client --config config.toml register-bundle --bundle /secure/enrollment.json
 ```
+
+Delete the bundle after successful registration. Preserve the private daemon
+state directory during upgrades and protect backups because `server.json` contains
+the private control-network key and enrollment identity.
 
 ## Implementation Details
 
@@ -275,28 +239,26 @@ pub async fn send_request(&self, request: DaemonRequest) -> io::Result<DaemonRes
 ```
 <data_dir>/
 ├── .daemon_secret          # Shared secret (0600)
-└── server.json             # Server configuration
+└── server.json             # Private daemon-owned enrollment state (0600)
 ```
 
 ```
-<daemon_socket>             # Unix socket (usually /tmp/cat4igp-client.sock)
+<daemon_socket>             # Unix socket (usually /run/cat4igp-client.sock, mode 0600)
 ```
 
 ## Testing
 
 ```bash
 # Generate config
-./target/debug/client gen-config --output test-config.toml
+cat4igp-client gen-config --output test-config.toml
 
 # Start daemon (Terminal 1)
-./target/debug/client daemon --config test-config.toml
+cat4igp-client daemon --config test-config.toml
 
-# Test commands (Terminal 2)
-./target/debug/client status
-./target/debug/client server --set "https://test.com,invite123"
-./target/debug/client server --get
-./target/debug/client server --register
-./target/debug/client public-ip both
+# Inspect status and enroll (Terminal 2)
+cat4igp-client --config test-config.toml status
+cat4igp-client --config test-config.toml register-bundle --bundle /secure/enrollment.json
+cat4igp-client public-ip both
 ```
 
 ## Performance

@@ -11,10 +11,14 @@ Import is limited to 16 KiB and 16 addresses per list. Addresses must be IP/TCP/
 all private addresses must name the pinned singleton controller. The supplied full public key
 is the out-of-band trust anchor (not TOFU); a separate fingerprint-only exchange is not implemented.
 Unknown fields, invalid keys/PSKs, identity mismatches and returned network/key substitutions fail closed.
-Pins and discovery proof are automatically saved to mode-0600 `server.json` using atomic replacement.
-The pending client identity is saved before sending enrollment, reused when the same bundle is retried,
-and the invite is removed from the completed config. Completed enrollment cannot be overwritten by registration.
-Legacy `register --server ... --invite ...` and existing configs remain supported.
+The daemon saves pins, bootstrap addresses and the private-network key to its private
+`<data_dir>/server.json` (mode `0600`, atomic replacement), not to user TOML or JSON
+configuration. Protect and back up the entire state directory. The pending client
+identity is saved before sending enrollment and reused when the same bundle is retried;
+the invite is removed from completed state. Completed enrollment cannot be overwritten
+by registration. Preserve existing enrolled state during upgrades; do not delete or
+recreate `server.json` to migrate configuration. Address/invite-only registration is
+no longer supported.
 
 This is singleton trusted enrollment against one standalone server. The client uses
 the configured server and pinned identity for control traffic.
@@ -28,6 +32,128 @@ revocations and new configuration cannot reach an isolated client until it
 reconnects; protect the cache and remove access through network controls when
 immediate revocation is required. The cache contains tunnel secrets and must be
 included in protected backups of the client state directory.
+
+An operator must plan containment outside the controller: block the isolated host
+or its tunnel endpoints at host and edge firewalls, disable its network access,
+and remove or rotate affected peer credentials on reachable systems as appropriate.
+Verify that traffic is blocked; a controller-side deletion alone is not immediate
+revocation. After reconnection, verify the deleted identity is rejected and the
+remaining peers converge before lifting containment. Preserve corrupt state for
+diagnosis; do not replace a cache based only on the configuration revision, which
+can lag the cached topology. Protect client backups with encryption and separately
+managed recoverable keys: the enrollment state and topology cache contain secrets.
+
+### Damaged cache recovery boundary
+
+On Unix, a client with a valid revision journal can repair a cache that cannot be
+decoded when an authenticated controller snapshot matches the journal's exact
+revision and topology hash. The daemon retains a private diagnostic copy before
+replacing the cache. This requires the controller to be reachable and does not
+repair a missing or damaged journal, unsafe file permissions, or a parseable but
+conflicting cache. For other failures, stop and fence the client and retain an
+encrypted, access-restricted copy of its entire state directory for diagnosis. Do
+not remove the cache, edit `server.json`, lower
+its revision, or re-enroll the existing identity as a recovery shortcut. A cache
+write can reach stable storage before the configuration revision is saved, so even
+an intact `server.json` does not establish the highest accepted revision. A valid
+older backup has the same limitation. Deleting the cache also loses the check that
+rejects different topology at an already accepted revision.
+New enrollments also retain an identity-bound revision journal with a hash of the
+accepted topology. Journal publication precedes cache publication and fails closed
+if the journal is missing or damaged. Existing enrollments are not automatically
+migrated. The journal is in the same state directory, so a coordinated restore or
+rollback of that directory can roll it back too; it is not an independent trust anchor.
+Control synchronization preserves and reserves surviving cached tunnel ports before
+publishing another cache, even if offline restoration has not completed. A completed
+dual-link refresh may replace a reservation only when the previous cache matches
+its required version 2 journal and the new port matches an identity-bound, persisted
+active refresh generation and slot. Other in-memory conflicts fail closed, including
+journal-only recovery; updating the cache never frees an in-use reservation.
+Refresh records without an enrollment identity binding are rejected rather than
+adopted during recovery; preserve such state for diagnosis.
+Rejected refresh candidates retain a durable cleanup intent and reserve their
+port on restart until verified interface cleanup and state publication succeed.
+
+
+
+Version 2 journals also retain validated local port reservations before cache
+publication. Exact-hash repair restores those reservations and rejects conflicts.
+Version 1 journals contain no reservations; damaged caches using them cannot
+recover lost mappings, and allocation alone may not reconstruct advertised ports.
+
+Recovery after a coordinated state-directory rollback would require an independently
+protected and current record,
+bound to this client and controller identity, of every accepted revision and the
+topology accepted at its high-water mark, including writes immediately before the
+failure. It would also require a verified, authorized replacement topology and a
+crash-safe, exclusive installation procedure that preserves both the revision floor
+and same-revision content check. This software does not maintain that independent
+record or provide that procedure. A controller signature, the controller's current
+revision, an operator estimate, or a backup comparison alone cannot supply it.
+Keep affected data paths contained using independent network controls while the
+incident is investigated; do not claim rollback-safe recovery without this evidence.
+
+## Backend privilege verification
+
+The zero-capability regression can be reproduced with
+`cargo test --locked -p cat4igp-client network::privilege_test::backends_fail_closed_without_capabilities -- --exact`.
+It runs denial checks in an isolated child with `no_new_privs` and empty capability
+sets, covering FakeTCP raw sockets, WireGuard, L2TPv3 and both L2TPv2 modes. It
+checks failed-setup resource release and retry, not the minimum sufficient positive
+capability profile; a packaged root service is not evidence of least privilege.
+When wrapping this test in a fresh `unshare --net` namespace, bring loopback up
+before launching the executable; otherwise FakeTCP can fail route discovery with
+ENETUNREACH before exercising the intended raw-socket EPERM boundary.
+
+In a disposable root VM, run the compiled test binary with
+`--exact network::privilege_test::l2tpv3_setup_with_net_admin_only --ignored --nocapture`
+to verify backend setup/recreation with only CAP_NET_ADMIN, or
+`--exact network::privilege_test::l2tpv2_denied_without_sys_admin --ignored --nocapture`
+to verify mount-namespace denial while retaining filesystem access. The harness
+creates its isolated network namespace before dropping capabilities; this does
+not establish the capabilities needed to create that namespace or run PPP.
+
+The same harness supports
+`--exact network::privilege_test::wireguard_setup_with_net_admin_only --ignored --nocapture`.
+It verifies configured kernel identity, peer/listener and destroy/recreate with
+CAP_NET_ADMIN only; it does not provision a live peer or establish traffic.
+`daemon::daemon_memory::l2tp_recovery_test::paired_snapshot_dependency_recovery`
+under `sudo unshare --net --mount` with `--exact --ignored --nocapture` instead
+verifies paired WireGuard/L2TP packet recovery after empty-snapshot teardown,
+including unmanaged-resource preservation and a ten-second reference bound.
+
+For a controlled PPP helper profile, run `.github/workflows/ppp-test.sh` with the
+compiled test executable inside a disposable transient systemd unit using
+`CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID`
+and `NoNewPrivileges=yes`, under `unshare --net --mount`. This bounds the complete
+driver, including namespace setup and ping; it is a candidate sufficient profile,
+not a minimum-helper or production-daemon profile. Pin pppd/xl2tpd versions in
+results, and require kernel, userspace and WireGuard modes to finish successfully.
+
+The real two-client native WireGuard restore driver also passed in Debian 13
+with `CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW` and
+`NoNewPrivileges=yes`. This includes its namespace/ping orchestration and excludes
+PPP/FakeTCP; it is a sufficient reference profile, not a production service change
+or proof that all three capabilities are needed by the long-running daemon.
+The same three-capability bounding set passed the complete PPP driver with
+pppd 2.5.2/xl2tpd 1.3.18 and the routed FakeTCP conntrack outage/recovery scenario.
+These root-owned fixtures needed neither DAC override nor UID/GID-changing caps;
+they do not establish non-root operation or helper-version-independent minimums.
+
+In a disposable VM with nftables, run the compiled test executable under
+`sudo env CAT4IGP_REFRESH_BLOCK_CANDIDATE=1 unshare -n` with
+`--exact daemon::daemon_memory::refresh_integration_test::kernel_dual_link_refresh --ignored --nocapture`.
+This blocks candidate UDP transport, verifies old-link traffic and absent candidate
+readiness, checks drop counters, then unblocks and verifies switch/cleanup/traffic.
+It does not establish deployment-specific proxy or restrictive-NAT compatibility.
+
+The ignored `daemon::daemon_memory::nat_integration_test::kernel_wireguard_static_udp_forward`
+scenario requires a disposable root VM with kernel WireGuard, iproute2, nftables,
+conntrack and ping. Run the compiled test executable with `--exact` for that name
+and `--ignored --nocapture` under `sudo unshare --net --mount`. It verifies explicit
+UDP DNAT/SNAT, removal-induced traffic failure and recovery after reinstating rules.
+It does not establish automatic NAT traversal or compatibility with an operator's
+restrictive firewall topology.
 
 
 ## Fixed-target client control relay
@@ -88,7 +214,7 @@ policy routing and security limitations.
 The daemon loads TOML configuration files:
 
 ```toml
-daemon_socket = "/tmp/cat4igp-client.sock"
+daemon_socket = "/run/cat4igp-client.sock"
 data_dir = "/var/lib/cat4igp-client"
 # Required only for direct, unencrypted L2TP.
 allow_insecure_l2tp = false
@@ -108,8 +234,9 @@ wireguard = true
 l2tp = false
 ```
 
-Controller addresses and the private-network key are normally supplied in the
-trusted enrollment bundle. Protect any manually configured keys as secrets.
+Controller bootstrap addresses and the private-network key come from the trusted
+enrollment bundle and are managed only in daemon-owned `server.json`; do not put
+them in client TOML or JSON configuration.
 
 ## CLI Commands
 
@@ -125,6 +252,17 @@ cat4igp-client daemon --config /path/to/config.toml
 # Or using the --config global option
 cat4igp-client --config /path/to/config.toml daemon
 ```
+
+### Register and control the daemon
+
+```bash
+cat4igp-client --config /path/to/config.toml register-bundle --bundle /secure/enrollment.json
+cat4igp-client --config /path/to/config.toml status
+cat4igp-client --config /path/to/config.toml stop
+```
+
+Use the same configuration path as the daemon so the CLI finds its socket and
+authentication state. Protect the bundle and delete it after successful registration.
 
 ### Generate Configuration File
 
@@ -201,11 +339,10 @@ This is best effort. Permit and, when necessary, forward the configured UDP rang
 
 ### Controller bootstrap servers
 
-`register --server` takes a controller libp2p multiaddress containing
-`/p2p/<controller-peer-id>`. Configure `control_bootstrap_addresses` for
-additional reachable addresses. The client tries each address in order and
-requires every configured address to identify the same controller peer.
-`control_private_network_key` is required and must match the controller's
+Put reachable controller IP/TCP/p2p multiaddresses in the bundle's
+`bootstrap_addresses`, each ending in `/p2p/<controller-peer-id>`. The client
+tries them in order and requires each to identify the pinned controller. The
+bundle's `private_network_key` must match the controller's
 `CONTROL_PRIVATE_NETWORK_KEY` environment variable.
 
 The controller stores its libp2p signing and encryption identities in its
@@ -248,7 +385,7 @@ The daemon tries `/etc/cat4igp/client.toml` unless `--config` is supplied; if
 the selected file does not exist, it uses defaults including:
 
 ```toml
-daemon_socket = "/tmp/cat4igp-client.sock"
+daemon_socket = "/run/cat4igp-client.sock"
 data_dir = "/var/lib/cat4igp-client"
 port_range = { min = 51820, max = 52000 }
 tunnel_protocols = { wireguard = true, l2tp = false }
