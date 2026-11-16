@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 # Secrets stay on the mounted volume rather than in container configuration.
 if [ -n "${CONTROL_PRIVATE_NETWORK_KEY_FILE:-}" ]; then

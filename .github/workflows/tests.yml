@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       # Cargo uses the repository's pinned rust-toolchain.toml.
@@ -25,23 +25,26 @@ jobs:
           sudo modprobe wireguard
           sudo modprobe l2tp_netlink
           sudo apt-get update
-          sudo apt-get install -y nftables conntrack
-          sudo modprobe l2tp_eth
+          sudo apt-get install -y nftables conntrack xl2tpd ppp wireguard-tools iproute2 iputils-ping
+          for module in l2tp_eth l2tp_ppp ppp_generic ppp_async pppox; do sudo modprobe "$module"; done
           cargo test --locked -p cat4igp-client --no-run --message-format=json > /tmp/client-tests.json
           binary=$(python3 -c 'import json; print(next(m["executable"] for line in open("/tmp/client-tests.json") if (m := json.loads(line)).get("reason") == "compiler-artifact" and m.get("profile", {}).get("test") and m.get("executable") and m["target"]["name"] == "cat4igp-client"))')
           for test in \
             daemon::daemon_memory::l2tp::integration_test::reconcile_wireguard_resources_are_shared_and_cleaned \
             daemon::daemon_memory::l2tp::integration_test::unmanaged_address_is_not_removed \
             daemon::daemon_memory::l2tp_v2_policy::tests::policy_routes_to_wireguard_and_drops_when_it_disappears \
+            daemon::daemon_memory::l2tp_v2::tests::wireguard_ppp_reconciler_creates_and_removes_resources \
             daemon::daemon_memory::l2tp::integration_test::l2tp_direct_and_wireguard_exchange_jumbo_packets \
             daemon::daemon_memory::wireguard::matching_mtu_still_brings_wireguard_up \
             tunnel::wireguard::tests::reconciliation_preserves_kernel_roaming \
             daemon::daemon_memory::refresh_integration_test::kernel_dual_link_refresh \
+            daemon::daemon_memory::refresh_integration_test::offline_revocation_requires_independent_containment \
             network::faketcp::tests::routed_conntrack_nat_outage_and_recovery; do
             # libtest succeeds even if an exact filter matches no tests.
             sudo unshare --net "$binary" --list --ignored | grep -Fx "$test: test"
             sudo unshare --net "$binary" --exact "$test" --ignored --nocapture
           done
+          sudo bash .github/workflows/ppp-test.sh "$binary"
 
   frontend:
     runs-on: ubuntu-24.04
@@ -50,10 +53,10 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -61,3 +64,20 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+
+  https-browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: sudo apt-get update && sudo apt-get install -y libnss3-tools
+      - run: cargo build --locked -p cat4igp-server
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: python3 server/tests/https_management.py --browser

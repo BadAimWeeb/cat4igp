@@ -8,6 +8,9 @@ permissions:
   contents: read
 
 jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+
   guard:
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -15,14 +18,15 @@ jobs:
       startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - run: bash packaging/build.sh --check
+      - run: bash packaging/check-release-tag.sh --check
       - run: cargo test --locked -p cat4igp-client -p cat4igp-shared -p cat4igp-libfec
 
   build:
-    needs: guard
+    needs: [guard, tests]
     strategy:
       fail-fast: false
       matrix:
@@ -39,12 +43,26 @@ jobs:
           - { distro: openwrt, arch: x86_64, runner: ubuntu-24.04 }
           - { distro: openwrt, arch: aarch64, runner: ubuntu-24.04 }
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - run: bash packaging/build.sh '${{ matrix.distro }}' '${{ matrix.arch }}'
-      - uses: actions/upload-artifact@v6
+      - name: Attest matrix outputs
+        id: provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: dist/${{ matrix.distro }}-${{ matrix.arch }}/*
+      - name: Include build attestation
+        env:
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          TARGET: ${{ matrix.distro }}-${{ matrix.arch }}
+        run: cp "$BUNDLE" "dist/$TARGET/BUILD-PROVENANCE.jsonl"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: client-${{ matrix.distro }}-${{ matrix.arch }}
           path: dist/${{ matrix.distro }}-${{ matrix.arch }}/*
@@ -57,26 +75,103 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: client-*
           path: packages
-      - name: Publish complete release
+      - name: Assemble complete release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          mkdir release
+          expected=(
+            client-alpine-x86_64 client-alpine-aarch64 client-alpine-riscv64
+            client-debian-x86_64 client-debian-aarch64 client-debian-riscv64
+            client-arch-x86_64 client-static-x86_64 client-static-aarch64
+            client-openwrt-x86_64 client-openwrt-aarch64
+          )
+          for name in "${expected[@]}"; do
+            test -d "packages/$name"
+          done
+          test "$(find packages -mindepth 1 -maxdepth 1 | wc -l)" -eq "${#expected[@]}"
+          for directory in packages/client-*; do
+            mapfile -t files < <(find "$directory" -maxdepth 1 -type f ! -name BUILD-DEPENDENCIES.txt ! -name BUILD-PROVENANCE.jsonl)
+            test "${#files[@]}" -eq 1
+            test -f "$directory/BUILD-DEPENDENCIES.txt"
+            test -f "$directory/BUILD-PROVENANCE.jsonl"
+            # ponytail: RISC-V currently builds on RISE self-hosted runners; replace
+            # this exception when a trusted GitHub-hosted build path is available.
+            runner_policy=(--deny-self-hosted-runners)
+            case "$(basename "$directory")" in
+              client-alpine-riscv64|client-debian-riscv64) runner_policy=() ;;
+            esac
+            for artifact in "${files[0]}" "$directory/BUILD-DEPENDENCIES.txt"; do
+              gh attestation verify "$artifact" --repo "$GH_REPO" \
+                --bundle "$directory/BUILD-PROVENANCE.jsonl" \
+                --signer-workflow "$GH_REPO/.github/workflows/packages.yml" \
+                --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
+                "${runner_policy[@]}"
+            done
+            # Prefix prevents Alpine/OpenWrt or ARM/x86 package name collisions.
+            cp "${files[0]}" "release/$(basename "$directory")-$(basename "${files[0]}")"
+            cp "$directory/BUILD-DEPENDENCIES.txt" "release/$(basename "$directory")-BUILD-DEPENDENCIES.txt"
+            cp "$directory/BUILD-PROVENANCE.jsonl" "release/$(basename "$directory")-BUILD-PROVENANCE.jsonl"
+          done
+          test "$(find release -type f | wc -l)" -eq 33
+          (cd release && sha256sum * > SHA256SUMS)
+      - name: Attest release artifacts
+        id: release-provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release/*
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          bash packaging/check-release-tag.sh
+          gh release create "$TAG" release/* --verify-tag --draft --title "$TAG" --generate-notes
+      - name: Verify downloaded release and attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          BUNDLE: ${{ steps.release-provenance.outputs.bundle-path }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir release
-          for directory in packages/client-*; do
-            mapfile -t files < <(find "$directory" -maxdepth 1 -type f)
-            test "${#files[@]}" -eq 1
-            # Prefix prevents Alpine/OpenWrt or ARM/x86 package name collisions.
-            cp "${files[0]}" "release/$(basename "$directory")-$(basename "${files[0]}")"
+          mkdir downloaded
+          gh release download "$TAG" --dir downloaded
+          diff -r release downloaded
+          (cd downloaded && sha256sum --check SHA256SUMS)
+          for artifact in downloaded/*; do
+            gh attestation verify "$artifact" --repo "$GH_REPO" \
+              --bundle "$BUNDLE" \
+              --signer-workflow "$GH_REPO/.github/workflows/packages.yml" \
+              --source-digest "$SOURCE_SHA" --source-ref "$SOURCE_REF" \
+              --deny-self-hosted-runners
           done
-          test "$(find release -type f | wc -l)" -eq 11
-          (cd release && sha256sum * > SHA256SUMS)
-          gh release create "$TAG" release/* --verify-tag --title "$TAG" --generate-notes
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          bash packaging/check-release-tag.sh
+          gh release edit "$TAG" --draft=false

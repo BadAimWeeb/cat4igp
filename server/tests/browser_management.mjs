@@ -1,7 +1,7 @@
 // Native Firefox BiDi + Node WebSocket; invoked by https_management.py --browser.
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { once } from 'node:events';
 
@@ -147,8 +147,6 @@ try {
   assert.equal(await evaluate(`getComputedStyle(document.querySelector('.sidebar')).backgroundColor`), 'rgb(18, 18, 18)');
   await outlined('input[name=username]');
   assert.equal(await evaluate(`getComputedStyle(document.querySelector('input[name=username]')).color`), 'rgb(255, 255, 255)', 'dark input text remains readable');
-  const screenshot = await command('browsingContext.captureScreenshot', { context });
-  await writeFile('/tmp/cat4igp-dark-login.png', Buffer.from(screenshot.data, 'base64'));
   await tabTo('button[aria-label="Switch to light mode"]');
   await enter();
   await wait(`getComputedStyle(document.documentElement).colorScheme === 'light'`);
@@ -263,8 +261,6 @@ try {
       getComputedStyle(input.labels[0]).color === 'rgb(63, 81, 181)' &&
       getComputedStyle(input.closest('.MuiOutlinedInput-root').querySelector('fieldset')).borderTopWidth === '2px';
   })()`), true, 'focused number field uses MUI floating label and outlined focus border');
-  const numberScreenshot = await command('browsingContext.captureScreenshot', { context });
-  await writeFile('/tmp/cat4igp-number-field.png', Buffer.from(numberScreenshot.data, 'base64'));
   await keys('\uE013'); // ArrowUp.
   assert.equal(await numberValue('mtu'), '1421');
   await keys('\uE015'); // ArrowDown.
@@ -363,7 +359,7 @@ try {
     const inventory = {
       nodes: [1, 2].map(id => ({ id, name: 'Fixture node ' + id, created_at: '', last_seen: null })),
       meshes: [1, 2].map(id => ({ id, name: 'Fixture mesh ' + id, auto_wireguard: true, mtu: 1420, fec: id === 2 })),
-      memberships: [{ node_id: 1, mesh_id: 1 }, { node_id: 2, mesh_id: 2 }], invites: [], tunnels: []
+      memberships: [{ node_id: 1, mesh_id: 1 }, { node_id: 2, mesh_id: 2 }], invites: [], tunnels: [], l2tp_tunnels: [], l2tp_v2_tunnels: []
     };
     window.membershipFixture = { inventory, writes: [], restore: () => { window.fetch = original; } };
     window.fetch = async (path, options) => {
@@ -403,26 +399,26 @@ try {
   }
   await click('Refresh');
   await nav('Meshes');
-  await wait(`document.querySelector('.inventory tbody').textContent.includes('Fixture mesh 2')`);
+  await wait(`document.querySelector('.inventory tbody')?.textContent.includes('Fixture mesh 2')`);
   assert.equal(await evaluate(`Array.from(document.querySelectorAll('.inventory thead th')).map(c => c.textContent).join(',')`), 'Mesh,Auto WireGuard,Actions');
   assert.equal(await evaluate(`document.querySelector('.inventory tbody tr:first-child td').textContent.trim()`), 'MTU 1420');
   assert.equal(await evaluate(`document.querySelector('.inventory tbody tr:last-child td').textContent.trim()`), 'MTU 1420 · FEC enabled');
   await nav('Nodes');
   await wait(`!!document.querySelector('[aria-label="Actions for node #1"]')`);
-  assert.equal(await evaluate(`document.querySelectorAll('nav button').length === 5 && !document.querySelector('nav').textContent.includes('Memberships')`), true);
+  assert.equal(await evaluate(`document.querySelectorAll('nav button').length === 4 && !document.querySelector('nav').textContent.includes('Memberships')`), true);
   await manage('Actions for node #1', 'Manage memberships');
   await wait(`document.activeElement.tagName === 'H1' && document.activeElement.textContent === 'Memberships · Fixture node 1 · #1'`);
   assert.equal(await evaluate(`document.querySelector('.inventory tbody').textContent.includes('Fixture mesh 1') && !document.querySelector('.inventory tbody').textContent.includes('Fixture mesh 2')`), true);
   await labels('select[name=mesh]');
   assert.equal(await evaluate(`Array.from(document.querySelector('select[name=mesh]').options).map(o => o.value).join(',')`), ',2');
   await add('mesh', 2);
-  await wait(`document.querySelector('.inventory tbody').textContent.includes('Fixture mesh 2')`);
+  await wait(`document.querySelector('.inventory tbody')?.textContent.includes('Fixture mesh 2')`);
   assert.equal(await evaluate(`document.querySelector('select[name=mesh]').matches(':disabled')`), true);
   await click('Back to Nodes');
   await wait(`document.activeElement.tagName === 'H1' && document.activeElement.textContent === 'Nodes'`);
   await nav('Meshes');
   await manage('Actions for mesh #2', 'Manage members');
-  await wait(`document.querySelector('h1').textContent === 'Members · Fixture mesh 2 · #2'`);
+  await wait(`document.querySelector('h1')?.textContent === 'Members · Fixture mesh 2 · #2'`);
   await tableStyles();
   await remove();
   assert.equal(await evaluate(`Array.from(document.querySelector('select[name=node]').options).map(o => o.value).join(',')`), ',1');
@@ -431,7 +427,7 @@ try {
   await click('Back to Meshes');
   await manage('Actions for mesh #2', 'Manage members');
   await nav('Nodes');
-  await wait(`document.querySelector('h1').textContent === 'Nodes'`);
+  await wait(`document.querySelector('h1')?.textContent === 'Nodes'`);
   await manage('Actions for node #1', 'Manage memberships');
   await remove();
   const writes = JSON.parse(await evaluate(`JSON.stringify(window.membershipFixture.writes)`));
@@ -444,7 +440,7 @@ try {
   assert.ok(writes.every(w => /^[0-9a-f-]{36}$/.test(w.key)));
   await evaluate(`window.membershipFixture.inventory.nodes = window.membershipFixture.inventory.nodes.filter(n => n.id !== 1)`);
   await click('Refresh');
-  await wait(`document.querySelector('.inventory').textContent.includes('This node is no longer available.')`);
+  await wait(`document.querySelector('.inventory')?.textContent.includes('This node is no longer available.')`);
   await click('Back to Nodes');
   await evaluate(`window.membershipFixture.restore(); delete window.membershipFixture`);
   console.log('PASS browser: scoped membership fixtures, remaining choices, add/remove bodies + keys, confirmations, back/focus, navigation reset, deleted selection');
@@ -467,7 +463,7 @@ try {
   console.log('PASS browser: native BiDi Tab/Enter login + invite submission, associated labels, skip-to-main focus, named nav and view heading focus (not a full accessibility audit)');
   console.log('PASS browser: UI login, inventory, reload session, Secure/HttpOnly/Strict host cookie hidden from document.cookie');
   console.log('PASS browser: retained signed expired JWT rejected 401; refresh clears inventory/invite secret; re-login, theme-only storage, logout clears cookie');
-  console.log('PASS browser: system theme default, keyboard dark/light toggle, persisted light reload, dark surface screenshot /tmp/cat4igp-dark-login.png; row menu Enter/ArrowDown/Escape restores focus');
+  console.log('PASS browser: system theme default, keyboard dark/light toggle, persisted light reload; row menu Enter/ArrowDown/Escape restores focus');
   console.log('PASS browser: computed MUI outline/label/focus/dark/disabled styles, table component classes + cell styles, native select and checkbox FormData + keyboard checked state');
   console.log('PASS browser: selected list navigation + named counts, responsive wrapping, theme panel spacing, primary/text button hierarchy, rename dialog footer/form association + keyboard Escape');
   await command('session.end');
