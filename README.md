@@ -18,8 +18,11 @@ This will attempt to address those drawbacks.
 
 Client packages for Alpine, Debian, Arch Linux and OpenWrt, plus portable static binaries, are
 built by GitHub Actions. The server is published as a multiarchitecture Alpine image in GitHub Packages.
+Non-release server images use the full source commit SHA as their tag; release images use the matching `vX.Y.Z` tag. Prefer the image digest when an immutable deployment reference is required.
 
 For a standalone server, see the [deployment guide](llm_notes/server/deployment.md) for Docker setup, administrator bootstrap, HTTPS, backups, and verification.
+
+Enroll clients using a trusted, sensitive registration bundle, not client TOML or JSON settings. Start the daemon and run `cat4igp-client register-bundle --bundle /secure/enrollment.json`; see the [client guide](llm_notes/client/configuration.md#trusted-enrollment-bundle) for bundle contents, secret handling, retries, and protected daemon state. Preserve the existing client state directory when upgrading.
 
 ### WireGuard mesh FakeTCP
 
