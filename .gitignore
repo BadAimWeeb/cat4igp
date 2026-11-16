@@ -3,3 +3,5 @@
 /server/*.db
 .env
 old/
+__pycache__/
+*.py[cod]
