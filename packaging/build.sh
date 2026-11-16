@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# A recorded commit must name its own objects, not local git-replace substitutes.
+export GIT_NO_REPLACE_OBJECTS=1
 
 die() { echo "$*" >&2; exit 1; }
 root=${CAT4IGP_SOURCE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$root/client/Cargo.toml" | head -n1)
 [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || die 'Client version must be X.Y.Z'
+
+stage_source() { git -C "$1" archive "$2" | tar -C "$3" -xf -; }
+git_mounts_for() {
+    local git_dir git_common_dir
+    git_dir=$(git -C "$1" rev-parse --path-format=absolute --git-dir)
+    git_common_dir=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir)
+    git_mounts=(-v "$git_dir:$git_dir:ro")
+    [[ $git_common_dir == "$git_dir" ]] || git_mounts+=(-v "$git_common_dir:$git_common_dir:ro")
+}
 
 pkgversion() {
     local distro=$1 ref=$2 stamp=$3 sha=$4
@@ -42,6 +53,36 @@ if [[ ${1:-} == --check ]]; then
     grep -Eq '^depends=".* nftables([ ]|"$)' "$root/packaging/alpine/APKBUILD"
     grep -Eq "^depends=\(.*'nftables'" "$root/packaging/arch/PKGBUILD"
     grep -Eq '^[[:space:]]*DEPENDS:=.*\+nftables([[:space:]]|$)' "$root/packaging/openwrt/Makefile"
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    mkdir "$tmp/repo" "$tmp/staged" "$tmp/template"
+    git init -q --template="$tmp/template" "$tmp/repo"
+    printf 'committed\n' > "$tmp/repo/input"
+    mkdir "$tmp/repo/packaging"
+    printf 'committed script\n' > "$tmp/repo/packaging/build.sh"
+    git -C "$tmp/repo" add input packaging/build.sh
+    git -C "$tmp/repo" -c user.name=test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm initial
+    source_sha=$(git -C "$tmp/repo" rev-parse HEAD)
+    printf 'modified\n' > "$tmp/repo/input"
+    printf 'modified script\n' > "$tmp/repo/packaging/build.sh"
+    printf 'untracked\n' > "$tmp/repo/untracked"
+    stage_source "$tmp/repo" "$source_sha" "$tmp/staged"
+    [[ $(<"$tmp/staged/input") == committed && ! -e $tmp/staged/untracked ]] || die 'Source staging included uncommitted files'
+    git -C "$tmp/repo" show "$source_sha:packaging/build.sh" > "$tmp/executing-build.sh"
+    [[ $(<"$tmp/executing-build.sh") == 'committed script' ]] || die 'Executing script included uncommitted changes'
+    # Replacement refs must not silently substitute another tree for source_sha.
+    printf 'replacement\n' > "$tmp/repo/input"
+    git -C "$tmp/repo" add input
+    git -C "$tmp/repo" -c user.name=test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm replacement
+    replacement_sha=$(git -C "$tmp/repo" rev-parse HEAD)
+    git -C "$tmp/repo" replace "$source_sha" "$replacement_sha"
+    mkdir "$tmp/replaced-stage"
+    stage_source "$tmp/repo" "$source_sha" "$tmp/replaced-stage"
+    [[ $(<"$tmp/replaced-stage/input") == committed ]] || die 'Replacement ref changed staged source provenance'
+    [[ $(git -C "$tmp/repo" show "$source_sha:input") == committed ]] || die 'Replacement ref changed source inspection'
+    git -C "$tmp/repo" worktree add -q --detach "$tmp/linked" "$source_sha"
+    git_mounts_for "$tmp/linked"
+    [[ ${#git_mounts[@]} == 4 && ${git_mounts[1]} == "$tmp/repo/.git/worktrees/linked:$tmp/repo/.git/worktrees/linked:ro" && ${git_mounts[3]} == "$tmp/repo/.git:$tmp/repo/.git:ro" ]] || die 'Linked checkout Git mounts are incomplete'
     if pkgversion bogus main invalid invalid; then die 'Accepted invalid input'; fi
     echo 'Version/input checks passed'
     exit
@@ -55,6 +96,8 @@ expected_host=$arch
 [[ $(uname -m) == "$expected_host" ]] || die "This build requires a $expected_host host"
 ref=${GITHUB_REF:-refs/heads/local}
 sha=${GITHUB_SHA:-$(git -C "$root" rev-parse HEAD)}
+committed_version=$(git -C "$root" show "$sha:client/Cargo.toml" | sed -n 's/^version = "\([^"]*\)"$/\1/p' | head -n1)
+[[ $version == "$committed_version" ]] || die 'Client version differs from the source commit'
 stamp=$(git -C "$root" show -s --format=%cI "$sha")
 stamp=$(date -u -d "$stamp" +%Y%m%d%H%M%S)
 pkgver=$(pkgversion "$distro" "$ref" "$stamp" "$sha") || die 'Invalid version inputs or tag does not match client/Cargo.toml'
@@ -66,19 +109,22 @@ if [[ ${3:-} != --inside ]]; then
         debian/*|openwrt/*) image=debian@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c ;;
         arch/x86_64) image=archlinux@sha256:b21322c663be387c0ed9cbc7bbbfe18e41633ad4e7b7c77cfad45f128be20040 ;;
     esac
+    # Linked worktrees and --separate-git-dir checkouts store objects outside /repo.
+    git_mounts_for "$root"
     mkdir -p "$root/dist/$distro-$arch"
     # Native runners only; both OpenWrt SDKs execute on x86_64.
-    docker run --rm -v "$root:/repo:ro" -v "$root/dist/$distro-$arch:/out" \
+    docker run --rm -v "$root:/repo:ro" "${git_mounts[@]}" -v "$root/dist/$distro-$arch:/out" \
         -e GITHUB_REF="$ref" -e GITHUB_SHA="$sha" -e OUTPUT_UID="$(id -u)" -e OUTPUT_GID="$(id -g)" \
         "$image" sh -ec '
+            export GIT_NO_REPLACE_OBJECTS=1
             case "$1" in
                 alpine|static) apk add --no-cache bash git coreutils ;;
                 debian|openwrt) apt-get update; apt-get install -y --no-install-recommends bash git ca-certificates ;;
                 arch) pacman-key --init; pacman-key --populate; pacman -Syu --noconfirm bash git ;;
             esac
             git config --system --add safe.directory /repo
-            # Keep the executing script stable if the checkout is edited during a build.
-            cp /repo/packaging/build.sh /tmp/cat4igp-build.sh
+            # Execute the build logic from the same commit as the staged source.
+            git -C /repo show "$GITHUB_SHA:packaging/build.sh" > /tmp/cat4igp-build.sh
             CAT4IGP_SOURCE_ROOT=/repo exec bash /tmp/cat4igp-build.sh "$1" "$2" --inside
         ' sh "$distro" "$arch"
     exit
@@ -104,7 +150,7 @@ esac
 work=$(mktemp -d /tmp/cat4igp.XXXXXX)
 trap 'rm -rf "$work"' EXIT
 mkdir "$work/workspace"
-tar -C "$root" --exclude=.git --exclude=target --exclude=dist -cf - . | tar -C "$work/workspace" -xf -
+stage_source "$root" "$sha" "$work/workspace"
 for file in Cargo.lock LICENSE packaging/client.toml packaging/cat4igp-client.service packaging/cat4igp-client.openrc; do
     [[ -f $work/workspace/$file ]] || die "Missing shared input: $file"
 done
@@ -153,8 +199,10 @@ case $DISTRO in
         strip "$binary"
         # Native ELF checks reject accidental loader/shared-library dependencies.
         readelf -h "$binary" | grep -F "$machine"
-        ! readelf -l "$binary" | grep -q INTERP
-        ! readelf -d "$binary" | grep -q NEEDED
+        program_headers=$(readelf -l "$binary")
+        if grep -q INTERP <<< "$program_headers"; then echo 'Static binary has an interpreter' >&2; exit 1; fi
+        dynamic_section=$(readelf -d "$binary")
+        if grep -q NEEDED <<< "$dynamic_section"; then echo 'Static binary has shared-library dependencies' >&2; exit 1; fi
         "$binary" --help >/dev/null
         install -m755 "$binary" "$WORK/cat4igp-client-$CAT4IGP_PKGVER-$target" ;;
     alpine)
@@ -205,6 +253,18 @@ case $DISTRO in
         find bin/packages -name 'cat4igp-client-*.apk' -exec cp {} "$WORK/" \; ;;
 esac
 BUILD
+# Record the resolved feed packages, not just the pinned container image: distro
+# repositories can change independently of the image digest.
+manifest="/out/BUILD-DEPENDENCIES.txt"
+{
+    printf 'target=%s/%s\nsource=%s\n' "$distro" "$arch" "$sha"
+    case $distro in
+        alpine|static) apk info -vv | LC_ALL=C sort ;;
+        debian|openwrt) dpkg-query -W -f='${binary:Package}=${Version}\n' | LC_ALL=C sort ;;
+        arch) pacman -Q | LC_ALL=C sort ;;
+    esac
+} > "$manifest"
+chown "$OUTPUT_UID:$OUTPUT_GID" "$manifest"
 mapfile -t packages < <(find "$work" -maxdepth 1 -type f \( -name '*.apk' -o -name '*.deb' -o -name '*.pkg.tar.zst' -o -name 'cat4igp-client-*-unknown-linux-musl' \))
 [[ ${#packages[@]} == 1 ]] || die "Expected one client package, found ${#packages[@]}"
 mode=644

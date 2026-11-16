@@ -9,7 +9,13 @@ ExecStartPre=/usr/bin/test -r /etc/cat4igp/client.toml
 ExecStart=/usr/bin/cat4igp-client daemon --config /etc/cat4igp/client.toml
 StateDirectory=cat4igp-client
 StateDirectoryMode=0700
+RuntimeDirectory=cat4igp-client
+RuntimeDirectoryMode=0700
 UMask=0077
+# Include tunnel helpers even if they start new sessions or process groups.
+KillMode=control-group
+SendSIGKILL=yes
+TimeoutStopSec=15s
 Restart=on-failure
 RestartSec=5
 

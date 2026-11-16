@@ -1,5 +1,5 @@
 # Enrollment and network settings are configured by the administrator.
-daemon_socket = "/var/run/cat4igp-client.sock"
+daemon_socket = "/run/cat4igp-client.sock"
 data_dir = "/var/lib/cat4igp-client"
 # Set true only for direct, unencrypted L2TP.
 allow_insecure_l2tp = false
