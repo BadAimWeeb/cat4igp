@@ -16,28 +16,29 @@ This will attempt to address those drawbacks.
 
 **This is not available in Windows.**
 
-Client packages for Alpine, Debian, Arch Linux and OpenWrt, plus portable static binaries, are
-built by GitHub Actions. The server is published as a multiarchitecture Alpine image in GitHub Packages.
-Non-release server images use the full source commit SHA as their tag; release images use the matching `vX.Y.Z` tag. Prefer the image digest when an immutable deployment reference is required.
+### Install the client
 
-For a standalone server, see the [deployment guide](llm_notes/server/deployment.md) for Docker setup, administrator bootstrap, HTTPS, backups, and verification.
+Install `cat4igp-client` from the signed feed for your distribution. Verify the
+repository signing key with your operator before trusting it; keep signature
+checks enabled.
 
-Enroll clients using a trusted, sensitive registration bundle, not client TOML or JSON settings. Start the daemon and run `cat4igp-client register-bundle --bundle /secure/enrollment.json`; see the [client guide](llm_notes/client/configuration.md#trusted-enrollment-bundle) for bundle contents, secret handling, retries, and protected daemon state. Preserve the existing client state directory when upgrading.
+| Distribution | Feed | Install |
+| --- | --- | --- |
+| Debian 13 | `https://c4i-repo.badaimweeb.me/debian` (`trixie main`) | `apt-get update && apt-get install cat4igp-client` |
+| Alpine 3.24 | `https://c4i-repo.badaimweeb.me/alpine/v3.24` | `apk update && apk add cat4igp-client` |
+| Arch Linux | `https://c4i-repo.badaimweeb.me/arch/$arch` (`[cat4igp]`, `SigLevel = Required`) | `pacman -Syu cat4igp/cat4igp-client` |
+| OpenWrt 25.12.5 | `https://c4i-repo.badaimweeb.me/openwrt/25.12.5/<arch>/packages.adb` (`x86_64` or `aarch64_generic`, matching firmware) | `apk update && apk add cat4igp-client` |
 
-### WireGuard mesh FakeTCP
+Portable x86-64 and ARM64 Linux binaries are available in the [signed download
+directory](https://c4i-repo.badaimweeb.me/portable/v0.1.0/SHA256SUMS) and on
+[GitHub Releases](https://github.com/BadAimWeeb/cat4igp/releases).
 
-Administrators can enable FakeTCP when creating an Auto WireGuard mesh or toggle it later in the mesh actions. It applies to current and future mesh-owned WireGuard tunnels; changing it causes clients to converge on the new configuration. A tunnel shared by multiple meshes uses FakeTCP if any owning mesh enables it, or if its explicit per-tunnel flag is set. Other tunnel protocols are unaffected.
+Packages do not start the service automatically. Review `/etc/cat4igp/client.toml`,
+then start `cat4igp-client` with `systemctl`, `rc-service`, or
+`/etc/init.d/cat4igp-client start` on OpenWrt. With the service running, enroll
+using `cat4igp-client register-bundle --bundle /secure/enrollment.json` and a
+trusted bundle from your operator.
 
-FakeTCP is disabled by default for existing meshes and requests that omit the setting. It requires Linux clients with raw-socket privileges and nftables; enable it only when both ends support it. FakeTCP disguises packet framing as TCP, not as a reliable TCP connection, and does not replace WireGuard encryption.
+### Controller
 
-The administrator `create_mesh` action accepts optional boolean `faketcp` (default `false`); enabling it requires `auto_wireguard: true`. Use `{"action":"set_mesh_faketcp","id":1,"faketcp":true}` to change an existing mesh. Inventory mesh entries report the boolean as `faketcp`. Disabling a mesh policy does not override another owning mesh or an explicit tunnel setting.
-
-### WireGuard endpoint refresh modes
-
-Each WireGuard tunnel has a controller-selected refresh mode. `current` preserves the original behavior: active kernel WireGuard sockets cannot be queried for a STUN mapping, so refresh requires a configured public hostname and forwarding, or an FEC transport whose socket can be queried. `proxy` keeps a userspace UDP bridge in front of kernel WireGuard so STUN can use the live public socket. The bridge forwards only packets from the exact controller-selected peer address and port; unlike direct WireGuard it cannot authenticate or follow endpoint roaming by itself. A trusted controller update is required when the peer address changes. FEC already owns its public socket and does not need the UDP bridge. FakeTCP requires a public hostname and TCP port forwarding.
-
-`dual_link` creates a second WireGuard interface with a new key and UDP port. Both peers exchange offers and wait for an authenticated handshake before switching; the old interface remains until both have switched. A reserved interface-name bit distinguishes the two slots, giving them distinct link-local addresses for IGP convergence. Direct UDP mapping discovery closes and rebinds the candidate port, so the discovered NAT mapping is best effort; an unsuccessful handshake must not cause a cutover. The port range must have room for both links. Dependent L2TP sessions are recreated on the new underlay during cutover and may experience a brief interruption.
-
-The client stores active and pending generation keys and ports in its protected daemon data directory. Do not delete or reset this state during a transition or after a key rotation: the controller and peer may still depend on those keys, and a reset can interrupt connectivity until the tunnel is reprovisioned. Back up the client state securely along with the controller state.
-
-Dual-link retirement refuses to remove an interface with externally managed addresses or static routes; migrate those settings yourself before retrying. Recognized dynamic routing-protocol routes can reconverge over the new interface; routes using an unrecognized protocol are treated conservatively as external. Changing between `current` and `proxy` rebinds the public port and can briefly interrupt traffic. `proxy` cannot be combined with FakeTCP: select `current` or `dual_link` instead.
+The server container image is published to [GitHub Packages](https://github.com/BadAimWeeb/cat4igp/pkgs/container/cat4igp-server).

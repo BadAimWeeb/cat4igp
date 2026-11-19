@@ -5,3 +5,4 @@
 old/
 __pycache__/
 *.py[cod]
+/llm_notes/
