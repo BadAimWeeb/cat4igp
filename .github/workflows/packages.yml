@@ -175,3 +175,53 @@ jobs:
         run: |
           bash packaging/check-release-tag.sh
           gh release edit "$TAG" --draft=false
+      - name: Prepare signed Pages repositories
+        if: vars.PUBLISH_PACKAGE_FEEDS == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: BadAimWeeb/cat4igp-repo
+          ref: main
+          path: pages-repository
+          token: ${{ secrets.PACKAGE_PAGES_TOKEN }}
+          persist-credentials: false
+      - name: Install repository indexing tools
+        if: vars.PUBLISH_PACKAGE_FEEDS == 'true'
+        run: sudo apt-get update && sudo apt-get install -y apt-utils
+      - name: Sign verified packages and publish Pages source
+        if: vars.PUBLISH_PACKAGE_FEEDS == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PAGES_GPG_FINGERPRINT: ${{ vars.PACKAGE_GPG_FINGERPRINT }}
+          GPG_SECRET: ${{ secrets.PACKAGE_GPG_SECRET }}
+          ALPINE_SECRET: ${{ secrets.PACKAGE_ALPINE_RSA_KEY }}
+          SOURCE_SHA: ${{ github.sha }}
+          OPENWRT_SECRET: ${{ secrets.PACKAGE_OPENWRT_KEY }}
+        run: |
+          set -euo pipefail
+          bash packaging/check-release-tag.sh
+          umask 077
+          keys=$(mktemp -d)
+          trap 'rm -rf "$keys"' EXIT
+          mkdir "$keys/gnupg"
+          export GNUPGHOME="$keys/gnupg"
+          export ALPINE_SIGNING_KEY="$keys/alpine.rsa" OPENWRT_SIGNING_KEY="$keys/openwrt.pem"
+          printf '%s\n' "$GPG_SECRET" | gpg --batch --import
+          printf '%s\n' "$ALPINE_SECRET" > "$ALPINE_SIGNING_KEY"
+          printf '%s\n' "$OPENWRT_SECRET" > "$OPENWRT_SIGNING_KEY"
+          unset GPG_SECRET ALPINE_SECRET OPENWRT_SECRET
+          bash packaging/pages-repositories.sh packages pages-repository/docs "$TAG"
+      - name: Push Pages source
+        if: vars.PUBLISH_PACKAGE_FEEDS == 'true'
+        working-directory: pages-repository
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGE_PAGES_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name 'cat4igp release automation'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- docs
+          git commit -m "Publish CAT4IGP $TAG package feeds"
+          git -c 'credential.helper=!gh auth git-credential' push origin HEAD:refs/heads/main
